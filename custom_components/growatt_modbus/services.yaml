@@ -246,7 +246,7 @@ read_register:
 
 set_battery_mode:
   name: Set Battery Mode (VPP)
-  description: "Set battery charge/discharge/hold mode via VPP protocol registers (30xxx). For WIT/WIS inverters only. CHARGE: Forces battery charging from grid+PV. DISCHARGE: Forces battery discharging to load. HOLD: Uses TOU +1% workaround for true standby (simply disabling remote control returns to self-consumption where battery discharges)."
+  description: "Set battery charge/discharge/preserve_soc mode via VPP protocol registers (30xxx). For WIT/WIS inverters only. CHARGE: Forces battery charging from grid+PV. DISCHARGE: Forces battery discharging to load. PRESERVE_SOC: Battery idle, PV charges battery, surplus exports to grid."
   fields:
     device_id:
       name: Device
@@ -264,7 +264,7 @@ write_registers:
           integration: growatt_modbus
     mode:
       name: Mode
-      description: "Battery operating mode: charge, discharge, or hold"
+      description: "Battery operating mode: charge, discharge, or preserve_soc"
       required: true
       selector:
         select:
@@ -273,8 +273,8 @@ write_registers:
               value: "charge"
             - label: "Discharge (to load)"
               value: "discharge"
-            - label: "Hold (true standby)"
-              value: "hold"
+            - label: "Preserve SOC (battery idle, PV charges)"
+              value: "preserve_soc"
     power_percent:
       name: Power Percentage
       description: Charge/discharge power as percentage of rated power (1-100%)
@@ -288,7 +288,7 @@ write_registers:
 
 sync_tou_schedule:
   name: Sync TOU Schedule
-  description: "Write Time-of-Use schedule to inverter for autonomous operation. The inverter will follow this schedule even if Home Assistant goes offline. Maximum 20 periods. CRITICAL: Periods CANNOT overlap! Use XX:59 end times (e.g., 119 for 01:59) then start next at XX:00 (e.g., 120 for 02:00). For HOLD mode, use power=1 (+1% charge = true standby)."
+  description: "Write Time-of-Use schedule to inverter for autonomous operation. The inverter will follow this schedule even if Home Assistant goes offline. Maximum 20 periods. CRITICAL: Periods CANNOT overlap! Use XX:59 end times (e.g., 119 for 01:59) then start next at XX:00 (e.g., 120 for 02:00). For PRESERVE SOC mode, use power=0 (battery idle)."
   fields:
     device_id:
       name: Device
@@ -299,9 +299,9 @@ sync_tou_schedule:
           integration: growatt_modbus
     periods:
       name: Schedule Periods
-      description: "List of TOU periods. CRITICAL: NO OVERLAPPING! Use XX:59 end times. power=1 for HOLD (true standby), +100 for charge, -100 for discharge."
+      description: "List of TOU periods. CRITICAL: NO OVERLAPPING! Use XX:59 end times. power=0 for PRESERVE SOC (battery idle), +100 for charge, -100 for discharge."
       required: true
-      example: '[{"start": 0, "end": 119, "power": 100}, {"start": 120, "end": 1019, "power": 1}, {"start": 1020, "end": 1259, "power": -100}]'
+      example: '[{"start": 0, "end": 119, "power": 100}, {"start": 120, "end": 1019, "power": 0}, {"start": 1020, "end": 1259, "power": -100}]'
       selector:
         object:
     default_mode:
@@ -335,3 +335,93 @@ sync_tou_schedule:
       example: "[0, 120, 100]"
       selector:
         object:
+
+set_wit_mode:
+  name: Set WIT Inverter Mode
+  description: >
+    Set WIT inverter operating mode with atomic multi-register write.
+    Combines battery power, export rate, AC charge mode, and SOC limits
+    into a single command. For WIT/WIS inverters with VPP protocol only.
+  fields:
+    device_id:
+      name: Device
+      description: The Growatt WIT inverter device
+      required: true
+      selector:
+        device:
+          integration: growatt_modbus
+    mode:
+      name: Mode
+      description: >
+        Operating mode preset.
+        self_consumption: PV covers load, zero export, battery follows base mode.
+        grid_charge: Charge battery from grid (+ PV supplement).
+        discharge_to_load: Discharge battery to cover home load, zero export.
+        discharge_to_grid: Discharge battery with export allowed (for selling).
+        max_export: Full discharge + unrestricted export.
+        preserve_soc: Battery idle, PV charges battery, surplus exports to grid.
+        hold: Alias for preserve_soc (backward compatibility).
+        passthrough: Release all overrides, return to panel-configured base mode.
+      required: true
+      selector:
+        select:
+          options:
+            - self_consumption
+            - grid_charge
+            - discharge_to_load
+            - discharge_to_grid
+            - max_export
+            - preserve_soc
+            - hold
+            - passthrough
+    power_percent:
+      name: Power Percent
+      description: "Charge/discharge power level (1-100%). Default: 100."
+      default: 100
+      selector:
+        number:
+          min: 1
+          max: 100
+          unit_of_measurement: "%"
+    duration_minutes:
+      name: Duration
+      description: "How long the override stays active (1-1440 minutes). Default: 60. Inverter reverts to base mode when duration expires."
+      default: 60
+      selector:
+        number:
+          min: 1
+          max: 1440
+          unit_of_measurement: "min"
+    export_rate:
+      name: Export Rate
+      description: "Grid export power rate (0-100%). 0=zero export, 100=full export. If omitted, mode defaults apply."
+      selector:
+        number:
+          min: 0
+          max: 100
+          unit_of_measurement: "%"
+    ac_charge_mode:
+      name: AC Charge Mode
+      description: "AC/grid charging behavior. disabled=solar only, pv_priority=PV first + AC supplement, ac_priority=AC first."
+      selector:
+        select:
+          options:
+            - disabled
+            - pv_priority
+            - ac_priority
+    charge_cutoff_soc:
+      name: Charge Cutoff SOC
+      description: "Stop charging when battery reaches this SOC (10-100%)."
+      selector:
+        number:
+          min: 10
+          max: 100
+          unit_of_measurement: "%"
+    discharge_cutoff_soc:
+      name: Discharge Cutoff SOC
+      description: "Stop discharging when battery drops to this SOC (10-100%)."
+      selector:
+        number:
+          min: 10
+          max: 100
+          unit_of_measurement: "%"

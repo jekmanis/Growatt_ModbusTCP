@@ -150,6 +150,15 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         self._normal_update_interval = timedelta(seconds=scan_interval)
         self._offline_update_interval = timedelta(seconds=entry.options.get("offline_scan_interval", 300))  # 5 min default
 
+        # WIT Direct Control tracking (set by set_wit_mode service, read by mode status sensor)
+        self.wit_direct_mode: str | None = None
+        self.wit_direct_mode_power: int = 0
+        self.wit_direct_mode_duration: int = 0
+        self.wit_direct_mode_timestamp = None  # datetime or None
+        self.wit_direct_mode_source: str = ""
+        self.wit_direct_export_rate: int | None = None
+        self.wit_direct_ac_charge_mode: str | None = None
+
         super().__init__(
             hass,
             _LOGGER,
@@ -330,6 +339,55 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         
         return raw_value
 
+    def _compute_wit_mode_status(self, data) -> None:
+        """Compute effective WIT mode from control register states."""
+        remote_enable = getattr(data, 'remote_power_control_enable', 0)
+        power_raw = getattr(data, 'remote_charge_and_discharge_power', 0)
+        export_enable = getattr(data, 'vpp_export_limit_enable', 0)
+        export_rate = getattr(data, 'vpp_export_limit_power_rate', 0)
+        ac_charge = getattr(data, 'vpp_ac_charge_enable', 0)
+
+        # Decode signed power (two's complement)
+        if power_raw > 32767:
+            power_signed = power_raw - 65536
+        else:
+            power_signed = power_raw
+
+        data.wit_mode_override_active = bool(remote_enable)
+        data.wit_mode_ac_charge = ac_charge
+
+        # Determine export rate
+        if export_enable:
+            data.wit_mode_export_rate = export_rate
+        else:
+            data.wit_mode_export_rate = 100  # No limiter = full export
+
+        if not remote_enable:
+            # No override active
+            if export_enable and export_rate == 0:
+                data.wit_mode_status = "Self-consumption"
+            else:
+                data.wit_mode_status = "Passthrough"
+            data.wit_mode_power_percent = 0
+        elif power_signed > 1:
+            data.wit_mode_status = "Grid Charge"
+            data.wit_mode_power_percent = power_signed
+        elif power_signed in (0, 1):
+            data.wit_mode_status = "Preserve SOC"
+            data.wit_mode_power_percent = 0
+        elif power_signed < 0:
+            export_allowed = (not export_enable) or (export_rate > 0)
+            if export_allowed and abs(power_signed) == 100:
+                data.wit_mode_status = "Max Export"
+            elif export_allowed:
+                data.wit_mode_status = "Discharge to Grid"
+            else:
+                data.wit_mode_status = "Discharge to Load"
+            data.wit_mode_power_percent = abs(power_signed)
+        else:
+            data.wit_mode_status = "Passthrough"
+            data.wit_mode_power_percent = 0
+
     @property
     def is_online(self) -> bool:
         """Return whether the inverter is currently online."""
@@ -456,6 +514,13 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 # Debounce window expired
                 _LOGGER.debug("Debounce window expired - normal operation resumed")
                 self._just_came_online_time = None
+
+            # Compute WIT mode status from control registers (WIT profiles only)
+            if "WIT" in self._register_map_key.upper():
+                self._compute_wit_mode_status(data)
+                # Clear optimistic preset so polled register state takes over
+                if hasattr(self, 'wit_mode_preset_last'):
+                    self.wit_mode_preset_last = None
 
             return data
 

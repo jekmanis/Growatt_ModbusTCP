@@ -156,6 +156,7 @@ class GrowattData:
     power_to_user: float = 0.0        # W
     power_to_grid: float = 0.0        # W (export)
     power_to_load: float = 0.0        # W
+    self_consumption_power: float = 0.0  # W (power consumed by house, from meter)
     system_output_power: float = 0.0  # W (total system output per inverter)
     
     # Energy & Status
@@ -267,6 +268,19 @@ class GrowattData:
     gen_charge_current: int = 0       # 0-800 (0-80A with scale 0.1)
     bat_low_to_uti: int = 0           # Battery-dependent: Non-Lithium 200-640 (20-64V), Lithium 5-100 (0.5-10%)
     ac_to_bat_volt: int = 0           # Battery-dependent: Non-Lithium 200-640 (20-64V), Lithium 5-100 (0.5-10%)
+
+    # WIT VPP SOC and AC Charge control registers (read from holding registers)
+    vpp_charge_cutoff_soc: int = 100      # 10-100% (stop charging at this SOC; 100=charge to full)
+    vpp_discharge_cutoff_soc: int = 10    # 10-100% (stop discharging at this SOC; 10=discharge to 10%)
+    vpp_ac_charge_enable: int = 0         # 0=Disabled, 1=PV Priority, 2=AC Priority
+
+    # WIT Direct Control Mode Status (computed from VPP control registers)
+    wit_mode_status: str = ""
+    wit_mode_power_percent: int = 0
+    wit_mode_duration_remaining: int = 0
+    wit_mode_export_rate: int = -1
+    wit_mode_ac_charge: int = 0
+    wit_mode_override_active: bool = False
 
     # Device Info
     firmware_version: str = ""
@@ -1115,7 +1129,12 @@ class GrowattModbus:
                 data.power_to_grid = self._get_register_value(power_to_grid_addr) or 0.0
             if power_to_load_addr:
                 data.power_to_load = self._get_register_value(power_to_load_addr) or 0.0
-            
+
+            # Self consumption power (house consumption from meter)
+            self_consumption_addr = self._find_register_by_name('self_consumption_power_low')
+            if self_consumption_addr:
+                data.self_consumption_power = self._get_register_value(self_consumption_addr) or 0.0
+
             # Energy Today
             # For WIT/MIC with per-MPPT tracking: use sum of PV1+PV2 energy for accurate solar production
             # Registers 53-54 show total system AC output (PV+battery), not PV-only (Issue #146)

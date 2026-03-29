@@ -68,6 +68,7 @@ TEMPERATURE_SENSORS: Set[str] = {
 
 STATUS_SENSORS: Set[str] = {
     "status", "last_update", "derating_mode", "fault_code", "warning_code",
+    "wit_mode_status",
 }
 
 THREE_PHASE_SENSORS: Set[str] = {

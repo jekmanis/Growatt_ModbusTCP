@@ -240,6 +240,34 @@ WRITABLE_REGISTERS = {
     },
 
 
+    # WIT VPP SOC Cutoff Controls
+    'vpp_charge_cutoff_soc': {
+        'register': 30404,
+        'scale': 1,
+        'valid_range': (10, 100),
+        'unit': '%',
+        'desc': 'VPP charge cutoff SOC (stop charging at this SOC)'
+    },
+    'vpp_discharge_cutoff_soc': {
+        'register': 30405,
+        'scale': 1,
+        'valid_range': (10, 100),
+        'unit': '%',
+        'desc': 'VPP discharge cutoff SOC (stop discharging at this SOC)'
+    },
+    'vpp_ac_charge_enable': {
+        'register': 30410,
+        'scale': 1,
+        'valid_range': (0, 2),
+        'options': {
+            0: 'Disabled',
+            1: 'PV Priority',
+            2: 'AC Priority'
+        },
+        'desc': 'VPP AC charge mode (0=disabled, 1=PV priority, 2=AC priority)'
+    },
+
+
     # SPF Off-Grid Inverter Controls
     'output_config': {
         'register': 1,
@@ -462,6 +490,39 @@ SENSOR_OFFLINE_BEHAVIOR = {
 }
 
 
+# ============================================================================
+# WIT DIRECT CONTROL MODE CONSTANTS
+# ============================================================================
+
+WIT_MODES = [
+    "self_consumption",
+    "grid_charge",
+    "discharge_to_load",
+    "discharge_to_grid",
+    "max_export",
+    "preserve_soc",
+    "hold",
+    "passthrough",
+]
+
+WIT_MODE_DISPLAY_NAMES = {
+    "self_consumption": "Self-consumption",
+    "grid_charge": "Grid Charge",
+    "discharge_to_load": "Discharge to Load",
+    "discharge_to_grid": "Discharge to Grid",
+    "max_export": "Max Export",
+    "preserve_soc": "Preserve SOC",
+    "hold": "Preserve SOC",
+    "passthrough": "Passthrough",
+}
+
+WIT_AC_CHARGE_MODES = {
+    "disabled": 0,
+    "pv_priority": 1,
+    "ac_priority": 2,
+}
+
+
 def get_sensor_type(sensor_key: str) -> str:
     """Get the sensor type for a given sensor key."""
     for sensor_type, sensors in SENSOR_TYPES.items():
@@ -491,6 +552,8 @@ SENSOR_DEVICE_MAP = {
         'battery_derating_mode',  # Battery-related status on inverter
         # SPF Off-Grid fan speeds
         'inverter_fan_speed',
+        # WIT Direct Control mode status
+        'wit_mode_status',
     },
 
     # Solar device - PV production and AC output
