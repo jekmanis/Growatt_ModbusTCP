@@ -1252,51 +1252,48 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             #     and PV surplus routing during discharge modes
             #   30476=0 (Load First): safe fallback for passthrough only
             if mode == "passthrough":
-                success = await _write(VPP_PRIORITY_MODE, 0)
-                if not success:
-                    _LOGGER.warning("[WIT] Failed to set priority mode (30476=0)")
-                registers_written[VPP_PRIORITY_MODE] = 0
+                priority_val = 0
             else:
-                success = await _write(VPP_PRIORITY_MODE, 1)
-                if not success:
-                    _LOGGER.warning("[WIT] Failed to set priority mode (30476=1)")
-                registers_written[VPP_PRIORITY_MODE] = 1
+                priority_val = 1
+            success = await _write(VPP_PRIORITY_MODE, priority_val)
+            if not success:
+                raise ValueError(f"Failed to set priority mode (30476={priority_val})")
+            registers_written[VPP_PRIORITY_MODE] = priority_val
 
             # ---- Step 2: AC charge mode (before enabling remote control) ----
             if ac_charge_mode is not None:
                 ac_val = AC_CHARGE_MODE_MAP[ac_charge_mode]
                 success = await _write(VPP_AC_CHARGE_ENABLE, ac_val)
                 if not success and ac_val == 2:
-                    # V2.02 firmware doesn't support AC priority (value 2) — fall back to PV priority
                     _LOGGER.warning("[WIT] AC priority (30410=2) not supported, falling back to PV priority (1)")
                     ac_val = 1
                     success = await _write(VPP_AC_CHARGE_ENABLE, 1)
                 if not success:
-                    _LOGGER.warning("[WIT] Failed to write AC charge mode (30410=%d)", ac_val)
+                    raise ValueError(f"Failed to write AC charge mode (30410={ac_val})")
                 registers_written[VPP_AC_CHARGE_ENABLE] = ac_val
             elif mode == "grid_charge":
                 success = await _write(VPP_AC_CHARGE_ENABLE, 1)
                 if not success:
-                    _LOGGER.warning("[WIT] Failed to write AC charge mode (30410=1)")
+                    raise ValueError("Failed to write AC charge mode (30410=1)")
                 registers_written[VPP_AC_CHARGE_ENABLE] = 1
             elif mode in ("discharge_to_load", "discharge_to_grid", "max_export",
                           "hold", "preserve_soc", "passthrough"):
                 success = await _write(VPP_AC_CHARGE_ENABLE, 0)
                 if not success:
-                    _LOGGER.warning("[WIT] Failed to write AC charge mode (30410=0)")
+                    raise ValueError("Failed to write AC charge mode (30410=0)")
                 registers_written[VPP_AC_CHARGE_ENABLE] = 0
 
             # ---- Step 3: SOC limits (before charge/discharge starts) ----
             if charge_cutoff_soc is not None:
                 success = await _write(VPP_CHARGE_CUTOFF_SOC, charge_cutoff_soc)
                 if not success:
-                    _LOGGER.warning("[WIT] Failed to write charge cutoff SOC (30404=%d)", charge_cutoff_soc)
+                    raise ValueError(f"Failed to write charge cutoff SOC (30404={charge_cutoff_soc})")
                 registers_written[VPP_CHARGE_CUTOFF_SOC] = charge_cutoff_soc
 
             if discharge_cutoff_soc is not None:
                 success = await _write(VPP_DISCHARGE_CUTOFF_SOC, discharge_cutoff_soc)
                 if not success:
-                    _LOGGER.warning("[WIT] Failed to write discharge cutoff SOC (30405=%d)", discharge_cutoff_soc)
+                    raise ValueError(f"Failed to write discharge cutoff SOC (30405={discharge_cutoff_soc})")
                 registers_written[VPP_DISCHARGE_CUTOFF_SOC] = discharge_cutoff_soc
 
             # ---- Step 4: Export rate ----
@@ -1304,15 +1301,15 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 if export_rate >= 100:
                     success = await _write(VPP_EXPORT_LIMIT_ENABLE, 0)
                     if not success:
-                        _LOGGER.warning("[WIT] Failed to write export limit enable (30200=0)")
+                        raise ValueError("Failed to disable export limit (30200=0)")
                     registers_written[VPP_EXPORT_LIMIT_ENABLE] = 0
                 else:
                     success = await _write(VPP_EXPORT_LIMIT_ENABLE, 1)
                     if not success:
-                        _LOGGER.warning("[WIT] Failed to write export limit enable (30200=1)")
+                        raise ValueError("Failed to enable export limit (30200=1)")
                     success = await _write(VPP_EXPORT_LIMIT_RATE, export_rate)
                     if not success:
-                        _LOGGER.warning("[WIT] Failed to write export limit rate (30201=%d)", export_rate)
+                        raise ValueError(f"Failed to write export limit rate (30201={export_rate})")
                     registers_written[VPP_EXPORT_LIMIT_ENABLE] = 1
                     registers_written[VPP_EXPORT_LIMIT_RATE] = export_rate
             elif mode == "discharge_to_load":
@@ -1332,12 +1329,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 # (grid_charge needs this — stale 30200=1 from discharge_to_load blocks charging)
                 success = await _write(VPP_EXPORT_LIMIT_ENABLE, 0)
                 if not success:
-                    _LOGGER.warning("[WIT] Failed to clear export limit (30200=0)")
+                    raise ValueError("Failed to clear export limit (30200=0)")
                 registers_written[VPP_EXPORT_LIMIT_ENABLE] = 0
 
             # ---- Step 5: Battery power command ----
             # Clear any leftover TOU periods from previous modes
-            await _write(VPP_TOU_NUM_PERIODS, 0)
+            success = await _write(VPP_TOU_NUM_PERIODS, 0)
+            if not success:
+                raise ValueError("Failed to clear TOU periods (30411=0)")
             registers_written[VPP_TOU_NUM_PERIODS] = 0
 
             if mode == "passthrough":
@@ -1345,10 +1344,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 # stale command remains if 30407 is re-enabled externally.
                 success = await _write(VPP_REMOTE_POWER_DURATION, 0)
                 if not success:
-                    _LOGGER.warning("[WIT] Failed to clear duration (30408=0)")
+                    raise ValueError("Failed to clear duration (30408=0)")
                 success = await _write(VPP_REMOTE_POWER_PERCENT, 0)
                 if not success:
-                    _LOGGER.warning("[WIT] Failed to clear power (30409=0)")
+                    raise ValueError("Failed to clear power (30409=0)")
                 success = await _write(VPP_REMOTE_POWER_ENABLE, 0)
                 if not success:
                     raise ValueError("Failed to disable remote power control (30407)")
