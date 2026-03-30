@@ -166,9 +166,9 @@ These are the **preset modes** available in the HA select entity and as shorthan
 | `discharge_to_grid` | **1** | 1 | -power% | 0 | -- | 0 | Discharge with export for selling. |
 | `max_export` | **1** | 1 | -100 | 0 | -- | 0 | Full discharge + max export. |
 | `hold` / `preserve_soc` | **0** | 0 | 0 | 0 | -- | 0 | Battery idle. PV covers load + exports. |
-| `passthrough` | **0** | 0 | -- | 0 | -- | -- | Release all overrides. Safe base mode. |
+| `passthrough` | **0** | 0 | 0 | 0 | -- | 0 | Release all overrides. Defensive zero-out. |
 
-**Every mode explicitly sets 30476.** No register values are inherited from previous modes. "--" means only that the caller can override via service parameter; the mode's default is always written.
+**Every mode explicitly sets all critical registers.** No stale values remain on hardware between mode switches. "--" for 30201 means it is not written when 30200=0 (limiter disabled, rate irrelevant).
 
 **Key findings from Modbus probing (2026-03-28/29/30):**
 - `grid_charge`: TOU periods (30411-30414) alone do NOT trigger charging. Remote control (30407=1, 30409=+100) is required.

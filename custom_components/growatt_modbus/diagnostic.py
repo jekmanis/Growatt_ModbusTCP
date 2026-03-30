@@ -1334,18 +1334,39 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             registers_written[VPP_TOU_NUM_PERIODS] = 0
 
             if mode == "passthrough":
+                # Release all overrides. Zero out power/duration defensively so no
+                # stale command remains if 30407 is re-enabled externally.
+                success = await _write(VPP_REMOTE_POWER_DURATION, 0)
+                if not success:
+                    _LOGGER.warning("[WIT] Failed to clear duration (30408=0)")
+                success = await _write(VPP_REMOTE_POWER_PERCENT, 0)
+                if not success:
+                    _LOGGER.warning("[WIT] Failed to clear power (30409=0)")
                 success = await _write(VPP_REMOTE_POWER_ENABLE, 0)
                 if not success:
                     raise ValueError("Failed to disable remote power control (30407)")
+                registers_written[VPP_REMOTE_POWER_DURATION] = 0
+                registers_written[VPP_REMOTE_POWER_PERCENT] = 0
                 registers_written[VPP_REMOTE_POWER_ENABLE] = 0
 
             elif mode in ("hold", "preserve_soc"):
                 # Preserve SOC: battery idle, PV charges battery, surplus exports.
                 # 30407=0 disables remote control — inverter follows base mode
                 # (30476=0 Load First). 30407=1 clips PV export — confirmed by probing.
+                # Defensive: zero out 30409/30408 so no stale charge/discharge command
+                # remains on hardware — prevents unintended action if 30407 is re-enabled
+                # externally (Growatt cloud, inverter panel, or manual register write).
+                success = await _write(VPP_REMOTE_POWER_DURATION, 0)
+                if not success:
+                    _LOGGER.warning("[WIT] Failed to clear duration (30408=0)")
+                success = await _write(VPP_REMOTE_POWER_PERCENT, 0)
+                if not success:
+                    _LOGGER.warning("[WIT] Failed to clear power (30409=0)")
                 success = await _write(VPP_REMOTE_POWER_ENABLE, 0)
                 if not success:
                     raise ValueError("Failed to disable remote power control (30407)")
+                registers_written[VPP_REMOTE_POWER_DURATION] = 0
+                registers_written[VPP_REMOTE_POWER_PERCENT] = 0
                 registers_written[VPP_REMOTE_POWER_ENABLE] = 0
 
             elif mode == "grid_charge":

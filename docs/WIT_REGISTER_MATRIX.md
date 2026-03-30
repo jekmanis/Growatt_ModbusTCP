@@ -18,14 +18,14 @@ Pilns pārskats par to, kuri reģistri tiek iestatīti katrā `set_wit_mode` re�
 |---|---|---|---|---|---|---|---|
 | **30100** | VPP Control Authority | **1** | **1** | **1** | **1** | **1** | **1** |
 | **30476** | Priority Mode | **1** (Bat First) | **1** (Bat First) | **1** (Bat First) | **1** (Bat First) | **0** (Load First) | **0** (Load First) |
-| **30410** | AC Charge Enable | **1** (PV priority) | **0** (disabled) | **0** (disabled) | **0** (disabled) | **0** (disabled) | -- |
+| **30410** | AC Charge Enable | **1** (PV priority) | **0** (disabled) | **0** (disabled) | **0** (disabled) | **0** (disabled) | **0** (disabled) |
 | **30404** | Charge Cutoff SOC | soc%* | soc%* | soc%* | soc%* | soc%* | soc%* |
 | **30405** | Discharge Cutoff SOC | soc%* | soc%* | soc%* | soc%* | soc%* | soc%* |
 | **30200** | Export Limit Enable | **0** (off) | **1** (on) | **0** (off) | **0** (off) | **0** (off) | **0** (off) |
 | **30201** | Export Limit Rate | -- | **0** (zero export) | -- | -- | -- | -- |
 | **30411** | TOU Period Count | **0** (clear) | **0** (clear) | **0** (clear) | **0** (clear) | **0** (clear) | **0** (clear) |
-| **30408** | Remote Power Duration | **duration** min | **duration** min | **duration** min | **duration** min | **duration** min | -- |
-| **30409** | Remote Power % | **+power%** | **65536-power%** | **65536-power%** | **65436** (=-100%) | **0** | -- |
+| **30408** | Remote Power Duration | **duration** min | **duration** min | **duration** min | **duration** min | **0** (clear) | **0** (clear) |
+| **30409** | Remote Power % | **+power%** | **65536-power%** | **65536-power%** | **65436** (=-100%) | **0** (clear) | **0** (clear) |
 | **30407** | Remote Power Enable | **1** (on) | **1** (on) | **1** (on) | **1** (on) | **0** (off) | **0** (off) |
 
 ### Kopsavilkums: reģistri, kas eksplicīti iestatīti katrā režīmā
@@ -34,15 +34,15 @@ Pilns pārskats par to, kuri reģistri tiek iestatīti katrā `set_wit_mode` re�
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
 | 30100 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | 30476 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| 30410 | ✓ | ✓ | ✓ | ✓ | ✓ | -- |
+| 30410 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | 30200 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | 30201 | -- | ✓ | -- | -- | -- | -- |
 | 30411 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| 30408 | ✓ | ✓ | ✓ | ✓ | ✓ | -- |
-| 30409 | ✓ | ✓ | ✓ | ✓ | ✓ | -- |
+| 30408 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 30409 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | 30407 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 
-`--` = netiek rakstīts (nav nepieciešams: 30201 ir nerelevants kad 30200=0; passthrough apzināti atbrīvo overrides).
+`--` = 30201 netiek rakstīts kad 30200=0 (limiteris izslēgts, rate vērtība nerelevanta).
 
 ---
 
@@ -82,7 +82,7 @@ Atklāts 2026-03-30: grid_charge ar 30476=0 → 0W; ar 30476=1 → 3kW+. Vērtī
 | Discharge to Grid | **0** (disabled) | Nav nepieciešama tīkla lādēšana |
 | Max Export | **0** (disabled) | Nav nepieciešama tīkla lādēšana |
 | Preserve SOC | **0** (disabled) | Nav nepieciešama tīkla lādēšana |
-| Passthrough | -- | Apzināti netiek mainīts — pilnīgs overridu atbrīvošana |
+| Passthrough | **0** (disabled) | Defensīvi notīra, lai nepaliktu stale vērtība |
 
 Ja `ac_charge_mode` parametrs norādīts servisa izsaukumā, tas pārraksta režīma noklusējumu.
 
@@ -126,8 +126,8 @@ Vienmēr **0** visos režīmos. Notīra TOU periodu paliekas.
 | Discharge to Load | **duration_minutes** | Noklusējums: 60 (preset: 120) |
 | Discharge to Grid | **duration_minutes** | Noklusējums: 60 (preset: 120) |
 | Max Export | **duration_minutes** | Noklusējums: 60 (preset: 120) |
-| Preserve SOC | **duration_minutes** | Tiek rakstīts, bet 30407=0 nozīmē, ka taimeris nav aktīvs |
-| **Passthrough** | -- | Netiek rakstīts — pilnīgs overridu atbrīvošana |
+| Preserve SOC | **0** (clear) | Defensīvi nodzēš — ja 30407 tiek atkārtoti ieslēgts ārēji, taimeris nesāksies |
+| Passthrough | **0** (clear) | Defensīvi nodzēš stale vērtību |
 
 ### 30409 — Remote Power Percent
 | Režīms | Vērtība | Nozīme |
@@ -136,8 +136,8 @@ Vienmēr **0** visos režīmos. Notīra TOU periodu paliekas.
 | **Discharge to Load** | **65536 - power%** | Negatīvs (unsigned) = izlāde |
 | **Discharge to Grid** | **65536 - power%** | Negatīvs (unsigned) = izlāde |
 | **Max Export** | **65436** (= 65536-100) | Vienmēr 100% izlāde |
-| **Preserve SOC** | **0** | Akumulators dīkstāvē |
-| Passthrough | -- | Netiek rakstīts |
+| **Preserve SOC** | **0** (clear) | Defensīvi nodzēš — neļauj stale charge/discharge komandai palikt hardware |
+| **Passthrough** | **0** (clear) | Defensīvi nodzēš stale vērtību |
 
 ### 30407 — Remote Power Enable (VIENMĒR PĒDĒJAIS)
 | Režīms | Vērtība | Piezīme |
@@ -174,13 +174,14 @@ Vienmēr **0** visos režīmos. Notīra TOU periodu paliekas.
 ### Reģistri bez mantojuma riska (iestatīti VISOS režīmos):
 - **30100** — vienmēr 1
 - **30476** — vienmēr eksplicīti (1 vai 0)
+- **30410** — vienmēr eksplicīti (0 vai 1)
 - **30200** — vienmēr eksplicīti (0 vai 1)
 - **30411** — vienmēr 0
+- **30408** — vienmēr eksplicīti (duration vai 0)
+- **30409** — vienmēr eksplicīti (power vai 0)
 - **30407** — vienmēr eksplicīti (0 vai 1)
 
 ### Reģistri ar minimālu mantojuma risku:
-- **30410** — netiek mainīts tikai passthrough (apzināti — pilnīgs atbrīvošana)
-- **30408/30409** — netiek mainīts tikai passthrough (30407=0 tos atslēdz)
 - **30201** — rakstīts tikai ar 30200=1 (kad 30200=0, vērtība ir nerelevanta)
 
 ### Reģistri, kas var palikt mantojumā:
