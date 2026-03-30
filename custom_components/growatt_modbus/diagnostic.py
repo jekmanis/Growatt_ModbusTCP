@@ -1316,15 +1316,23 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     registers_written[VPP_EXPORT_LIMIT_ENABLE] = 1
                     registers_written[VPP_EXPORT_LIMIT_RATE] = export_rate
             elif mode == "discharge_to_load":
-                await _write(VPP_EXPORT_LIMIT_ENABLE, 1)
-                await _write(VPP_EXPORT_LIMIT_RATE, 0)
+                # Zero export is CRITICAL for discharge_to_load — without it,
+                # mode appears as "Max Export" (battery dumps to grid).
+                success = await _write(VPP_EXPORT_LIMIT_ENABLE, 1)
+                if not success:
+                    raise ValueError("Failed to enable export limit (30200=1) — discharge would export to grid!")
+                success = await _write(VPP_EXPORT_LIMIT_RATE, 0)
+                if not success:
+                    raise ValueError("Failed to set zero export rate (30201=0)")
                 registers_written[VPP_EXPORT_LIMIT_ENABLE] = 1
                 registers_written[VPP_EXPORT_LIMIT_RATE] = 0
             elif mode in ("max_export", "discharge_to_grid", "hold", "preserve_soc",
                           "grid_charge", "passthrough"):
                 # Export enabled: clear stale zero-export from previous modes
-                # (grid_charge needs this — stale 30200=1 from discharge_to_load blocks TOU charging)
-                await _write(VPP_EXPORT_LIMIT_ENABLE, 0)
+                # (grid_charge needs this — stale 30200=1 from discharge_to_load blocks charging)
+                success = await _write(VPP_EXPORT_LIMIT_ENABLE, 0)
+                if not success:
+                    _LOGGER.warning("[WIT] Failed to clear export limit (30200=0)")
                 registers_written[VPP_EXPORT_LIMIT_ENABLE] = 0
 
             # ---- Step 5: Battery power command ----
