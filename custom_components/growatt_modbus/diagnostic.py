@@ -1293,26 +1293,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     _LOGGER.warning("[WIT] Failed to write charge cutoff SOC (30404=%d)", charge_cutoff_soc)
                 registers_written[VPP_CHARGE_CUTOFF_SOC] = charge_cutoff_soc
 
-            if mode in ("hold", "preserve_soc"):
-                # Block discharge: set cutoff to max allowed (30) so inverter stops
-                # draining battery. 30476=0 (Load First) alone does NOT prevent
-                # discharge — it means "serve load first, including from battery".
-                # Hardware limit: 30405 range is [10, 30] — values >30 are rejected
-                # with Modbus Illegal Function. Discovered 2026-03-30.
-                dch_soc = discharge_cutoff_soc if discharge_cutoff_soc is not None else 30
-                success = await _write(VPP_DISCHARGE_CUTOFF_SOC, dch_soc)
-                if not success:
-                    _LOGGER.warning("[WIT] Failed to write discharge cutoff SOC (30405=%d)", dch_soc)
-                registers_written[VPP_DISCHARGE_CUTOFF_SOC] = dch_soc
-            elif mode == "passthrough":
-                # Restore safe default so stale 30405=100 from preserve_soc doesn't
-                # block discharge in normal operation.
-                dch_soc = discharge_cutoff_soc if discharge_cutoff_soc is not None else 10
-                success = await _write(VPP_DISCHARGE_CUTOFF_SOC, dch_soc)
-                if not success:
-                    _LOGGER.warning("[WIT] Failed to write discharge cutoff SOC (30405=%d)", dch_soc)
-                registers_written[VPP_DISCHARGE_CUTOFF_SOC] = dch_soc
-            elif discharge_cutoff_soc is not None:
+            if discharge_cutoff_soc is not None:
                 success = await _write(VPP_DISCHARGE_CUTOFF_SOC, discharge_cutoff_soc)
                 if not success:
                     _LOGGER.warning("[WIT] Failed to write discharge cutoff SOC (30405=%d)", discharge_cutoff_soc)
