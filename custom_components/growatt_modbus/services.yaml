@@ -409,17 +409,17 @@ set_wit_mode:
             - ac_priority
     charge_cutoff_soc:
       name: Charge Cutoff SOC
-      description: "Stop charging when battery reaches this SOC (10-100%)."
+      description: "Stop charging when battery reaches this SOC. Hardware range: 70-100%."
       selector:
         number:
-          min: 10
+          min: 70
           max: 100
           unit_of_measurement: "%"
     discharge_cutoff_soc:
       name: Discharge Cutoff SOC
-      description: "Stop discharging when battery drops to this SOC (10-100%)."
+      description: "Stop discharging when battery drops to this SOC. Hardware range: 10-30%. Preserve SOC uses 30 (max) by default."
       selector:
         number:
           min: 10
-          max: 100
+          max: 30
           unit_of_measurement: "%"

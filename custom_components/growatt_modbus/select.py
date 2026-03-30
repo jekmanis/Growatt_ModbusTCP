@@ -50,7 +50,7 @@ WIT_MODE_PRESETS = {
     },
     "Preserve SOC": {
         "mode": "preserve_soc",
-        "duration_minutes": 120,
+        "discharge_cutoff_soc": 30,
     },
     "Passthrough": {
         "mode": "passthrough",

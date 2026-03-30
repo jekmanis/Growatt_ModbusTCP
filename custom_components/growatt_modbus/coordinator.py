@@ -363,12 +363,9 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             data.wit_mode_export_rate = 100  # No limiter = full export
 
         if not remote_enable:
-            # No remote override — check coordinator state for non-register modes
-            if getattr(self, 'wit_direct_mode', None) in ("hold", "preserve_soc"):
-                # Hold uses 30407=0 (no register signature) — use coordinator tracking
-                data.wit_mode_status = "Preserve SOC"
-            else:
-                data.wit_mode_status = "Passthrough"
+            # No remote override active — this is Passthrough
+            # (Preserve SOC now uses 30407=1 with 30409=1, so it won't hit this branch)
+            data.wit_mode_status = "Passthrough"
             data.wit_mode_power_percent = 0
         elif power_signed > 1:
             data.wit_mode_status = "Grid Charge"

@@ -190,10 +190,10 @@ SERVICE_SET_WIT_MODE_SCHEMA = vol.Schema({
     ),
     vol.Optional("ac_charge_mode"): vol.In(["disabled", "pv_priority", "ac_priority"]),
     vol.Optional("charge_cutoff_soc"): vol.All(
-        vol.Coerce(int), vol.Range(min=10, max=100)
+        vol.Coerce(int), vol.Range(min=70, max=100)
     ),
     vol.Optional("discharge_cutoff_soc"): vol.All(
-        vol.Coerce(int), vol.Range(min=10, max=100)
+        vol.Coerce(int), vol.Range(min=10, max=30)
     ),
 })
 
@@ -1248,11 +1248,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
             # Set priority mode based on operating mode.
             # 30476 affects behavior BOTH with and without remote control:
-            #   30476=1 (Battery First): required for charging at high SOC,
-            #     allows PV surplus to charge battery during discharge modes
-            #   30476=0 (Load First): safe fallback when 30407=0 (hold/passthrough),
-            #     prevents unwanted battery discharge to grid
-            if mode in ("hold", "preserve_soc", "passthrough"):
+            #   30476=1 (Battery First): required for grid charging, preserve_soc (30409=1),
+            #     and PV surplus routing during discharge modes
+            #   30476=0 (Load First): safe fallback for passthrough only
+            if mode == "passthrough":
                 success = await _write(VPP_PRIORITY_MODE, 0)
                 if not success:
                     _LOGGER.warning("[WIT] Failed to set priority mode (30476=0)")
@@ -1294,7 +1293,26 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     _LOGGER.warning("[WIT] Failed to write charge cutoff SOC (30404=%d)", charge_cutoff_soc)
                 registers_written[VPP_CHARGE_CUTOFF_SOC] = charge_cutoff_soc
 
-            if discharge_cutoff_soc is not None:
+            if mode in ("hold", "preserve_soc"):
+                # Block discharge: set cutoff to max allowed (30) so inverter stops
+                # draining battery. 30476=0 (Load First) alone does NOT prevent
+                # discharge — it means "serve load first, including from battery".
+                # Hardware limit: 30405 range is [10, 30] — values >30 are rejected
+                # with Modbus Illegal Function. Discovered 2026-03-30.
+                dch_soc = discharge_cutoff_soc if discharge_cutoff_soc is not None else 30
+                success = await _write(VPP_DISCHARGE_CUTOFF_SOC, dch_soc)
+                if not success:
+                    _LOGGER.warning("[WIT] Failed to write discharge cutoff SOC (30405=%d)", dch_soc)
+                registers_written[VPP_DISCHARGE_CUTOFF_SOC] = dch_soc
+            elif mode == "passthrough":
+                # Restore safe default so stale 30405=100 from preserve_soc doesn't
+                # block discharge in normal operation.
+                dch_soc = discharge_cutoff_soc if discharge_cutoff_soc is not None else 10
+                success = await _write(VPP_DISCHARGE_CUTOFF_SOC, dch_soc)
+                if not success:
+                    _LOGGER.warning("[WIT] Failed to write discharge cutoff SOC (30405=%d)", dch_soc)
+                registers_written[VPP_DISCHARGE_CUTOFF_SOC] = dch_soc
+            elif discharge_cutoff_soc is not None:
                 success = await _write(VPP_DISCHARGE_CUTOFF_SOC, discharge_cutoff_soc)
                 if not success:
                     _LOGGER.warning("[WIT] Failed to write discharge cutoff SOC (30405=%d)", discharge_cutoff_soc)
@@ -1351,23 +1369,24 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
             elif mode in ("hold", "preserve_soc"):
                 # Preserve SOC: battery idle, PV charges battery, surplus exports.
-                # 30407=0 disables remote control — inverter follows base mode
-                # (30476=0 Load First). 30407=1 clips PV export — confirmed by probing.
-                # Defensive: zero out 30409/30408 so no stale charge/discharge command
-                # remains on hardware — prevents unintended action if 30407 is re-enabled
-                # externally (Growatt cloud, inverter panel, or manual register write).
-                success = await _write(VPP_REMOTE_POWER_DURATION, 0)
+                # Uses 30407=1 with 30409=1 (charge at 1%) to block discharge at any
+                # SOC level. 30405=30 (max hardware allows) as safety net.
+                # 30407=0 does NOT work: Load First (30476=0) still discharges battery
+                # to serve load. 30407=1 + 30409=0 clips PV export.
+                # 30409=1 (tiny charge) effectively holds battery without PV clipping.
+                # Confirmed 2026-03-30: Bat goes from -700W to -36W (standby only).
+                success = await _write(VPP_REMOTE_POWER_DURATION, duration_minutes)
                 if not success:
-                    _LOGGER.warning("[WIT] Failed to clear duration (30408=0)")
-                success = await _write(VPP_REMOTE_POWER_PERCENT, 0)
+                    raise ValueError("Failed to write duration (30408)")
+                success = await _write(VPP_REMOTE_POWER_PERCENT, 1)
                 if not success:
-                    _LOGGER.warning("[WIT] Failed to clear power (30409=0)")
-                success = await _write(VPP_REMOTE_POWER_ENABLE, 0)
+                    raise ValueError("Failed to write power (30409=1)")
+                success = await _write(VPP_REMOTE_POWER_ENABLE, 1)
                 if not success:
-                    raise ValueError("Failed to disable remote power control (30407)")
-                registers_written[VPP_REMOTE_POWER_DURATION] = 0
-                registers_written[VPP_REMOTE_POWER_PERCENT] = 0
-                registers_written[VPP_REMOTE_POWER_ENABLE] = 0
+                    raise ValueError("Failed to enable remote power control (30407)")
+                registers_written[VPP_REMOTE_POWER_DURATION] = duration_minutes
+                registers_written[VPP_REMOTE_POWER_PERCENT] = 1
+                registers_written[VPP_REMOTE_POWER_ENABLE] = 1
 
             elif mode == "grid_charge":
                 # Grid charge uses remote control (30407=1, 30409=+power%).
