@@ -161,7 +161,6 @@ SERVICE_GET_REGISTER_DATA_SCHEMA = vol.Schema(
 )
 
 WIT_MODE_CHOICES = [
-    "self_consumption",
     "grid_charge",
     "discharge_to_load",
     "discharge_to_grid",
@@ -1202,6 +1201,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         VPP_AC_CHARGE_ENABLE = 30410
         VPP_TOU_NUM_PERIODS = 30411
         VPP_TOU_PERIOD1_BASE = 30412  # 3 regs: start_min, end_min, power%
+        VPP_PRIORITY_MODE = 30476     # 0=Load First, 1=Battery First, 2=Grid First
 
         registers_written = {}
 
@@ -1236,11 +1236,28 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             return False
 
         try:
-            # ---- Step 1: Ensure VPP control authority is enabled ----
+            # ---- Step 1: Ensure VPP control authority + safe base mode ----
             success = await _write(VPP_CONTROL_AUTHORITY, 1)
             if not success:
                 _LOGGER.warning("[WIT] Failed to enable VPP control authority, continuing anyway...")
             registers_written[VPP_CONTROL_AUTHORITY] = 1
+
+            # Set priority mode based on operating mode.
+            # 30476 affects behavior BOTH with and without remote control:
+            #   30476=1 (Battery First): required for charging at high SOC,
+            #     allows PV surplus to charge battery during discharge modes
+            #   30476=0 (Load First): safe fallback when 30407=0 (hold/passthrough),
+            #     prevents unwanted battery discharge to grid
+            if mode in ("hold", "preserve_soc", "passthrough"):
+                success = await _write(VPP_PRIORITY_MODE, 0)
+                if not success:
+                    _LOGGER.warning("[WIT] Failed to set priority mode (30476=0)")
+                registers_written[VPP_PRIORITY_MODE] = 0
+            else:
+                success = await _write(VPP_PRIORITY_MODE, 1)
+                if not success:
+                    _LOGGER.warning("[WIT] Failed to set priority mode (30476=1)")
+                registers_written[VPP_PRIORITY_MODE] = 1
 
             # ---- Step 2: AC charge mode (before enabling remote control) ----
             if ac_charge_mode is not None:
@@ -1294,7 +1311,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                         _LOGGER.warning("[WIT] Failed to write export limit rate (30201=%d)", export_rate)
                     registers_written[VPP_EXPORT_LIMIT_ENABLE] = 1
                     registers_written[VPP_EXPORT_LIMIT_RATE] = export_rate
-            elif mode in ("self_consumption", "discharge_to_load"):
+            elif mode == "discharge_to_load":
                 await _write(VPP_EXPORT_LIMIT_ENABLE, 1)
                 await _write(VPP_EXPORT_LIMIT_RATE, 0)
                 registers_written[VPP_EXPORT_LIMIT_ENABLE] = 1
@@ -1307,18 +1324,11 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 registers_written[VPP_EXPORT_LIMIT_ENABLE] = 0
 
             # ---- Step 5: Battery power command ----
-            # Modes that don't use grid_charge TOU must clear leftover TOU periods
-            if mode != "grid_charge":
-                await _write(VPP_TOU_NUM_PERIODS, 0)
-                registers_written[VPP_TOU_NUM_PERIODS] = 0
+            # Clear any leftover TOU periods from previous modes
+            await _write(VPP_TOU_NUM_PERIODS, 0)
+            registers_written[VPP_TOU_NUM_PERIODS] = 0
 
             if mode == "passthrough":
-                success = await _write(VPP_REMOTE_POWER_ENABLE, 0)
-                if not success:
-                    raise ValueError("Failed to disable remote power control (30407)")
-                registers_written[VPP_REMOTE_POWER_ENABLE] = 0
-
-            elif mode == "self_consumption":
                 success = await _write(VPP_REMOTE_POWER_ENABLE, 0)
                 if not success:
                     raise ValueError("Failed to disable remote power control (30407)")
@@ -1342,39 +1352,21 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 registers_written[VPP_REMOTE_POWER_ENABLE] = 0
 
             elif mode == "grid_charge":
-                # Grid charge uses TOU period instead of VPP direct (30407-30409).
-                # V2.02 firmware only supports 30410=1 (PV priority) which won't
-                # charge from grid when PV=0. TOU periods bypass this limitation.
-                now_dt = datetime.now()
-                current_minutes = now_dt.hour * 60 + now_dt.minute
-                start_min = max(0, current_minutes - 1)
-                end_min = min(1439, current_minutes + duration_minutes)
-
-                # Disable VPP remote control (TOU takes over)
-                success = await _write(VPP_REMOTE_POWER_ENABLE, 0)
+                # Grid charge uses remote control (30407=1, 30409=+power%).
+                # Requires 30476=1 (Battery First) — with 30476=0 or 2, charging = 0W.
+                # Confirmed 2026-03-30: 30476=1 + 30407=1 + 30409=100 → 3kW+ charge.
+                success = await _write(VPP_REMOTE_POWER_DURATION, duration_minutes)
                 if not success:
-                    _LOGGER.warning("[WIT] Failed to disable remote control before TOU write")
-                registers_written[VPP_REMOTE_POWER_ENABLE] = 0
-
-                # Write TOU period: [start, end, power%] via FC 0x10
-                try:
-                    success = await hass.async_add_executor_job(
-                        client.write_registers, VPP_TOU_PERIOD1_BASE,
-                        [start_min, end_min, power_percent]
-                    )
-                    if not success:
-                        raise ValueError("Failed to write TOU period (30412-30414)")
-                except Exception as err:
-                    raise ValueError(f"Failed to write TOU period: {err}") from err
-                registers_written[VPP_TOU_PERIOD1_BASE] = start_min
-                registers_written[VPP_TOU_PERIOD1_BASE + 1] = end_min
-                registers_written[VPP_TOU_PERIOD1_BASE + 2] = power_percent
-
-                # Activate 1 TOU period
-                success = await _write(VPP_TOU_NUM_PERIODS, 1)
+                    raise ValueError("Failed to write duration (30408)")
+                success = await _write(VPP_REMOTE_POWER_PERCENT, power_percent)
                 if not success:
-                    raise ValueError("Failed to activate TOU period (30411)")
-                registers_written[VPP_TOU_NUM_PERIODS] = 1
+                    raise ValueError("Failed to write power (30409)")
+                success = await _write(VPP_REMOTE_POWER_ENABLE, 1)
+                if not success:
+                    raise ValueError("Failed to enable remote power control (30407)")
+                registers_written[VPP_REMOTE_POWER_DURATION] = duration_minutes
+                registers_written[VPP_REMOTE_POWER_PERCENT] = power_percent
+                registers_written[VPP_REMOTE_POWER_ENABLE] = 1
 
             elif mode in ("discharge_to_load", "discharge_to_grid", "max_export"):
                 p = power_percent if mode != "max_export" else 100
@@ -1421,7 +1413,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 "timestamp": now.isoformat(),
                 "override_expires": (
                     (now + timedelta(minutes=duration_minutes)).isoformat()
-                    if mode not in ("passthrough", "self_consumption", "hold", "preserve_soc") else None
+                    if mode not in ("passthrough", "hold", "preserve_soc") else None
                 ),
             }
 

@@ -354,7 +354,6 @@ set_wit_mode:
       name: Mode
       description: >
         Operating mode preset.
-        self_consumption: PV covers load, zero export, battery follows base mode.
         grid_charge: Charge battery from grid (+ PV supplement).
         discharge_to_load: Discharge battery to cover home load, zero export.
         discharge_to_grid: Discharge battery with export allowed (for selling).
@@ -366,7 +365,6 @@ set_wit_mode:
       selector:
         select:
           options:
-            - self_consumption
             - grid_charge
             - discharge_to_load
             - discharge_to_grid

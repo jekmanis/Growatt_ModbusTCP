@@ -495,7 +495,6 @@ SENSOR_OFFLINE_BEHAVIOR = {
 # ============================================================================
 
 WIT_MODES = [
-    "self_consumption",
     "grid_charge",
     "discharge_to_load",
     "discharge_to_grid",
@@ -506,7 +505,6 @@ WIT_MODES = [
 ]
 
 WIT_MODE_DISPLAY_NAMES = {
-    "self_consumption": "Self-consumption",
     "grid_charge": "Grid Charge",
     "discharge_to_load": "Discharge to Load",
     "discharge_to_grid": "Discharge to Grid",

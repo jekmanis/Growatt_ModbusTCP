@@ -24,10 +24,6 @@ _LOGGER = logging.getLogger(__name__)
 # Preset parameter maps for dashboard-friendly mode selection.
 # Each preset calls set_wit_mode with these defaults (user can override via service directly).
 WIT_MODE_PRESETS = {
-    "Self-consumption": {
-        "mode": "self_consumption",
-        "ac_charge_mode": "disabled",
-    },
     "Grid Charge": {
         "mode": "grid_charge",
         "power_percent": 100,

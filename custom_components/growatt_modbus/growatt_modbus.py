@@ -273,6 +273,7 @@ class GrowattData:
     vpp_charge_cutoff_soc: int = 100      # 10-100% (stop charging at this SOC; 100=charge to full)
     vpp_discharge_cutoff_soc: int = 10    # 10-100% (stop discharging at this SOC; 10=discharge to 10%)
     vpp_ac_charge_enable: int = 0         # 0=Disabled, 1=PV Priority, 2=AC Priority
+    vpp_tou_num_periods: int = 0          # 0-20 (number of active TOU periods)
 
     # WIT Direct Control Mode Status (computed from VPP control registers)
     wit_mode_status: str = ""
@@ -2229,6 +2230,20 @@ class GrowattModbus:
                                data.remote_power_control_enable, data.remote_power_control_charging_time, data.remote_charge_and_discharge_power)
             except Exception as e:
                 logger.debug(f"Could not read VPP remote power control registers 30407-30409: {e}")
+
+        # VPP AC Charge + TOU Periods (30410-30411)
+        if any(reg in holding_map for reg in [30410, 30411]):
+            try:
+                vpp_tou_regs = self.read_holding_registers(30410, 2)
+                if vpp_tou_regs is not None and len(vpp_tou_regs) >= 2:
+                    if 30410 in holding_map:
+                        data.vpp_ac_charge_enable = int(vpp_tou_regs[0])
+                    if 30411 in holding_map:
+                        data.vpp_tou_num_periods = int(vpp_tou_regs[1])
+                    logger.debug("[WIT VPP] vpp_ac_charge_enable=%s, vpp_tou_num_periods=%s",
+                               data.vpp_ac_charge_enable, data.vpp_tou_num_periods)
+            except Exception as e:
+                logger.debug(f"Could not read VPP AC charge/TOU registers 30410-30411: {e}")
 
     def get_status_text(self, status_code: int) -> str:
         """Convert status code to human readable text"""
