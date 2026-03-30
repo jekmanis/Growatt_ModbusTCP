@@ -17,16 +17,16 @@ Pilns pārskats par to, kuri reģistri tiek iestatīti katrā `set_wit_mode` re�
 | Reģistrs | Apraksts | Grid Charge | Discharge to Load | Discharge to Grid | Max Export | Preserve SOC | Passthrough |
 |---|---|---|---|---|---|---|---|
 | **30100** | VPP Control Authority | **1** | **1** | **1** | **1** | **1** | **1** |
-| **30476** | Priority Mode | **1** (Bat First) | **1** (Bat First) | **1** (Bat First) | **1** (Bat First) | **0** (Load First) | **0** (Load First) |
+| **30476** | Priority Mode | **1** (Bat First) | **1** (Bat First) | **1** (Bat First) | **1** (Bat First) | **1** (Bat First) | **0** (Load First) |
 | **30410** | AC Charge Enable | **1** (PV priority) | **0** (disabled) | **0** (disabled) | **0** (disabled) | **0** (disabled) | **0** (disabled) |
 | **30404** | Charge Cutoff SOC | soc%* | soc%* | soc%* | soc%* | soc%* | soc%* |
-| **30405** | Discharge Cutoff SOC | soc%* | soc%* | soc%* | soc%* | soc%* | soc%* |
+| **30405** | Discharge Cutoff SOC | soc%* | soc%* | soc%* | soc%* | **30** (preset) | soc%* |
 | **30200** | Export Limit Enable | **0** (off) | **1** (on) | **0** (off) | **0** (off) | **0** (off) | **0** (off) |
 | **30201** | Export Limit Rate | -- | **0** (zero export) | -- | -- | -- | -- |
 | **30411** | TOU Period Count | **0** (clear) | **0** (clear) | **0** (clear) | **0** (clear) | **0** (clear) | **0** (clear) |
-| **30408** | Remote Power Duration | **duration** min | **duration** min | **duration** min | **duration** min | **0** (clear) | **0** (clear) |
-| **30409** | Remote Power % | **+power%** | **65536-power%** | **65536-power%** | **65436** (=-100%) | **0** (clear) | **0** (clear) |
-| **30407** | Remote Power Enable | **1** (on) | **1** (on) | **1** (on) | **1** (on) | **0** (off) | **0** (off) |
+| **30408** | Remote Power Duration | **duration** min | **duration** min | **duration** min | **duration** min | **duration** min | **0** (clear) |
+| **30409** | Remote Power % | **+power%** | **65536-power%** | **65536-power%** | **65436** (=-100%) | **1** (hold) | **0** (clear) |
+| **30407** | Remote Power Enable | **1** (on) | **1** (on) | **1** (on) | **1** (on) | **1** (on) | **0** (off) |
 
 ### Kopsavilkums: reģistri, kas eksplicīti iestatīti katrā režīmā
 
@@ -59,7 +59,7 @@ Vienmēr **1** visos režīmos. Nodrošina VPP kontroles tiesības.
 | **Discharge to Load** | **1** (Battery First) | PV surplus lādē akumulatoru; ar 30476=0 tas nenotiek |
 | **Discharge to Grid** | **1** (Battery First) | PV surplus lādē akumulatoru izlādes laikā |
 | **Max Export** | **1** (Battery First) | Konsistenti ar citiem 30407=1 režīmiem |
-| **Preserve SOC** | **0** (Load First) | Drošs — novērš akumulatora izlādi uz tīklu |
+| **Preserve SOC** | **1** (Battery First) | 30407=1 aktīvs — konsistenti ar citiem 30407=1 režīmiem |
 | **Passthrough** | **0** (Load First) | Drošs — inverters seko normālai Load First uzvedībai |
 
 **Kāpēc tieši šī dalījums?**
@@ -91,10 +91,11 @@ Tiek rakstīts **tikai tad**, ja `charge_cutoff_soc` vai `discharge_cutoff_soc` 
 
 | Parametrs | Tipiski ar | Preset noklusējums |
 |---|---|---|
-| charge_cutoff_soc (30404) | Grid Charge | 100 |
-| discharge_cutoff_soc (30405) | Discharge režīmi | 10 |
+| charge_cutoff_soc (30404) | Grid Charge | 100 | Diapazons: **70-100%** |
+| discharge_cutoff_soc (30405) | Discharge režīmi | 10 | Diapazons: **10-30%** |
+| discharge_cutoff_soc (30405) | Preserve SOC | 30 | Max vērtība kā safety net |
 
-**Piezīme:** Šie ir vienīgie reģistri, kas var palikt mantojumā — bet tikai tad, ja lietotājs tos nenorada. Praktiski preset vienmēr norāda SOC vērtības.
+**Hardware ierobežojumi:** 30404 pieņem tikai [70,100], 30405 pieņem tikai [10,30]. Vērtības ārpus diapazona tiek noraidītas ar Modbus Illegal Function. Tiek rakstīts tikai ja parametrs norādīts (preset to norāda).
 
 ### 30200 — Export Limit Enable
 | Režīms | Vērtība | Piezīme |
@@ -126,7 +127,7 @@ Vienmēr **0** visos režīmos. Notīra TOU periodu paliekas.
 | Discharge to Load | **duration_minutes** | Noklusējums: 60 (preset: 120) |
 | Discharge to Grid | **duration_minutes** | Noklusējums: 60 (preset: 120) |
 | Max Export | **duration_minutes** | Noklusējums: 60 (preset: 120) |
-| Preserve SOC | **0** (clear) | Defensīvi nodzēš — ja 30407 tiek atkārtoti ieslēgts ārēji, taimeris nesāksies |
+| Preserve SOC | **duration_minutes** | 30407=1 aktīvs — override ilgums |
 | Passthrough | **0** (clear) | Defensīvi nodzēš stale vērtību |
 
 ### 30409 — Remote Power Percent
@@ -136,8 +137,10 @@ Vienmēr **0** visos režīmos. Notīra TOU periodu paliekas.
 | **Discharge to Load** | **65536 - power%** | Negatīvs (unsigned) = izlāde |
 | **Discharge to Grid** | **65536 - power%** | Negatīvs (unsigned) = izlāde |
 | **Max Export** | **65436** (= 65536-100) | Vienmēr 100% izlāde |
-| **Preserve SOC** | **0** (clear) | Defensīvi nodzēš — neļauj stale charge/discharge komandai palikt hardware |
+| **Preserve SOC** | **1** (charge 1%) | Efektīvi bloķē izlādi jebkurā SOC līmenī |
 | **Passthrough** | **0** (clear) | Defensīvi nodzēš stale vērtību |
+
+**Preserve SOC:** 30409=0 klipē PV eksportu, 30409=1 (charge 1%) — nē. Minimāla lādēšanas komanda efektīvi tur bateriju dīkstāvē. Apstiprināts: -700W → -36W (tikai BMS standby).
 
 ### 30407 — Remote Power Enable (VIENMĒR PĒDĒJAIS)
 | Režīms | Vērtība | Piezīme |
@@ -146,7 +149,7 @@ Vienmēr **0** visos režīmos. Notīra TOU periodu paliekas.
 | Discharge to Load | **1** | Remote control aktīvs |
 | Discharge to Grid | **1** | Remote control aktīvs |
 | Max Export | **1** | Remote control aktīvs |
-| **Preserve SOC** | **0** | Remote control izslēgts — ļauj PV eksportēt |
+| **Preserve SOC** | **1** | Remote control aktīvs — 30409=1 bloķē izlādi |
 | **Passthrough** | **0** | Remote control izslēgts — inverters seko 30476 |
 
 ---
@@ -193,7 +196,7 @@ Vienmēr **0** visos režīmos. Notīra TOU periodu paliekas.
 | # | Scenārijs | Bugs | Cēlonis | Labojums |
 |---|---|---|---|---|
 | 1 | `discharge_to_load` → `grid_charge` | Lādēšana bloķēta | 30200=1 (zero export) palika no discharge | Tagad grid_charge iestata 30200=0 |
-| 2 | Jebkurš → `preserve_soc` | Akumulators izlādējas 6kW | 30476=2 (Grid First) palika | Tagad preserve_soc iestata 30476=0 |
+| 2 | Jebkurš → `preserve_soc` (vecā versija) | Akumulators izlādējas 700W | 30407=0 + 30476=0 = Load First izlādē bateriju | **30407=1, 30409=1 (charge 1%)** |
 | 3 | `preserve_soc` → `grid_charge` | Lādēšana = 0W | 30476=0 (Load First) palika | **Tagad grid_charge iestata 30476=1** |
 | 4 | `preserve_soc` → `discharge_to_load` | PV surplus nelādē akumulatoru | 30476=0 palika | **Tagad discharge iestata 30476=1** |
 | 5 | `grid_charge` → `discharge_to_load` | AC charge joprojām aktīvs | 30410=1 palika | Tagad discharge iestata 30410=0 |
@@ -207,10 +210,10 @@ Kad režīms tiek izvēlēts caur **Mode Preset** dropdown:
 | Parametrs | Grid Charge | Discharge to Load | Discharge to Grid | Max Export | Preserve SOC | Passthrough |
 |---|---|---|---|---|---|---|
 | power_percent | 100 | 100 | 100 | *(nav)* | *(nav)* | *(nav)* |
-| duration_minutes | 120 | 120 | 120 | 120 | 120 | *(nav)* |
+| duration_minutes | 120 | 120 | 120 | 120 | *(nav)* | *(nav)* |
 | ac_charge_mode | pv_priority | *(nav)* | *(nav)* | *(nav)* | *(nav)* | *(nav)* |
 | charge_cutoff_soc | 100 | *(nav)* | *(nav)* | *(nav)* | *(nav)* | *(nav)* |
-| discharge_cutoff_soc | *(nav)* | 10 | 10 | 10 | *(nav)* | *(nav)* |
+| discharge_cutoff_soc | *(nav)* | 10 | 10 | 10 | 30 | *(nav)* |
 
 ---
 

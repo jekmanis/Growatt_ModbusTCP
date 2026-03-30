@@ -133,8 +133,8 @@ Combinations:
 
 | Parameter | Register | Range | Meaning |
 |---|---|---|---|
-| Charge cutoff | 30404 | 10-100% | Stop charging at this SOC |
-| Discharge cutoff | 30405 | 10-100% | Stop on-grid discharge at this SOC |
+| Charge cutoff | 30404 | **70-100%** | Stop charging at this SOC. Values <70 rejected. |
+| Discharge cutoff | 30405 | **10-30%** | Stop on-grid discharge at this SOC. Values >30 rejected. |
 
 ### Axis 5: Priority / Base Mode (register 30476)
 
@@ -152,8 +152,8 @@ Combinations:
 - **30476=0 + 30407=1 + discharge** → PV surplus does NOT charge battery
 
 The `set_wit_mode` service now sets 30476 explicitly for every mode:
-- **30476=1** (Battery First) for all modes with 30407=1: grid_charge, discharge_to_load, discharge_to_grid, max_export
-- **30476=0** (Load First) for all modes with 30407=0: hold, preserve_soc, passthrough
+- **30476=1** (Battery First) for all modes with 30407=1: grid_charge, discharge_to_load, discharge_to_grid, max_export, **preserve_soc**
+- **30476=0** (Load First) for passthrough only
 
 ## Mode Definitions
 
@@ -165,7 +165,7 @@ These are the **preset modes** available in the HA select entity and as shorthan
 | `discharge_to_load` | **1** | 1 | -power% | 1 | 0 | 0 | Discharge to cover load. Zero export. |
 | `discharge_to_grid` | **1** | 1 | -power% | 0 | -- | 0 | Discharge with export for selling. |
 | `max_export` | **1** | 1 | -100 | 0 | -- | 0 | Full discharge + max export. |
-| `hold` / `preserve_soc` | **0** | 0 | 0 | 0 | -- | 0 | Battery idle. PV covers load + exports. |
+| `hold` / `preserve_soc` | **1** | 1 | **1** | 0 | -- | 0 | Battery idle via charge 1%. Blocks discharge at any SOC. |
 | `passthrough` | **0** | 0 | 0 | 0 | -- | 0 | Release all overrides. Defensive zero-out. |
 
 **Every mode explicitly sets all critical registers.** No stale values remain on hardware between mode switches. "--" for 30201 means it is not written when 30200=0 (limiter disabled, rate irrelevant).

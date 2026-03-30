@@ -15,10 +15,16 @@ Forces the battery to discharge at full power with grid export enabled (30200=0)
 Full-power discharge with unrestricted export — maximum selling. The battery discharges at 100% and all surplus beyond home load is exported. This is the most aggressive selling mode, used when the spot price is at its peak and you want to extract maximum revenue from stored energy.
 
 ## Preserve SOC
-Battery sits idle — no charging from grid, no discharging. PV still powers your home first, and any surplus PV charges the battery. When the battery is full, surplus PV exports to the grid. Uses 30407=0 (remote control disabled) so the inverter doesn't clip PV export — confirmed by Modbus probing that 30407=1 with 30409=0 blocks PV export. Use this to preserve battery SOC for a planned discharge window later, or when electricity prices are mid-range and neither grid charging nor discharging makes economic sense.
+Battery sits idle — no charging from grid, no discharging. PV still powers your home first, and any surplus PV charges the battery. When the battery is full, surplus PV exports to the grid. Uses **30407=1 with 30409=1** (charge at 1%) which effectively holds the battery without actually charging. The discharge cutoff is set to 30% (max hardware allows) as a safety net.
+
+**Why not 30407=0?** Load First (30476=0, 30407=0) does NOT prevent discharge — the inverter drains battery to serve home load (~700W observed). 30405 (discharge cutoff) only accepts [10-30%], so it can't block discharge above 30% SOC. The 30409=1 approach blocks discharge at any SOC level. Confirmed 2026-03-30: battery power dropped from -700W to -36W (BMS standby only).
+
+**Why not 30409=0?** Testing confirmed that 30407=1 + 30409=0 clips PV export to 0W. 30409=1 (1% charge) avoids this — PV export remains functional (to be verified during daytime).
 
 ## Passthrough
-Releases all overrides completely. The inverter returns to whatever base mode is configured by register 30476 (reset to "Load First" by the service). No remote power control is active — the inverter follows its base mode. Use this to hand control back to the inverter's built-in logic, or as an emergency "undo everything" reset.
+Releases all overrides completely. The inverter returns to Load First base mode (30476=0). All power/duration registers are zeroed out defensively. No remote power control is active. Use this to hand control back to the inverter's built-in logic, or as an emergency "undo everything" reset.
+
+**Note:** Passthrough restores 30476=0 (Load First), which means the inverter MAY discharge battery to serve load. This is normal Load First behavior — if you want to prevent discharge, use Preserve SOC instead.
 
 ---
 
@@ -40,13 +46,14 @@ Register 30476 controls the inverter's priority behavior and affects operation *
 | Discharge to Load | **1** (Battery First) | PV surplus charges battery; 30476=0 would block this |
 | Discharge to Grid | **1** (Battery First) | PV surplus charges battery during discharge |
 | Max Export | **1** (Battery First) | Consistent with other 30407=1 modes |
-| Preserve SOC | **0** (Load First) | Safe — prevents unintended battery discharge |
+| Preserve SOC | **1** (Battery First) | 30407=1 aktīvs — konsistenti ar citiem 30407=1 režīmiem |
 | Passthrough | **0** (Load First) | Safe — inverter follows normal Load First behavior |
 
 ### Discovery timeline (2026-03-30)
 1. Stale 30476=2 (Grid First) caused "Preserve SOC" to discharge at 6kW → fix: set 30476=0 for hold modes
 2. Setting 30476=0 for ALL modes broke "Discharge to Load" (PV surplus stopped charging battery) → fix: keep 30476 unchanged for 30407=1 modes
-3. Grid charging failed with 30476=0 and 30476=2, only worked with **30476=1** → fix: set 30476=1 for all 30407=1 modes, 30476=0 for all 30407=0 modes. **No inheritance.**
+3. Grid charging failed with 30476=0 and 30476=2, only worked with **30476=1** → fix: set 30476=1 for all 30407=1 modes
+4. Preserve SOC with 30407=0, 30476=0 (Load First) still discharged at 700W → fix: **30407=1, 30409=1 (charge 1%)** blocks discharge at any SOC. 30405 range [10-30] too narrow to block. **No inheritance.**
 
 ---
 
@@ -178,5 +185,5 @@ condition:
 | `duration_minutes` | No | 60 | 1-1440 | Override duration before reverting to base mode |
 | `export_rate` | No | mode default | 0-100 | Grid export rate (0=zero export, 100=full) |
 | `ac_charge_mode` | No | mode default | disabled/pv_priority | Grid charging behavior (ac_priority rejected by V1.39 firmware) |
-| `charge_cutoff_soc` | No | unchanged | 10-100 | Stop charging at this SOC |
-| `discharge_cutoff_soc` | No | unchanged | 10-100 | Stop discharging at this SOC |
+| `charge_cutoff_soc` | No | unchanged | **70-100** | Stop charging at this SOC (hardware rejects <70) |
+| `discharge_cutoff_soc` | No | unchanged | **10-30** | Stop discharging at this SOC (hardware rejects >30) |
