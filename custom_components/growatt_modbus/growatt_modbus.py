@@ -273,7 +273,6 @@ class GrowattData:
     vpp_charge_cutoff_soc: int = 100      # 10-100% (stop charging at this SOC; 100=charge to full)
     vpp_discharge_cutoff_soc: int = 10    # 10-100% (stop discharging at this SOC; 10=discharge to 10%)
     vpp_ac_charge_enable: int = 0         # 0=Disabled, 1=PV Priority, 2=AC Priority
-    vpp_tou_num_periods: int = 0          # 0-20 (number of active TOU periods)
 
     # WIT Direct Control Mode Status (computed from VPP control registers)
     wit_mode_status: str = ""
@@ -1312,7 +1311,7 @@ class GrowattModbus:
                     logger.warning(
                         f"[WIT CTRL] Rate limit: Register {register} write blocked. "
                         f"Must wait {remaining:.1f}s more (30s cooldown between WIT control writes). "
-                        f"See docs/WIT_CONTROL_GUIDE.md for details."
+                        f"See docs/WIT_MODE_PRESETS.md for details."
                     )
                     return False
 
@@ -1470,7 +1469,7 @@ class GrowattModbus:
             if len(active_controls) > 1:
                 logger.warning(
                     f"[WIT CTRL] Multiple control mechanisms active simultaneously: {', '.join(active_controls)}. "
-                    f"This may cause conflicts. See docs/WIT_CONTROL_GUIDE.md for recommended patterns."
+                    f"This may cause conflicts. See docs/WIT_MODE_PRESETS.md for recommended patterns."
                 )
 
             # Detect potential TOU conflicts when enabling remote control
@@ -2231,19 +2230,15 @@ class GrowattModbus:
             except Exception as e:
                 logger.debug(f"Could not read VPP remote power control registers 30407-30409: {e}")
 
-        # VPP AC Charge + TOU Periods (30410-30411)
-        if any(reg in holding_map for reg in [30410, 30411]):
+        # VPP AC Charge Mode (30410)
+        if 30410 in holding_map:
             try:
-                vpp_tou_regs = self.read_holding_registers(30410, 2)
-                if vpp_tou_regs is not None and len(vpp_tou_regs) >= 2:
-                    if 30410 in holding_map:
-                        data.vpp_ac_charge_enable = int(vpp_tou_regs[0])
-                    if 30411 in holding_map:
-                        data.vpp_tou_num_periods = int(vpp_tou_regs[1])
-                    logger.debug("[WIT VPP] vpp_ac_charge_enable=%s, vpp_tou_num_periods=%s",
-                               data.vpp_ac_charge_enable, data.vpp_tou_num_periods)
+                vpp_ac_regs = self.read_holding_registers(30410, 1)
+                if vpp_ac_regs is not None and len(vpp_ac_regs) >= 1:
+                    data.vpp_ac_charge_enable = int(vpp_ac_regs[0])
+                    logger.debug("[WIT VPP] vpp_ac_charge_enable=%s", data.vpp_ac_charge_enable)
             except Exception as e:
-                logger.debug(f"Could not read VPP AC charge/TOU registers 30410-30411: {e}")
+                logger.debug(f"Could not read VPP AC charge register 30410: {e}")
 
     def get_status_text(self, status_code: int) -> str:
         """Convert status code to human readable text"""

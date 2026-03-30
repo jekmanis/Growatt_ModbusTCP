@@ -55,7 +55,7 @@ Register scan was conducted at night (SOC=10% confirmed), validating register 31
 
 **Bug fix (same PR):** Register 3136 was previously mapped as `battery_bms_temp` — a copy-paste error from a nearby temperature register. The raw value of 5305 × 0.1 = 530.5 kWh is clearly an energy value, not a temperature. Corrected to `ac_charge_energy_total_low`.
 
-**Battery control (MOD):** Battery control holding registers have not yet been confirmed for MOD hardware. Register scan showed the SPH-style 1000–1124 range returns all zeros, and VPP control (30099=0) is not available. Control is deferred to a follow-up release pending hardware confirmation. See [docs/CONTROL.md](docs/CONTROL.md) for details.
+**Battery control (MOD):** Battery control holding registers have not yet been confirmed for MOD hardware. Register scan showed the SPH-style 1000–1124 range returns all zeros, and VPP control (30099=0) is not available. Control is deferred to a follow-up release pending hardware confirmation. See [docs/DIRECT_CONTROL_OVERVIEW.md](docs/DIRECT_CONTROL_OVERVIEW.md) for details.
 
 ---
 
@@ -105,9 +105,7 @@ This release documents and validates the full control entity stack for SPH, SPF,
 | Remote Control Duration | Number | 30408 | 0–1440 min |
 | Remote Charge/Discharge Power | Number | 30409 | −100–+100 % |
 
-WIT commands are time-limited. The inverter reverts to its TOU schedule when the duration expires. See [docs/WIT_CONTROL_GUIDE.md](WIT_CONTROL_GUIDE.md) for the full VPP protocol explanation.
-
-📖 **[Full control documentation →](docs/CONTROL.md)**
+WIT commands are time-limited. The inverter reverts to its TOU schedule when the duration expires. See [docs/WIT_MODE_PRESETS.md](docs/WIT_MODE_PRESETS.md) for mode presets and [docs/DIRECT_CONTROL_OVERVIEW.md](docs/DIRECT_CONTROL_OVERVIEW.md) for the full VPP protocol explanation.
 
 ---
 
@@ -1993,7 +1991,7 @@ The code was logging this as a WARNING even though it's expected and harmless fo
    - Helps users identify problematic automation patterns
 
 4. **Comprehensive WIT Control Guide**
-   - New documentation: `docs/WIT_CONTROL_GUIDE.md`
+   - New documentation: `docs/WIT_MODE_PRESETS.md`
    - Explains VPP vs Legacy protocol differences
    - Shows proper WIT control patterns with examples
    - Documents why register 30476 is read-only
@@ -2017,7 +2015,7 @@ The code was logging this as a WARNING even though it's expected and harmless fo
 - 30409: Remote Charge/Discharge Power (-100% to +100%)
 
 **For WIT Users:**
-- **Read the guide**: See `docs/WIT_CONTROL_GUIDE.md` for proper control patterns
+- **Read the guide**: See `docs/WIT_MODE_PRESETS.md` for proper control patterns
 - **Use VPP remote control**: Don't try to write to register 30476
 - **Set durations**: All overrides should specify time duration (register 30408)
 - **Wait 30s between changes**: Rate limiting is intentional to prevent oscillation
@@ -2038,7 +2036,7 @@ The code was logging this as a WARNING even though it's expected and harmless fo
 - Log noise from missing grid-tied registers eliminated
 
 **For WIT users:**
-- **IMPORTANT:** Read `docs/WIT_CONTROL_GUIDE.md` if you use battery control features
+- **IMPORTANT:** Read `docs/WIT_MODE_PRESETS.md` if you use battery control features
 - Control writes now have 30s cooldown (prevents oscillation - this is intentional)
 - Register 30476 (priority_mode) is now correctly marked read-only
 - If you have automations that write to WIT controls rapidly, they may need adjustment
@@ -2057,7 +2055,7 @@ logger:
 ### Files Changed:
 - `custom_components/growatt_modbus/growatt_modbus.py` - Added AC charge/discharge energy register mapping for SPF + reduced log noise + WIT rate limiting + conflict detection
 - `custom_components/growatt_modbus/profiles/wit.py` - Marked priority_mode as read-only + added VPP control model documentation
-- `docs/WIT_CONTROL_GUIDE.md` - NEW: Comprehensive WIT control guide with examples and troubleshooting
+- `docs/WIT_MODE_PRESETS.md` - NEW: Comprehensive WIT control guide with examples and troubleshooting
 - `custom_components/growatt_modbus/manifest.json` - Version bump to 0.4.6
 - `README.md` - Version badge updated to 0.4.6
 - `RELEASENOTES.md` - Updated with v0.4.6 changes

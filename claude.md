@@ -2,6 +2,10 @@
 
 This document provides comprehensive guidelines for AI assistants (and developers) working on the Growatt Modbus Home Assistant integration.
 
+## Environment
+
+- **Python runner:** Use `uv` (not `python3` or `pip`). Example: `uv run python validate_sensors.py`, `uv run py_compile ...`
+
 ---
 
 ## 🚨 START HERE - Adding/Updating Sensors 🚨
@@ -15,19 +19,19 @@ This document provides comprehensive guidelines for AI assistants (and developer
 □ Step 3: Add sensor definition (sensor.py) - SENSOR_DEFINITIONS
 □ Step 4: Assign device type (const.py) - SENSOR_DEVICE_MAP
 □ Step 5: Add to sensor group (device_profiles.py) - BATTERY_SENSORS/GRID_SENSORS/etc
-□ Step 6: Run validation script: python3 validate_sensors.py --sensor <name>
+□ Step 6: Run validation script: uv run python validate_sensors.py --sensor <name>
 ```
 
 ### 2. **Validation Tools**
 ```bash
 # Validate a specific sensor
-python3 validate_sensors.py --sensor battery_power
+uv run python validate_sensors.py --sensor battery_power
 
 # Validate all sensors
-python3 validate_sensors.py
+uv run python validate_sensors.py
 
 # Validate entire profile
-python3 validate_sensors.py --profile sph
+uv run python validate_sensors.py --profile sph
 ```
 
 ### 3. **Quick Search Check**
@@ -237,7 +241,7 @@ GRID_SENSORS: Set[str] = {
 
 **Run the validation script (REQUIRED):**
 ```bash
-python3 validate_sensors.py --sensor your_sensor_name
+uv run python validate_sensors.py --sensor your_sensor_name
 ```
 
 This will automatically check:
@@ -447,8 +451,8 @@ Before committing changes:
 
 1. **Check syntax:**
    ```bash
-   python3 -m py_compile custom_components/growatt_modbus/profiles/*.py
-   python3 -m py_compile custom_components/growatt_modbus/*.py
+   uv run python -m py_compile custom_components/growatt_modbus/profiles/*.py
+   uv run python -m py_compile custom_components/growatt_modbus/*.py
    ```
 
 2. **Search for register name** across project:

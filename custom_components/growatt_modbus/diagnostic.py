@@ -1220,11 +1220,15 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             for attempt in range(retries):
                 try:
                     if reg in FC10_REGISTERS:
-                        ok = await hass.async_add_executor_job(client.write_registers, reg, [val])
+                        result = await hass.async_add_executor_job(client.write_registers, reg, [val])
                     else:
-                        ok = await hass.async_add_executor_job(client.write_register, reg, val)
-                    if ok is not False:
-                        return True
+                        result = await hass.async_add_executor_job(client.write_register, reg, val)
+                    if result is not None:
+                        if hasattr(result, 'isError'):
+                            if not result.isError():
+                                return True
+                        elif result is not False:
+                            return True
                 except Exception as err:
                     if attempt < retries - 1:
                         _LOGGER.debug("[WIT] Register %d write attempt %d failed: %s", reg, attempt + 1, err)
@@ -1276,7 +1280,8 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 if not success:
                     _LOGGER.warning("[WIT] Failed to write AC charge mode (30410=1)")
                 registers_written[VPP_AC_CHARGE_ENABLE] = 1
-            elif mode in ("discharge_to_load", "discharge_to_grid", "max_export", "hold", "preserve_soc"):
+            elif mode in ("discharge_to_load", "discharge_to_grid", "max_export",
+                          "hold", "preserve_soc", "passthrough"):
                 success = await _write(VPP_AC_CHARGE_ENABLE, 0)
                 if not success:
                     _LOGGER.warning("[WIT] Failed to write AC charge mode (30410=0)")
@@ -1335,20 +1340,12 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 registers_written[VPP_REMOTE_POWER_ENABLE] = 0
 
             elif mode in ("hold", "preserve_soc"):
-                # Preserve SOC: battery idle, PV charges battery, surplus exports
-                # Must disable remote power control (30407=0) so inverter doesn't
-                # override TOU and clip PV export — confirmed by Modbus probing.
-                success = await _write(VPP_REMOTE_POWER_DURATION, duration_minutes)
-                if not success:
-                    raise ValueError("Failed to write duration (30408)")
-                success = await _write(VPP_REMOTE_POWER_PERCENT, 0)
-                if not success:
-                    raise ValueError("Failed to write power (30409)")
+                # Preserve SOC: battery idle, PV charges battery, surplus exports.
+                # 30407=0 disables remote control — inverter follows base mode
+                # (30476=0 Load First). 30407=1 clips PV export — confirmed by probing.
                 success = await _write(VPP_REMOTE_POWER_ENABLE, 0)
                 if not success:
                     raise ValueError("Failed to disable remote power control (30407)")
-                registers_written[VPP_REMOTE_POWER_DURATION] = duration_minutes
-                registers_written[VPP_REMOTE_POWER_PERCENT] = 0
                 registers_written[VPP_REMOTE_POWER_ENABLE] = 0
 
             elif mode == "grid_charge":

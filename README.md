@@ -102,7 +102,7 @@ A native Home Assistant integration for Growatt solar inverters using direct Mod
 
 📖 **[Complete sensor list by model →](docs/MODELS.md#-sensor-availability-by-model)**
 
-📖 **[Inverter control guide (SPH / SPF / WIT / MOD) →](docs/CONTROL.md)**
+📖 **[WIT direct control overview →](docs/DIRECT_CONTROL_OVERVIEW.md)** | **[WIT mode presets →](docs/WIT_MODE_PRESETS.md)**
 
 ---
 
