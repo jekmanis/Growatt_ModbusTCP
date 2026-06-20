@@ -1112,7 +1112,7 @@ async def async_setup_entry(
     # arrives (coordinator.has_real_data becomes True). Any that now pass are added via
     # async_add_entities. The listener removes itself when all deferred sensors are
     # resolved or the config entry is unloaded.
-    created_keys = {e._sensor_key for e in entities}
+    created_keys = {e._sensor_key for e in entities if hasattr(e, "_sensor_key")}
     deferred: list[tuple[str, dict]] = [
         (sk, sd)
         for sk, sd in SENSOR_DEFINITIONS.items()
