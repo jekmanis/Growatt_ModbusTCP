@@ -1117,6 +1117,7 @@ async def async_setup_entry(
         (sk, sd)
         for sk, sd in SENSOR_DEFINITIONS.items()
         if sk in available_sensors and "condition" in sd and sk not in created_keys
+        and sk not in wit_custom_sensors
     ]
 
     if deferred:
