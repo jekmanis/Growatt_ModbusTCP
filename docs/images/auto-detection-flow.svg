@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 960 460" xmlns="http://www.w3.org/2000/svg"
+     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 Z" fill="#94A3B8"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="960" height="460" fill="#F8FAFC" rx="10"/>
+
+  <!-- Title -->
+  <text x="480" y="28" text-anchor="middle" font-size="13" font-weight="700" fill="#1E293B">Inverter Auto-Detection Flow</text>
+  <line x1="20" y1="36" x2="940" y2="36" stroke="#E2E8F0" stroke-width="1"/>
+
+  <!-- ════  START  ════ -->
+  <rect x="350" y="48" width="260" height="30" rx="15" fill="#1E293B"/>
+  <text x="480" y="68" text-anchor="middle" font-size="11" font-weight="700" fill="#FFFFFF">Integration setup starts</text>
+  <line x1="480" y1="78" x2="480" y2="100" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- ════  Step 1: Read DTC 30000  ════ -->
+  <rect x="330" y="102" width="300" height="44" rx="7" fill="#EEF2FF" stroke="#6366F1" stroke-width="1.5"/>
+  <text x="480" y="119" text-anchor="middle" font-size="11" font-weight="600" fill="#4338CA">Read DTC register 30000</text>
+  <text x="480" y="136" text-anchor="middle" font-size="9" fill="#4338CA">VPP Identification — e.g. 5100, 5400, 5603</text>
+
+  <!-- Branch LEFT: Illegal Function / No response -->
+  <line x1="330" y1="124" x2="220" y2="124" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="274" y="118" text-anchor="middle" font-size="9" fill="#64748B">Illegal Function</text>
+  <text x="274" y="130" text-anchor="middle" font-size="9" fill="#64748B">/ No response</text>
+
+  <!-- Branch DOWN: Valid DTC -->
+  <line x1="480" y1="146" x2="480" y2="168" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="510" y="161" text-anchor="start" font-size="9" fill="#64748B">Valid DTC returned</text>
+
+  <!-- ════  LEFT BRANCH: Legacy probe  ════ -->
+  <rect x="60" y="102" width="158" height="44" rx="7" fill="#FFFBEB" stroke="#F59E0B" stroke-width="1.5"/>
+  <text x="139" y="119" text-anchor="middle" font-size="10" font-weight="600" fill="#92400E">Model name probe</text>
+  <text x="139" y="136" text-anchor="middle" font-size="9" fill="#78350F">Registers 125–132</text>
+  <!-- Arrow down from left branch -->
+  <line x1="139" y1="146" x2="139" y2="168" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- LEFT BRANCH: Pattern match -->
+  <rect x="60" y="170" width="158" height="44" rx="7" fill="#FFFBEB" stroke="#F59E0B" stroke-width="1.5"/>
+  <text x="139" y="187" text-anchor="middle" font-size="10" font-weight="600" fill="#92400E">Pattern match</text>
+  <text x="139" y="204" text-anchor="middle" font-size="9" fill="#78350F">MIN · MIC · SPH · SPF</text>
+
+  <!-- LEFT matched → down-right to confirm -->
+  <text x="82" y="230" text-anchor="middle" font-size="9" fill="#64748B">Matched</text>
+  <line x1="139" y1="214" x2="139" y2="370" stroke="#94A3B8" stroke-width="1.5"/>
+  <line x1="139" y1="370" x2="310" y2="370" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- LEFT no match → manual -->
+  <text x="27" y="244" text-anchor="middle" font-size="9" fill="#64748B">No match</text>
+  <line x1="60" y1="192" x2="20" y2="192" stroke="#94A3B8" stroke-width="1.5"/>
+  <line x1="20" y1="192" x2="20" y2="404" stroke="#94A3B8" stroke-width="1.5"/>
+  <line x1="20" y1="404" x2="640" y2="404" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- ════  CENTRE: DTC map lookup  ════ -->
+  <rect x="330" y="170" width="300" height="44" rx="7" fill="#EEF2FF" stroke="#6366F1" stroke-width="1.5"/>
+  <text x="480" y="187" text-anchor="middle" font-size="11" font-weight="600" fill="#4338CA">Look up DTC in profile map</text>
+  <text x="480" y="204" text-anchor="middle" font-size="9" fill="#4338CA">5100 → MIN TL-XH · 5400 → MOD · 5603 → WIT</text>
+
+  <!-- Unknown DTC → right branch -->
+  <line x1="630" y1="192" x2="742" y2="192" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="686" y="186" text-anchor="middle" font-size="9" fill="#64748B">Unknown DTC</text>
+
+  <!-- DTC found → refinement -->
+  <line x1="480" y1="214" x2="480" y2="236" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="510" y="229" text-anchor="start" font-size="9" fill="#64748B">DTC found</text>
+
+  <!-- ════  CENTRE: Refinement checks  ════ -->
+  <rect x="330" y="238" width="300" height="44" rx="7" fill="#EEF2FF" stroke="#6366F1" stroke-width="1.5"/>
+  <text x="480" y="255" text-anchor="middle" font-size="11" font-weight="600" fill="#4338CA">Refinement checks</text>
+  <text x="480" y="272" text-anchor="middle" font-size="9" fill="#4338CA">PV3 voltage? · Storage range responds?</text>
+
+  <!-- Refinement → confirm -->
+  <line x1="480" y1="282" x2="480" y2="370" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- ════  RIGHT BRANCH: Unknown DTC  ════ -->
+  <rect x="744" y="170" width="158" height="44" rx="7" fill="#FFFBEB" stroke="#F59E0B" stroke-width="1.5"/>
+  <text x="823" y="187" text-anchor="middle" font-size="10" font-weight="600" fill="#92400E">Model name probe</text>
+  <text x="823" y="204" text-anchor="middle" font-size="9" fill="#78350F">Registers 125–132</text>
+
+  <!-- Right matched → confirm -->
+  <text x="900" y="230" text-anchor="middle" font-size="9" fill="#64748B">Matched</text>
+  <line x1="823" y1="214" x2="823" y2="370" stroke="#94A3B8" stroke-width="1.5"/>
+  <line x1="823" y1="370" x2="650" y2="370" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Right no match → manual -->
+  <text x="930" y="244" text-anchor="middle" font-size="9" fill="#64748B">No match</text>
+  <line x1="902" y1="192" x2="940" y2="192" stroke="#94A3B8" stroke-width="1.5"/>
+  <line x1="940" y1="192" x2="940" y2="404" stroke="#94A3B8" stroke-width="1.5"/>
+  <line x1="940" y1="404" x2="870" y2="404" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- ════  CONFIRM  ════ -->
+  <rect x="310" y="372" width="280" height="44" rx="7" fill="#F0FDF4" stroke="#16A34A" stroke-width="2"/>
+  <text x="450" y="389" text-anchor="middle" font-size="11" font-weight="700" fill="#15803D">Profile confirmed</text>
+  <text x="450" y="406" text-anchor="middle" font-size="9" fill="#166534">High confidence · shown to user for approval</text>
+
+  <!-- ════  MANUAL  ════ -->
+  <rect x="640" y="372" width="220" height="44" rx="7" fill="#FFFBEB" stroke="#F59E0B" stroke-width="1.5"/>
+  <text x="750" y="389" text-anchor="middle" font-size="11" font-weight="700" fill="#92400E">Manual selection</text>
+  <text x="750" y="406" text-anchor="middle" font-size="9" fill="#78350F">User picks profile from dropdown</text>
+
+  <!-- Note -->
+  <text x="480" y="432" text-anchor="middle" font-size="9" fill="#94A3B8" font-style="italic">
+    If auto-detection picks the wrong profile: delete the integration entry and re-add with manual model selection.
+  </text>
+
+</svg>

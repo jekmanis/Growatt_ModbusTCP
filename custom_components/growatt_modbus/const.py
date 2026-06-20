@@ -45,7 +45,8 @@ CONF_DEVICE_PATH = "device_path"
 CONF_BAUDRATE = "baudrate"
 CONF_REGISTER_MAP = "register_map"
 CONF_INVERTER_SERIES = "inverter_series"
-CONF_INVERT_GRID_POWER = "invert_grid_power"  # For reversed CT clamps
+CONF_INVERT_GRID_POWER = "invert_grid_power"  # For reversed CT clamps (AC side)
+CONF_INVERT_BATTERY_POWER = "invert_battery_power"  # For inverters with opposite battery power sign
 CONF_DEVICE_STRUCTURE_VERSION = "device_structure_version"
 
 # Default Values
@@ -74,6 +75,8 @@ SENSOR_TYPES = {
         'battery_power', 'battery_charge_power', 'battery_discharge_power',
         # Three-phase power sensors
         'ac_power_r', 'ac_power_s', 'ac_power_t',
+        # SPF Off-Grid power sensors
+        'ac_input_power', 'ac_apparent_power', 'load_power',
     ],
 
     # Daily total sensors - retain until midnight, then reset
@@ -84,14 +87,23 @@ SENSOR_TYPES = {
         'battery_charge_today', 'battery_discharge_today',
         # SPF Off-Grid daily battery sensors
         'ac_charge_energy_today', 'ac_discharge_energy_today',
+        'op_discharge_energy_today',
+        # SPF generator daily energy
+        'generator_discharge_today',
     ],
 
     # Lifetime total sensors - always retain last value
     'lifetime_total': [
-        'energy_total', 'energy_to_grid_total', 'grid_import_energy_total',
+        'energy_total', 'pv_energy_total', 'energy_to_grid_total', 'grid_import_energy_total',
         'load_energy_total', 'energy_to_user_total', 'grid_energy_total',
         # Battery lifetime sensors
         'battery_charge_total', 'battery_discharge_total',
+        # SPF Off-Grid lifetime battery sensors
+        'op_discharge_energy_total',
+        # SPF/WIT AC charge/discharge lifetime totals
+        'ac_charge_energy_total', 'ac_discharge_energy_total',
+        # SPF generator lifetime energy
+        'generator_discharge_total',
     ],
 
     # Diagnostic sensors - go unavailable when offline
@@ -109,7 +121,7 @@ SENSOR_TYPES = {
     ],
 
     # Status sensors - show "offline" when not responding
-    'status': ['status', 'derating_mode', 'fault_code', 'warning_code',
+    'status': ['status', 'grid_connection_status', 'derating_mode', 'fault_code', 'warning_code',
                'priority_mode', 'battery_derating_mode'],
 }
 
@@ -151,6 +163,10 @@ WRITABLE_REGISTERS = {
     #   201 = Active Power Rate (%)
     #   202 = Work Mode / Remote Command (0 standby, 1 charge, 2 discharge)
     #   203 = Export Limit (W), 0 = zero export
+    #   30100 = VPP Control Authority (master enable)
+    #   30407 = Remote Power Control Enable (timed override)
+    #   30408 = Remote Power Control Charging Time (minutes)
+    #   30409 = Remote Charge/Discharge Power (%)
     # =========================================================================
     'active_power_rate': {
         'register': 201,
@@ -176,6 +192,98 @@ WRITABLE_REGISTERS = {
         'valid_range': (0, 20000),
         'unit': 'W',
         'desc': 'Export limit in watts (0 = zero export)'
+    },
+    'control_authority': {
+        'register': 30100,
+        'scale': 1,
+        'valid_range': (0, 1),
+        'options': {
+            0: 'Disabled',
+            1: 'Enabled'
+        },
+        'desc': 'VPP master enable switch'
+    },
+    'vpp_export_limit_enable': {
+        'register': 30200,
+        'scale': 1,
+        'valid_range': (0, 1),
+        'options': {
+            0: 'Disabled',
+            1: 'Enabled'
+        },
+        'desc': 'VPP Export limitation enable'
+    },
+    'vpp_export_limit_power_rate': {
+        'register': 30201,
+        'scale': 1,
+        'valid_range': (-100, 100),
+        'unit': '%',
+        'signed': True,
+        'desc': 'Export limit power rate (-100 to +100%, positive=export, 0=zero export)'
+    },
+    'remote_power_control_enable': {
+        'register': 30407,
+        'scale': 1,
+        'valid_range': (0, 1),
+        'options': {
+            0: 'Disabled',
+            1: 'Enabled'
+        },
+        'desc': 'Enable timed charge/discharge power override'
+    },
+    'remote_power_control_charging_time': {
+        'register': 30408,
+        'scale': 1,
+        'valid_range': (0, 1440),
+        'unit': 'min',
+        'desc': 'Duration for remote power control (0-1440 minutes)'
+    },
+    'remote_charge_and_discharge_power': {
+        'register': 30409,
+        'scale': 1,
+        'valid_range': (-100, 100),
+        'unit': '%',
+        'desc': 'Remote charge/discharge power (-100% to +100%, negative=discharge, positive=charge)',
+        'signed': True
+    },
+    'vpp_ac_charge_enable': {
+        'register': 30410,
+        'scale': 1,
+        'valid_range': (0, 2),
+        'options': {
+            0: 'Disabled',
+            1: 'PV priority',
+            2: 'AC priority',
+        },
+        'desc': 'AC charging enable (0=off, 1=PV charging first, 2=AC charging first)'
+    },
+
+
+    # WIT VPP SOC Cutoff Controls
+    'vpp_charge_cutoff_soc': {
+        'register': 30404,
+        'scale': 1,
+        'valid_range': (10, 100),
+        'unit': '%',
+        'desc': 'VPP charge cutoff SOC (stop charging at this SOC)'
+    },
+    'vpp_discharge_cutoff_soc': {
+        'register': 30405,
+        'scale': 1,
+        'valid_range': (10, 100),
+        'unit': '%',
+        'desc': 'VPP discharge cutoff SOC (stop discharging at this SOC)'
+    },
+    'vpp_ac_charge_enable': {
+        'register': 30410,
+        'scale': 1,
+        'valid_range': (0, 2),
+        'options': {
+            0: 'Disabled',
+            1: 'PV Priority',
+            2: 'AC Priority'
+        },
+        'desc': 'VPP AC charge mode (0=disabled, 1=PV priority, 2=AC priority)'
     },
 
 
@@ -226,43 +334,302 @@ WRITABLE_REGISTERS = {
     'ac_charge_current': {
         'register': 38,
         'scale': 1,
-        'valid_range': (0, 400),
+        'valid_range': (0, 80),
         'unit': 'A',
-        'desc': 'AC charging current limit'
+        'desc': 'AC charging current limit (0-80A, stored directly)'
     },
     'gen_charge_current': {
         'register': 83,
         'scale': 1,
-        'valid_range': (0, 400),
+        'valid_range': (0, 80),
         'unit': 'A',
-        'desc': 'Generator charging current limit'
+        'desc': 'Generator charging current limit (0-80A, stored directly)'
     },
     # Battery-type-dependent registers (special handling required)
     'bat_low_to_uti': {
         'register': 37,
         'scale': 0.1,
-        'valid_range': (5, 640),  # Full range: Lithium 0.5-10.0%, Non-Lithium 20.0-64.0V
+        'valid_range': (0, 1000),  # Full range: Lithium 0-100%, Non-Lithium 20.0-64.0V
         'unit': 'V/%',  # Unit depends on battery_type
-        'desc': 'Battery low voltage/SOC switch to utility',
+        'desc': 'Battery to Grid: SOC level to switch from battery to utility',
         'battery_dependent': True
     },
     'ac_to_bat_volt': {
         'register': 95,
         'scale': 0.1,
-        'valid_range': (5, 640),  # Full range: Lithium 0.5-10.0%, Non-Lithium 20.0-64.0V
+        'valid_range': (0, 1000),  # Full range: Lithium 0-100%, Non-Lithium 20.0-64.0V
         'unit': 'V/%',  # Unit depends on battery_type
-        'desc': 'AC to battery voltage/SOC switch point',
+        'desc': 'Grid to Battery: SOC level to switch back from utility to battery mode',
         'battery_dependent': True
+    },
+
+    'discharge_power_rate': {
+        'register': 1070,
+        'scale': 1,
+        'valid_range': (0, 100),
+        'unit': '%',
+        'desc': 'Battery discharge power rate limit (0-100%)'
+    },
+    'discharge_stopped_soc': {
+        'register': 1071,
+        'scale': 1,
+        'valid_range': (0, 100),
+        'unit': '%',
+        'desc': 'SOC level to stop battery discharge'
+    },
+    # Not in official Growatt Modbus protocol documentation.
+    # Source: https://www.photovoltaikforum.com/thread/192228-growatt-sph-modbus-rtu-rj45-pinout-und-register-beschreibung/?postID=3017838#post3017838
+    # Also used by the homeassistant-solax-modbus plugin_growatt.py (register 608, GEN3/SPH).
+    'load_first_battery_minimum_soc': {
+        'register': 608,
+        'scale': 1,
+        'valid_range': (10, 100),
+        'unit': '%',
+        'desc': 'Minimum battery SOC in Load First mode — inverter stops discharging below this level'
+    },
+    'charge_power_rate': {
+        'register': 1090,
+        'scale': 1,
+        'valid_range': (0, 100),
+        'unit': '%',
+        'desc': 'Battery charge power rate limit (0-100%)'
+    },
+    'charge_stopped_soc': {
+        'register': 1091,
+        'scale': 1,
+        'valid_range': (0, 100),
+        'unit': '%',
+        'desc': 'SOC level to stop battery charge'
+    },
+    'ac_charge_enable': {
+        'register': 1092,
+        'scale': 1,
+        'valid_range': (0, 1),
+        'options': {
+            0: 'Disabled',
+            1: 'Enabled'
+        },
+        'desc': 'Enable charging from AC (grid/backup)'
+    },
+    'system_enable': {
+        'register': 1008,
+        'scale': 1,
+        'valid_range': (0, 1),
+        'options': {
+            0: 'Disabled',
+            1: 'Enabled'
+        },
+        'desc': 'System enable control (SPH HU models)'
+    },
+
+    # AC Charge Time Period Controls (hex-packed: hours*256 + minutes, e.g. 06:00 = 0x0600 = 1536)
+    # These are SPH AC-charge scheduling slots (registers 1100-1108), distinct from
+    # the Battery First / Grid First extended slots at 1017-1088.
+    'time_period_1_start': {
+        'register': 1100,
+        'scale': 1,
+        'valid_range': (0, 5947),
+        'unit': '',
+        'label': 'AC Charge Time Period 1 Start',
+        'desc': 'AC charge period 1 start time (hex-packed: hours*256+minutes, e.g. 06:00 = 0x0600 = 1536)'
+    },
+    'time_period_1_end': {
+        'register': 1101,
+        'scale': 1,
+        'valid_range': (0, 5947),
+        'unit': '',
+        'label': 'AC Charge Time Period 1 End',
+        'desc': 'AC charge period 1 end time (hex-packed: hours*256+minutes, e.g. 22:00 = 0x1600 = 5632)'
+    },
+    'time_period_1_enable': {
+        'register': 1102,
+        'scale': 1,
+        'valid_range': (0, 1),
+        'options': {
+            0: 'Disabled',
+            1: 'Enabled'
+        },
+        'label': 'AC Charge Time Period 1 Enable',
+        'desc': 'Enable AC charge time period 1'
+    },
+    'time_period_2_start': {
+        'register': 1103,
+        'scale': 1,
+        'valid_range': (0, 5947),
+        'unit': '',
+        'label': 'AC Charge Time Period 2 Start',
+        'desc': 'AC charge period 2 start time (hex-packed: hours*256+minutes)'
+    },
+    'time_period_2_end': {
+        'register': 1104,
+        'scale': 1,
+        'valid_range': (0, 5947),
+        'unit': '',
+        'label': 'AC Charge Time Period 2 End',
+        'desc': 'AC charge period 2 end time (hex-packed: hours*256+minutes)'
+    },
+    'time_period_2_enable': {
+        'register': 1105,
+        'scale': 1,
+        'valid_range': (0, 1),
+        'options': {
+            0: 'Disabled',
+            1: 'Enabled'
+        },
+        'label': 'AC Charge Time Period 2 Enable',
+        'desc': 'Enable AC charge time period 2'
+    },
+    'time_period_3_start': {
+        'register': 1106,
+        'scale': 1,
+        'valid_range': (0, 5947),
+        'unit': '',
+        'label': 'AC Charge Time Period 3 Start',
+        'desc': 'AC charge period 3 start time (hex-packed: hours*256+minutes)'
+    },
+    'time_period_3_end': {
+        'register': 1107,
+        'scale': 1,
+        'valid_range': (0, 5947),
+        'unit': '',
+        'label': 'AC Charge Time Period 3 End',
+        'desc': 'AC charge period 3 end time (hex-packed: hours*256+minutes)'
+    },
+    'time_period_3_enable': {
+        'register': 1108,
+        'scale': 1,
+        'valid_range': (0, 1),
+        'options': {
+            0: 'Disabled',
+            1: 'Enabled'
+        },
+        'desc': 'Enable time period 3'
+    },
+
+    # SPH GEN3 Battery First extended time slots 4-6 (registers 1017-1025)
+    'batt_first_time_period_4_start': {'register': 1017, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 4 start (hex-packed: hours*256+minutes)'},
+    'batt_first_time_period_4_end':   {'register': 1018, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 4 end (hex-packed: hours*256+minutes)'},
+    'batt_first_time_period_4_enable': {'register': 1019, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 4'},
+    'batt_first_time_period_5_start': {'register': 1020, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 5 start (hex-packed: hours*256+minutes)'},
+    'batt_first_time_period_5_end':   {'register': 1021, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 5 end (hex-packed: hours*256+minutes)'},
+    'batt_first_time_period_5_enable': {'register': 1022, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 5'},
+    'batt_first_time_period_6_start': {'register': 1023, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 6 start (hex-packed: hours*256+minutes)'},
+    'batt_first_time_period_6_end':   {'register': 1024, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 6 end (hex-packed: hours*256+minutes)'},
+    'batt_first_time_period_6_enable': {'register': 1025, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 6'},
+
+    # SPH GEN3 Grid First extended time slots 4-6 (registers 1026-1034)
+    'grid_first_time_period_4_start': {'register': 1026, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 4 start (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_4_end':   {'register': 1027, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 4 end (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_4_enable': {'register': 1028, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 4'},
+    'grid_first_time_period_5_start': {'register': 1029, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 5 start (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_5_end':   {'register': 1030, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 5 end (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_5_enable': {'register': 1031, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 5'},
+    'grid_first_time_period_6_start': {'register': 1032, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 6 start (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_6_end':   {'register': 1033, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 6 end (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_6_enable': {'register': 1034, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 6'},
+
+    # SPH GEN3 Grid First extended time slots 7-9 (registers 1080-1088)
+    'grid_first_time_period_7_start': {'register': 1080, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 7 start (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_7_end':   {'register': 1081, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 7 end (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_7_enable': {'register': 1082, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 7'},
+    'grid_first_time_period_8_start': {'register': 1083, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 8 start (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_8_end':   {'register': 1084, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 8 end (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_8_enable': {'register': 1085, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 8'},
+    'grid_first_time_period_9_start': {'register': 1086, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 9 start (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_9_end':   {'register': 1087, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 9 end (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_9_enable': {'register': 1088, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 9'},
+
+    # MIN TL-X / TL-XH / MIC: fallback output power cap when export limitation control fails
+    'export_limit_failed_power_rate': {
+        'register': 3000,
+        'scale': 0.1,
+        'valid_range': (0, 1000),
+        'unit': '%',
+        'desc': 'Fallback output power rate applied when export limitation control fails (0–100%)'
+    },
+
+    # MOD GEN4 power rate limits for priority modes
+    # Scan #228 confirmed: 3036=100 (GridFirstDischargePowerRate), 3047=80 (BatFirstPowerRate)
+    'grid_first_discharge_power_rate': {
+        'register': 3036,
+        'scale': 1,
+        'valid_range': (1, 100),
+        'unit': '%',
+        'desc': 'Discharge power rate when Grid First mode (1-100%)'
+    },
+    'batt_first_charge_power_rate': {
+        'register': 3047,
+        'scale': 1,
+        'valid_range': (1, 100),
+        'unit': '%',
+        'desc': 'Charge power rate when Battery First mode (1-100%)'
+    },
+    'batt_first_charge_stopped_soc': {
+        'register': 3048,
+        'scale': 1,
+        'valid_range': (0, 100),
+        'unit': '%',
+        'desc': 'SOC to stop charging when Battery First mode is active (V1.39)'
+    },
+    'grid_first_discharge_stopped_soc': {
+        'register': 3067,
+        'scale': 1,
+        'valid_range': (1, 100),
+        'unit': '%',
+        'desc': 'SOC to stop discharging when Grid First mode is active (V1.39: US model / firmware ZACA-08+)'
+    },
+
+    # MOD GEN4 grid-charge prerequisite gate (must be Enabled for TOU writes to persist)
+    'allow_grid_charge': {
+        'register': 3049,
+        'scale': 1,
+        'valid_range': (0, 1),
+        'options': {
+            0: 'Disabled',
+            1: 'Enabled'
+        },
+        'desc': 'Allow Grid Charge — prerequisite gate for TOU persistence (MOD GEN4)',
     },
 }
 
 # Sensor offline behavior mapping
 SENSOR_OFFLINE_BEHAVIOR = {
-    'power': 0,                 # Power sensors go to 0W
-    'daily_total': 'retain',    # Daily totals retain until midnight
-    'lifetime_total': 'retain', # Lifetime totals always retain
+    'power': None,              # Power sensors go unavailable — inverter may be unreachable even when TCP adapter is connected (Issue #259)
+    'daily_total': None,        # Unavailable when offline — avoids retaining 0.0 initial state; HA resets total_increasing baseline after unavailable
+    'lifetime_total': None,     # Unavailable when offline — same reasoning; avoids total_increasing warnings from 32-bit register jitter
     'diagnostic': None,         # Diagnostic sensors go unavailable
     'status': 'offline',        # Status shows "offline"
+}
+
+
+# ============================================================================
+# WIT DIRECT CONTROL MODE CONSTANTS
+# ============================================================================
+
+WIT_MODES = [
+    "grid_charge",
+    "discharge_to_load",
+    "discharge_to_grid",
+    "max_export",
+    "preserve_soc",
+    "hold",
+    "passthrough",
+]
+
+WIT_MODE_DISPLAY_NAMES = {
+    "grid_charge": "Grid Charge",
+    "discharge_to_load": "Discharge to Load",
+    "discharge_to_grid": "Discharge to Grid",
+    "max_export": "Max Export",
+    "preserve_soc": "Preserve SOC",
+    "hold": "Preserve SOC",
+    "passthrough": "Passthrough",
+}
+
+WIT_AC_CHARGE_MODES = {
+    "disabled": 0,
+    "pv_priority": 1,
+    "ac_priority": 2,
 }
 
 
@@ -272,6 +639,31 @@ def get_sensor_type(sensor_key: str) -> str:
         if sensor_key in sensors:
             return sensor_type
     return 'diagnostic'  # Default to diagnostic if not found
+
+
+# GrowattData attrs for lifetime totals — must never drop to 0 during runtime
+# These are field names on the GrowattData dataclass, not sensor keys.
+LIFETIME_TOTAL_ATTRS = [
+    'energy_total', 'energy_to_grid_total', 'load_energy_total',
+    'energy_to_user_total',
+    'charge_energy_total', 'discharge_energy_total',
+    'op_discharge_energy_total',
+    'ac_charge_energy_total', 'ac_discharge_energy_total',
+    'generator_discharge_total',
+    'extra_energy_total', 'pv_energy_total',
+]
+
+# GrowattData attrs for daily totals — retain within day, clear at midnight
+DAILY_TOTAL_ATTRS = [
+    'energy_today', 'pv1_energy_today', 'pv2_energy_today', 'pv3_energy_today',
+    'energy_to_grid_today', 'load_energy_today',
+    'energy_to_user_today',
+    'charge_energy_today', 'discharge_energy_today',
+    'ac_charge_energy_today', 'ac_discharge_energy_today',
+    'op_discharge_energy_today',
+    'generator_discharge_today',
+    'extra_energy_today',
+]
 
 
 # ============================================================================
@@ -293,8 +685,12 @@ SENSOR_DEVICE_MAP = {
         'status', 'last_update', 'fault_code', 'warning_code', 'derating_mode',
         'inverter_temp', 'ipm_temp', 'boost_temp', 'dcdc_temp',
         'battery_derating_mode',  # Battery-related status on inverter
-        # SPF Off-Grid fan speeds and DC voltage input
-        'inverter_fan_speed', 'output_dc_voltage',
+        # SPF Off-Grid fan speeds
+        'inverter_fan_speed',
+        # WIT debug/safety registers (read-only, disabled by default)
+        'ntognd_detect', 'nonstd_vac_enable', 'enable_spec_set', 'fast_mppt_enable',
+        # WIT Direct Control mode status
+        'wit_mode_status',
     },
 
     # Solar device - PV production and AC output
@@ -304,8 +700,8 @@ SENSOR_DEVICE_MAP = {
         'pv2_voltage', 'pv2_current', 'pv2_power',
         'pv3_voltage', 'pv3_current', 'pv3_power',
         'pv_total_power',
-        # AC output (single phase)
-        'ac_voltage', 'ac_current', 'ac_power', 'ac_apparent_power', 'ac_frequency',
+        # AC output (single phase) - current and power
+        'ac_current', 'ac_power', 'ac_apparent_power', 'ac_frequency',
         'inverter_current',  # SPF: separate inverter current measurement
         # AC output (three phase)
         'ac_voltage_r', 'ac_voltage_s', 'ac_voltage_t',
@@ -313,8 +709,12 @@ SENSOR_DEVICE_MAP = {
         'ac_current_r', 'ac_current_s', 'ac_current_t',
         'ac_power_r', 'ac_power_s', 'ac_power_t',
         'system_output_power',
-        # Solar production energy
-        'energy_today', 'energy_total',
+        # Solar production energy (total and per-string daily)
+        'energy_today', 'energy_total', 'pv_energy_total',
+        'pv1_energy_today', 'pv2_energy_today', 'pv3_energy_today',
+        'pv1_energy_total', 'pv2_energy_total', 'pv3_energy_total',
+        # WIT: Extra/parallel inverter energy production
+        'extra_energy_today', 'extra_energy_total',
         # Self-consumption percentage (related to solar utilization)
         'self_consumption_percentage',
         # SPF Off-Grid MPPT fan and buck temperatures
@@ -324,10 +724,18 @@ SENSOR_DEVICE_MAP = {
     # Grid device - grid connection and import/export
     DEVICE_TYPE_GRID: {
         'grid_power', 'grid_export_power', 'grid_import_power',
+        'grid_connection_status',
         'grid_energy_today', 'grid_energy_total',
         'grid_import_energy_today', 'grid_import_energy_total',
         'energy_to_grid_today', 'energy_to_grid_total',
         'power_to_grid',
+        # SPF Off-Grid: AC input from grid/generator
+        'grid_voltage', 'grid_frequency', 'ac_input_power',
+        # SPF Off-Grid: Generator sensors
+        'generator_power', 'generator_voltage',
+        'generator_discharge_today', 'generator_discharge_total',
+        # WIT: Extra/parallel inverter power to grid
+        'extra_power_to_grid',
     },
 
     # Load device - consumption
@@ -336,8 +744,8 @@ SENSOR_DEVICE_MAP = {
         'load_energy_today', 'load_energy_total',
         'energy_to_user_today', 'energy_to_user_total',
         'self_consumption',
-        # SPF Off-Grid load percentage
-        'load_percentage',
+        # SPF Off-Grid: AC output to loads and DC bus voltage
+        'ac_voltage', 'output_dc_voltage', 'load_percentage',
     },
 
     # Battery device - storage
@@ -348,8 +756,20 @@ SENSOR_DEVICE_MAP = {
         'battery_charge_today', 'battery_discharge_today',
         'battery_charge_total', 'battery_discharge_total',
         'priority_mode',  # Battery priority mode
+        # WIT: Battery SOH and BMS voltage
+        'battery_soh', 'battery_voltage_bms',
         # SPF Off-Grid AC charge/discharge energy
-        'ac_charge_energy_today', 'ac_discharge_energy_today',
+        'ac_charge_energy_today', 'ac_charge_energy_total',
+        'ac_discharge_energy_today', 'ac_discharge_energy_total',
+        # SPF Off-Grid operational discharge energy
+        'op_discharge_energy_today', 'op_discharge_energy_total',
+        # BMS sensors (SPH HU and other models with battery management)
+        'bms_status', 'bms_error', 'bms_warn_info', 'bms_max_current',
+        'bms_cycle_count', 'bms_soh', 'bms_constant_volt',
+        'bms_max_cell_volt', 'bms_min_cell_volt',
+        'bms_module_num', 'bms_battery_count',
+        'bms_max_soc', 'bms_min_soc',
+        'bms_gauge_rm', 'bms_gauge_fcc', 'bms_fw_version', 'bms_delta_volt',
     },
 }
 
@@ -388,7 +808,13 @@ def get_device_type_for_control(control_name: str) -> str:
         'battery', 'bms', 'soc', 'charge_power', 'discharge_power',
         'ac_charge_power_rate', 'eod_voltage',
         # SPF off-grid battery controls
-        'charge_config', 'charge_current', 'bat_low', 'ac_to_bat'
+        'charge_config', 'charge_current', 'bat_low', 'ac_to_bat',
+        # SPH hybrid battery controls
+        'priority_mode', 'time_period', 'ac_charge_enable',
+        # MOD GEN4 battery charging gate
+        'allow_grid_charge',
+        # SPH GEN3 extended time slots (batt_first_* already caught by 'battery' but explicit here)
+        'batt_first', 'grid_first',
     ]):
         return DEVICE_TYPE_BATTERY
 
@@ -397,7 +823,9 @@ def get_device_type_for_control(control_name: str) -> str:
         'grid', 'ongrid', 'offgrid', 'vpp', 'export', 'import',
         'phase_mode', 'phase_sequence', 'antibackflow',
         # SPF off-grid AC input controls
-        'ac_input_mode'
+        'ac_input_mode',
+        # WIT VPP remote control
+        'control_authority', 'remote_power_control', 'remote_charge_and_discharge'
     ]):
         return DEVICE_TYPE_GRID
 
@@ -414,6 +842,22 @@ def get_device_type_for_control(control_name: str) -> str:
         return DEVICE_TYPE_SOLAR
 
     return DEVICE_TYPE_INVERTER
+
+
+# MOD TL3-XH TOU period register definitions (FC04 holding registers 3038-3059)
+# Slots 1-4: 3038-3045; gap at 3046-3049 (EMS/grid-charge); slots 5-9: 3050-3059
+# Used by time.py (time pickers) and select.py (priority/enable selects)
+MOD_TOU_PERIODS = [
+    {"period": 1, "start_reg": 3038, "end_reg": 3039, "start_field": "mod_tou_1_start", "end_field": "mod_tou_1_end"},
+    {"period": 2, "start_reg": 3040, "end_reg": 3041, "start_field": "mod_tou_2_start", "end_field": "mod_tou_2_end"},
+    {"period": 3, "start_reg": 3042, "end_reg": 3043, "start_field": "mod_tou_3_start", "end_field": "mod_tou_3_end"},
+    {"period": 4, "start_reg": 3044, "end_reg": 3045, "start_field": "mod_tou_4_start", "end_field": "mod_tou_4_end"},
+    {"period": 5, "start_reg": 3050, "end_reg": 3051, "start_field": "mod_tou_5_start", "end_field": "mod_tou_5_end"},
+    {"period": 6, "start_reg": 3052, "end_reg": 3053, "start_field": "mod_tou_6_start", "end_field": "mod_tou_6_end"},
+    {"period": 7, "start_reg": 3054, "end_reg": 3055, "start_field": "mod_tou_7_start", "end_field": "mod_tou_7_end"},
+    {"period": 8, "start_reg": 3056, "end_reg": 3057, "start_field": "mod_tou_8_start", "end_field": "mod_tou_8_end"},
+    {"period": 9, "start_reg": 3058, "end_reg": 3059, "start_field": "mod_tou_9_start", "end_field": "mod_tou_9_end"},
+]
 
 
 # ============================================================================
@@ -434,6 +878,7 @@ ENTITY_CATEGORY_MAP = {
         'buck1_temp', 'buck2_temp',
         'fault_code', 'warning_code', 'derating_mode', 'battery_derating_mode',
         'mppt_fan_speed', 'inverter_fan_speed',
+        'ntognd_detect', 'nonstd_vac_enable', 'enable_spec_set', 'fast_mppt_enable',
     },
     'config': set(),
 }
@@ -451,11 +896,73 @@ def get_entity_category(sensor_key: str) -> str | None:
 # STATUS CODE MAPPINGS
 # ============================================================================
 
+# Grid-tied string inverters (MIN, MIC, MID, TL3-S): simple 3-state map.
 STATUS_CODES = {
     0: {'name': 'Waiting', 'desc': 'Waiting for sufficient PV power or grid conditions'},
-    1: {'name': 'Normal', 'desc': 'Operating normally'},
-    3: {'name': 'Fault', 'desc': 'Fault condition detected'},
-    5: {'name': 'Standby', 'desc': 'Inverter in standby mode'},
+    1: {'name': 'Normal',  'desc': 'Operating normally'},
+    3: {'name': 'Fault',   'desc': 'Fault condition detected'},
+}
+
+# Hybrid inverters (SPH, SPM, MOD, WIT, TL-XH, SPA, SPE): V1.39 / VPP Protocol V2.01
+# Source: VPP Protocol V2.01 register 31000; legacy storage register 1000 (uwSysWorkMode)
+HYBRID_STATUS_CODES = {
+    0: {'name': 'Waiting',         'desc': 'Waiting for operating conditions'},
+    1: {'name': 'Self-Test',       'desc': 'Running self-test at startup'},
+    2: {'name': 'Reserved',        'desc': 'Reserved operating state'},
+    3: {'name': 'Fault',           'desc': 'Fault condition detected'},
+    4: {'name': 'Updating',        'desc': 'Firmware update in progress'},
+    5: {'name': 'PV On-Grid',      'desc': 'PV active, battery offline, connected to grid'},
+    6: {'name': 'Bat On-Grid',     'desc': 'Battery active, connected to grid'},
+    7: {'name': 'PV+Bat Off-Grid', 'desc': 'PV and battery active, off-grid mode'},
+    8: {'name': 'Bat Off-Grid',    'desc': 'Battery active, off-grid mode (PV inactive)'},
+    9: {'name': 'Bypass',          'desc': 'AC bypass mode'},
+}
+
+# SPF / SPE off-grid inverters: distinct status set, different meanings for shared codes
+SPF_STATUS_CODES = {
+    0:  {'name': 'Standby',              'desc': 'Off-grid inverter in standby'},
+    1:  {'name': 'No Use',               'desc': 'Unused state'},
+    2:  {'name': 'Discharge',            'desc': 'Battery discharging to load'},
+    3:  {'name': 'Fault',                'desc': 'Fault condition detected'},
+    4:  {'name': 'Flash',                'desc': 'Firmware update mode'},
+    5:  {'name': 'PV Charge',            'desc': 'Charging battery from PV'},
+    6:  {'name': 'AC Charge',            'desc': 'Charging battery from AC input'},
+    7:  {'name': 'Combine Charge',       'desc': 'Charging from both PV and AC'},
+    8:  {'name': 'Combine+Bypass',       'desc': 'PV+AC charging with AC bypass to load'},
+    9:  {'name': 'PV Charge+Bypass',     'desc': 'PV charging with AC bypass to load'},
+    10: {'name': 'AC Charge+Bypass',     'desc': 'AC charging with bypass to load'},
+    11: {'name': 'Bypass',               'desc': 'AC input bypassed directly to load'},
+    12: {'name': 'PV Charge+Discharge',  'desc': 'PV charging battery while discharging to load'},
+}
+
+# Maps register map keys to the status code family they use.
+# Keys absent from this dict use the default STATUS_CODES (grid-tied).
+PROFILE_STATUS_MAP: dict[str, str] = {
+    # Hybrid — SPH single-phase
+    'SPH_3000_6000':       'hybrid',
+    'SPH_7000_10000':      'hybrid',
+    'SPH_8000_10000_HU':   'hybrid',
+    'SPH_3000_6000_V201':  'hybrid',
+    'SPH_7000_10000_V201': 'hybrid',
+    # Hybrid — SPH three-phase
+    'SPH_TL3_3000_10000':       'hybrid',
+    'SPH_TL3_3000_10000_V201':  'hybrid',
+    # Hybrid — MOD three-phase
+    'MOD_6000_15000TL3_XH': 'hybrid',
+    'MOD_6000_15000TL3_X':  'hybrid',
+    # Hybrid — WIT commercial
+    'WIT_4000_15000TL3': 'hybrid',
+    # Hybrid — MIN TL-XH
+    'TL_XH_3000_10000':          'hybrid',
+    'TL_XH_US_3000_10000':       'hybrid',
+    'TL_XH_3000_10000_V201':     'hybrid',
+    'TL_XH_US_3000_10000_V201':  'hybrid',
+    'MIN_TL_XH_3000_10000_V201': 'hybrid',
+    # Hybrid — SPA / SPE
+    'SPA_3000_6000_TL_BL': 'hybrid',
+    'SPE_8000_12000_ES':   'hybrid',
+    # Off-grid — SPF / SPE uses SPF codes
+    'SPF_3000_6000_ES_PLUS': 'spf',
 }
 
 

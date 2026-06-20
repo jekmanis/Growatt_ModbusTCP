@@ -1,13 +1,21 @@
 """
 WIT Series - Three-Phase Hybrid Inverters with Advanced Storage
-Based on legacy Growatt Modbus Protocol
+Based on VPP (Virtual Power Plant) Modbus Protocol
+
+IMPORTANT CONTROL MODEL:
+- WIT uses VPP protocol with time-limited overrides (NOT persistent mode control like SPH/SPF)
+- Register 30476 (priority_mode) IS writable — set_wit_mode sets it explicitly for every mode
+- 30476=1 (Battery First) is REQUIRED for grid charging; 30476=0 for hold/passthrough
+- For control, use set_wit_mode service which coordinates 30407-30409 + 30476 + 30410 + 30200
+- See docs/WIT_MODE_PRESETS.md for mode presets and docs/DIRECT_CONTROL_OVERVIEW.md for architecture
 """
 
 # WIT 4000-15000TL3 (Three-phase hybrid with battery, 4-15kW residential)
 WIT_4000_15000TL3 = {
     'name': 'WIT 4-15kW Hybrid',
     'description': 'Three-phase hybrid inverter with battery storage and UPS/EPS backup (4-15kW)',
-    'notes': 'Uses 0-124, 125-249, 875-999, 8000-8124 and VPP (31000-31399) register ranges. Battery data mapped to 8000-8124 range; battery temperature seen at 31223 (VPP block). Features: UPS 10ms switching, time-of-use programming, VPP/demand management.',
+    'notes': 'Uses 0-124, 125-249, 875-999, 8000-8124 and VPP (31000-31399) register ranges. Battery data mapped to 8000-8124 range; battery temperature seen at 31223 (VPP block). Features: UPS 10ms switching, time-of-use programming, VPP/demand management. CONTROL MODEL: VPP protocol with time-limited overrides - register 30476 is READ-ONLY. Use registers 30407-30409 for temporary control.',
+    'use_mppt_energy_today': True,  # Reg 53/54 = system AC output incl. battery discharge; use per-MPPT DC sum instead
     'input_registers': {
         # ============================================================================
         # BASE RANGE 0-124: PV, AC, and System Status (same as SPH-TL3)
@@ -62,11 +70,28 @@ WIT_4000_15000TL3 = {
         51: {'name': 'line_voltage_st', 'scale': 0.1, 'unit': 'V', 'desc': 'Line voltage S-T'},
         52: {'name': 'line_voltage_tr', 'scale': 0.1, 'unit': 'V', 'desc': 'Line voltage T-R'},
 
-        # Energy
-        53: {'name': 'energy_today_high', 'scale': 1, 'unit': '', 'pair': 54},
-        54: {'name': 'energy_today_low', 'scale': 1, 'unit': '', 'pair': 53, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        55: {'name': 'energy_total_high', 'scale': 1, 'unit': '', 'pair': 56},
-        56: {'name': 'energy_total_low', 'scale': 1, 'unit': '', 'pair': 55, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        # Energy - Total System Output (all sources: PV + Battery)
+        # NOTE: These registers show total AC output energy, NOT PV-only
+        # For PV-only energy, use pv1_energy_today + pv2_energy_today (registers 59-60, 63-64)
+        53: {'name': 'energy_today_high', 'scale': 1, 'unit': '', 'pair': 54, 'desc': 'Total system AC output today HIGH (PV+Battery, NOT PV-only)'},
+        54: {'name': 'energy_today_low', 'scale': 1, 'unit': '', 'pair': 53, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'Total system AC output today LOW'},
+        55: {'name': 'energy_total_high', 'scale': 1, 'unit': '', 'pair': 56, 'desc': 'Total system AC output lifetime HIGH (PV+Battery, NOT PV-only)'},
+        56: {'name': 'energy_total_low', 'scale': 1, 'unit': '', 'pair': 55, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'Total system AC output lifetime LOW'},
+
+        # PV Energy - Per-MPPT (DC input from solar panels only)
+        # Use these for accurate PV production tracking (Issue #146)
+        59: {'name': 'pv1_energy_today_high', 'scale': 1, 'unit': '', 'pair': 60, 'desc': 'PV1 energy today HIGH (DC input)'},
+        60: {'name': 'pv1_energy_today_low', 'scale': 1, 'unit': '', 'pair': 59, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'PV1 energy today LOW'},
+        61: {'name': 'pv1_energy_total_high', 'scale': 1, 'unit': '', 'pair': 62, 'desc': 'PV1 DC energy total HIGH'},
+        62: {'name': 'pv1_energy_total_low', 'scale': 1, 'unit': '', 'pair': 61, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'PV1 DC energy total LOW'},
+        63: {'name': 'pv2_energy_today_high', 'scale': 1, 'unit': '', 'pair': 64, 'desc': 'PV2 energy today HIGH (DC input)'},
+        64: {'name': 'pv2_energy_today_low', 'scale': 1, 'unit': '', 'pair': 63, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'PV2 energy today LOW'},
+        65: {'name': 'pv2_energy_total_high', 'scale': 1, 'unit': '', 'pair': 66, 'desc': 'PV2 DC energy total HIGH'},
+        66: {'name': 'pv2_energy_total_low', 'scale': 1, 'unit': '', 'pair': 65, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'PV2 DC energy total LOW'},
+
+        # PV Total Energy (lifetime)
+        91: {'name': 'pv_energy_total_high', 'scale': 1, 'unit': '', 'pair': 92, 'desc': 'Total PV energy lifetime HIGH (DC input from all MPPTs)'},
+        92: {'name': 'pv_energy_total_low', 'scale': 1, 'unit': '', 'pair': 91, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'Total PV energy lifetime LOW'},
 
         # Temperatures
         93: {'name': 'inverter_temp', 'scale': 0.1, 'unit': '°C', 'signed': True},
@@ -112,11 +137,43 @@ WIT_4000_15000TL3 = {
         187: {'name': 'vpp_function_status', 'scale': 1, 'unit': '', 'desc': '0=Disabled, 1=Enabled'},
         188: {'name': 'datalog_server_status', 'scale': 1, 'unit': '', 'desc': '0=Connected, 1=Failed'},
 
+        # 3000-range battery fallbacks (TL-XH/TL-X protocol, also responds on some WIT firmware)
+        # Used as last-resort source when VPP register 31215 reports 0 and 8035 is unavailable.
+        # Note: 3169 uses 0.01 V scale (differs from 8034's 0.1 V scale).
+        3169: {'name': 'battery_voltage_3k', 'scale': 0.01, 'unit': 'V', 'desc': 'Vbat fallback (3k range, 0.01V scale)'},
+        3170: {'name': 'battery_current_3k', 'scale': 0.1,  'unit': 'A', 'signed': True, 'desc': 'Ibat fallback (3k range)'},
+        3171: {'name': 'battery_soc_3k',     'scale': 1,    'unit': '%', 'desc': 'SOC fallback (3k range)'},
+
         # Battery Range (8000-8124)
         8034: {'name': 'battery_voltage', 'scale': 0.1, 'unit': 'V'},
         8035: {'name': 'battery_current', 'scale': 0.1, 'unit': 'A', 'signed': True},
+
+        # AC charge energy (from grid to battery) - 32-bit pairs
+        8057: {'name': 'ac_charge_energy_today_high', 'scale': 1, 'unit': '', 'pair': 8058},
+        8058: {'name': 'ac_charge_energy_today_low', 'scale': 1, 'unit': '', 'pair': 8057, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        8059: {'name': 'ac_charge_energy_total_high', 'scale': 1, 'unit': '', 'pair': 8060},
+        8060: {'name': 'ac_charge_energy_total_low', 'scale': 1, 'unit': '', 'pair': 8059, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+
         8093: {'name': 'battery_soc', 'scale': 1, 'unit': '%'},
         8094: {'name': 'battery_soh', 'scale': 1, 'unit': '%'},
+        8095: {'name': 'battery_voltage_bms', 'scale': 0.1, 'unit': 'V', 'desc': 'BMS reported voltage (more accurate than 8034)'},
+
+        # Extra/Parallel inverter output (for multi-inverter systems) - 32-bit pairs
+        # These will be 0 for single inverter installations
+        8102: {'name': 'extra_power_to_grid_high', 'scale': 1, 'unit': '', 'pair': 8103},
+        8103: {'name': 'extra_power_to_grid_low', 'scale': 1, 'unit': '', 'pair': 8102, 'combined_scale': 0.1, 'combined_unit': 'kW'},
+        8104: {'name': 'extra_energy_today_high', 'scale': 1, 'unit': '', 'pair': 8105},
+        8105: {'name': 'extra_energy_today_low', 'scale': 1, 'unit': '', 'pair': 8104, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        8106: {'name': 'extra_energy_total_high', 'scale': 1, 'unit': '', 'pair': 8107},
+        8107: {'name': 'extra_energy_total_low', 'scale': 1, 'unit': '', 'pair': 8106, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+
+        # ============================================================================
+        # VPP SYSTEM STATUS (31000): Equipment Running Status
+        # ============================================================================
+        # V2.01 equipment_status — same register as MOD/SPH/MIN TL-XH VPP family.
+        # 0=Standby, 1=Normal, 2=Fault, 5=On-grid, 6=On-grid (export limited),
+        # 7=Off-grid/EPS, 8=Bypass. Used by grid_connection_status sensor (Issue #319).
+        31000: {'name': 'equipment_status', 'scale': 1, 'unit': '', 'desc': 'Equipment running status (V2.01)'},
 
         # ============================================================================
         # VPP BATTERY RANGE (31200-31323): Battery Cluster Data
@@ -127,11 +184,10 @@ WIT_4000_15000TL3 = {
         # Per VPP Protocol V2.01/V2.02 Official Specification
 
         # 65: Charge/discharge power (INT32, signed: positive=charge, negative=discharge)
-        # NOTE: VPP spec says 0.1W scale, but real-world WIT testing shows 1.0W scale
-        # User testing: 53.2V × 2.2A = 117W matches register reading with 1.0 scale (121W)
-        # With 0.1 scale, reading was 10x too small (12.1W). WIT firmware deviates from spec.
+        # VPP spec: 0.1W scale (standard for most WIT inverters)
+        # NOTE: Some rare WIT variants may use 1.0W scale - see v0.1.8 release notes for manual fix
         31200: {'name': 'battery_power_high', 'scale': 1, 'unit': '', 'pair': 31201},
-        31201: {'name': 'battery_power_low', 'scale': 1, 'unit': '', 'pair': 31200, 'combined_scale': 1.0, 'combined_unit': 'W', 'signed': True},
+        31201: {'name': 'battery_power_low', 'scale': 1, 'unit': '', 'pair': 31200, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
 
         # 66: Daily charge of battery
         31202: {'name': 'charge_energy_today_high', 'scale': 1, 'unit': '', 'pair': 31203},
@@ -161,9 +217,14 @@ WIT_4000_15000TL3 = {
         31214: {'name': 'battery_voltage_vpp', 'scale': 0.1, 'unit': 'V', 'maps_to': 'battery_voltage', 'signed': True},
         31215: {'name': 'battery_current_vpp', 'scale': 0.1, 'unit': 'A', 'maps_to': 'battery_current', 'signed': True},
         31217: {'name': 'battery_soc_vpp', 'scale': 1, 'unit': '%', 'maps_to': 'battery_soc'},
-        31222: {'name': 'battery_temp_vpp', 'scale': 0.1, 'unit': '°C', 'maps_to': 'battery_temp', 'signed': True},
-        # Note: 31223 also observed as battery_temp on some WIT scans
-        31223: {'name': 'battery_temp_alt', 'scale': 0.1, 'unit': '°C', 'signed': True, 'desc': 'Alternative battery temp register'},
+        31218: {'name': 'battery_soh_vpp', 'scale': 1, 'unit': '%', 'desc': 'Battery SOH from VPP cluster (V2.03)'},
+        # Per VPP Protocol V2.03 - firmware variant differences observed:
+        # Some WIT firmware: 31222=temp, 31223=alt_temp (e.g., linksu79's unit)
+        # Other WIT firmware: 31222=max_power(?), 31223=temp (e.g., YEAa141299/ZDDa-0014)
+        # We map 31223 as primary to support majority firmware, 31222 as alternative
+        31222: {'name': 'battery_temp_vpp_alt', 'scale': 0.1, 'unit': '°C', 'signed': True, 'desc': 'Battery temp (some firmware variants)'},
+        31223: {'name': 'battery_temp', 'scale': 0.1, 'unit': '°C', 'signed': True, 'maps_to': 'battery_temp', 'desc': 'Battery environmental temperature'},
+        31224: {'name': 'battery_temp_max', 'scale': 0.1, 'unit': '°C', 'signed': True, 'desc': 'Maximum battery temperature'},
 
         # Power flow / consumption (8045-8086)
         8045: {'name': 'self_consumption_power_high', 'scale': 1, 'unit': '', 'pair': 8046},
@@ -273,8 +334,12 @@ WIT_4000_15000TL3 = {
         229: {'name': 'energy_adjust', 'scale': 0.1, 'unit': '%', 'access': 'RW', 'valid_range': (1, 1000)},
 
         # Debug Settings (230-249)
-        230: {'name': 'island_disable', 'scale': 1, 'unit': '', 'access': 'W', 'desc': '0=Enable, 1=Disable'},
-        236: {'name': 'nonstd_vac_enable', 'scale': 1, 'unit': '', 'access': 'W', 'desc': '0=Disable, 1=Grade1, 2=Grade2'},
+        # 230 island_disable is write-only (safety control); not exposed as sensor.
+        # 235-238: Read-only diagnostic sensors (Issue #282). NOT writeable — see release notes.
+        235: {'name': 'ntognd_detect',      'scale': 1, 'unit': '', 'access': 'R', 'desc': '0=Disable, 1=Enable — NToGND grounding protection detection'},
+        236: {'name': 'nonstd_vac_enable',  'scale': 1, 'unit': '', 'access': 'R', 'desc': '0=Disable, 1=Grade1, 2=Grade2 — non-standard VAC enable'},
+        237: {'name': 'enable_spec_set',    'scale': 1, 'unit': '', 'access': 'R', 'desc': '0=Disable, 1=Enable — appointed spec / grid-code setting'},
+        238: {'name': 'fast_mppt_enable',   'scale': 1, 'unit': '', 'access': 'R', 'desc': '0=Disable, 1=Enable — fast MPPT algorithm'},
 
 		# Grid Phase Sequence
         871: {'name': 'grid_phase_sequence', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': '0=Positive, 1=Reverse'},
@@ -363,6 +428,138 @@ WIT_4000_15000TL3 = {
 
         # Anti-backflow
         953: {'name': 'single_phase_antibackflow', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': '0=Disable, 1=Enable'},
+
+        # ============================================================================
+        # TOU/OPERATING MODE CONTROL (30000+ range)
+        # ============================================================================
+
+        # VPP Remote Control Authority
+        30100: {'name': 'control_authority', 'scale': 1, 'unit': '', 'access': 'RW',
+                'desc': 'VPP master enable switch',
+                'valid_range': (0, 1),
+                'values': {
+                    0: 'Disabled',
+                    1: 'Enabled'
+                }},
+
+        # VPP Export Limitation Control
+        # NOTE: Register 30208 (Export Limitation Protection Mode) is NOT used by:
+        #   SPA 4000-10000TL3 BH-UP (DTC 3725), SPH 4000-10000TL3 BH-UP (DTC 3601),
+        #   WIT 100KTL3-H (DTC 5601), WIS 215KTL3 (DTC 5800)
+        # Mode descriptions for reference (VPP 2.01/2.03 documentation):
+        #   0: Default mode — meter disconnect limits output to Export Limitation Failure Power;
+        #      output > Export Limitation Power → inverter reports error and goes off-grid
+        #   1: Combine control mode — meter disconnect → error + off-grid within 5s;
+        #      anti-backflow failure → off-grid after 15s
+        #   2: Software control mode — meter disconnect reduces output to Failure Power in 15s;
+        #      output > Export Limit → reduces to Failure Power in 15s
+        #   3: Hardware control mode — meter disconnect → error + off-grid within 5s;
+        #      output > Export Limit → off-grid within 5s
+        # Register 30208 is not implemented here for WIT; if needed add to applicable DTC profiles only.
+        30200: {'name': 'vpp_export_limit_enable', 'scale': 1, 'unit': '', 'access': 'RW',
+                'desc': 'Export limitation master switch',
+                'valid_range': (0, 1),
+                'values': {0: 'Disabled', 1: 'Enabled'}},
+        30201: {'name': 'vpp_export_limit_power_rate', 'scale': 1, 'unit': '%', 'access': 'RW',
+                'signed': True, 'valid_range': (-100, 100),
+                'desc': 'Export limit power rate (-100 to +100%, positive=export, negative=import, 0=zero export)'},
+
+        # VPP Timed Charge/Discharge Override (temporary power control)
+        30407: {'name': 'remote_power_control_enable', 'scale': 1, 'unit': '', 'access': 'RW',
+                'desc': 'Enable timed charge/discharge power override',
+                'valid_range': (0, 1),
+                'values': {
+                    0: 'Disabled',
+                    1: 'Enabled'
+                }},
+        30408: {'name': 'remote_power_control_charging_time', 'scale': 1, 'unit': 'min', 'access': 'RW',
+                'desc': 'Duration for remote power control (0-1440 minutes)',
+                'valid_range': (0, 1440)},
+        30409: {'name': 'remote_charge_and_discharge_power', 'scale': 1, 'unit': '%', 'access': 'RW',
+                'desc': 'Remote charge/discharge power (-100% to +100%, negative=discharge, positive=charge)',
+                'valid_range': (-100, 100),
+                'signed': True},
+
+        # ============================================================================
+        # VPP EXTENDED CONTROL REGISTERS (V2.03): System Time, SOC Limits, TOU Schedule
+        # Based on Growatt VPP Protocol V2.03
+        # ============================================================================
+
+        # Inverter System Time (for TOU schedule reference)
+        30104: {'name': 'system_time_year', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': 'Year (0-99, add 2000)'},
+        30105: {'name': 'system_time_month', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': 'Month (1-12)'},
+        30106: {'name': 'system_time_day', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': 'Day (1-31)'},
+        30107: {'name': 'system_time_hour', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': 'Hour (0-23)'},
+        30108: {'name': 'system_time_minute', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': 'Minute (0-59)'},
+        30109: {'name': 'system_time_second', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': 'Second (0-59)'},
+
+        # SOC Limit Registers
+        30404: {'name': 'vpp_charge_cutoff_soc', 'scale': 1, 'unit': '%', 'access': 'RW',
+                'valid_range': (10, 100), 'desc': 'Stop charging when SOC reaches this %'},
+        30405: {'name': 'vpp_discharge_cutoff_soc', 'scale': 1, 'unit': '%', 'access': 'RW',
+                'valid_range': (10, 100), 'desc': 'Stop on-grid discharge when SOC drops to this %'},
+        # NOTE: Register 30406 (Load Priority Discharge Cutoff SOC) is device-type specific.
+        # Only applicable to Load-first mode (priority_mode=0) on:
+        #   SPH 3000-6000TL BL (DTC 3502), SPA 3000-6000TL BL (DTC 3735),
+        #   SPH (DTC 3750 variants), SPH 4000-10000TL3 BH-UP (DTC 3601)
+        # This register is NOT applicable to WIT (DTC 5603) and is therefore
+        # not implemented here. Add to sph/spa profiles if load-priority SOC cutoff control is needed.
+
+        # AC Charging Enable (NOTE: May return "Illegal function" on some WIT firmware)
+        30410: {'name': 'vpp_ac_charge_enable', 'scale': 1, 'unit': '', 'access': 'RW',
+                'values': {0: 'Disabled', 1: 'PV priority', 2: 'AC priority'},
+                'desc': 'AC charging enable - required for grid charging'},
+
+        # TOU Schedule Configuration (VPP Protocol V2.03)
+        30411: {'name': 'vpp_tou_num_periods', 'scale': 1, 'unit': '', 'access': 'RW',
+                'valid_range': (0, 20), 'desc': 'Number of active TOU periods (0=self-consumption)'},
+
+        # TOU Period Registers (30412-30471): Up to 20 periods, 3 registers each (start, end, power)
+        # Period N: base + (N-1)*3 = start, base + (N-1)*3 + 1 = end, base + (N-1)*3 + 2 = power
+        # Start/End in minutes since midnight (0-1439), Power in % (-100 to +100, signed)
+        # CRITICAL: Periods CANNOT overlap! Use XX:59 end times with XX:00 start times.
+        30412: {'name': 'vpp_tou_period1_start', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 1 start (minutes since midnight)'},
+        30413: {'name': 'vpp_tou_period1_end', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 1 end (minutes since midnight)'},
+        30414: {'name': 'vpp_tou_period1_power', 'scale': 1, 'unit': '%', 'access': 'RW', 'signed': True, 'desc': 'Period 1 power (+charge/-discharge)'},
+        30415: {'name': 'vpp_tou_period2_start', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 2 start'},
+        30416: {'name': 'vpp_tou_period2_end', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 2 end'},
+        30417: {'name': 'vpp_tou_period2_power', 'scale': 1, 'unit': '%', 'access': 'RW', 'signed': True, 'desc': 'Period 2 power'},
+        30418: {'name': 'vpp_tou_period3_start', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 3 start'},
+        30419: {'name': 'vpp_tou_period3_end', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 3 end'},
+        30420: {'name': 'vpp_tou_period3_power', 'scale': 1, 'unit': '%', 'access': 'RW', 'signed': True, 'desc': 'Period 3 power'},
+        30421: {'name': 'vpp_tou_period4_start', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 4 start'},
+        30422: {'name': 'vpp_tou_period4_end', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 4 end'},
+        30423: {'name': 'vpp_tou_period4_power', 'scale': 1, 'unit': '%', 'access': 'RW', 'signed': True, 'desc': 'Period 4 power'},
+        30424: {'name': 'vpp_tou_period5_start', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 5 start'},
+        30425: {'name': 'vpp_tou_period5_end', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 5 end'},
+        30426: {'name': 'vpp_tou_period5_power', 'scale': 1, 'unit': '%', 'access': 'RW', 'signed': True, 'desc': 'Period 5 power'},
+        # Periods 6-20 follow same pattern: 30427-30471
+
+        # Actual Control Value (Read-only feedback)
+        30474: {'name': 'vpp_actual_control_value', 'scale': 1, 'unit': '%', 'access': 'RO',
+                'signed': True, 'desc': 'Current charge/discharge power % being applied'},
+
+        # Off-grid Discharge SOC Limit
+        30475: {'name': 'vpp_offgrid_discharge_soc', 'scale': 1, 'unit': '%', 'access': 'RW',
+                'valid_range': (10, 100), 'desc': 'Stop off-grid discharge when SOC drops to this %'},
+
+        # Priority Mode — writable despite VPP V2.01 listing it as "Reserved".
+        # Confirmed writable on WIT 8000TL3-HU V1.39 via FC 0x06.
+        # CRITICAL: 30476=1 (Battery First) is required for grid charging to work.
+        # set_wit_mode sets this explicitly for every mode. See docs/DIRECT_CONTROL_OVERVIEW.md.
+        30476: {'name': 'priority_mode', 'scale': 1, 'unit': '', 'access': 'RW',
+                'desc': 'Priority mode (0=Load First, 1=Battery First, 2=Grid First)',
+                'valid_range': (0, 2),
+                'values': {
+                    0: 'Load First',
+                    1: 'Battery First',
+                    2: 'Grid First'
+                }},
+
+        # TOU Reset
+        30477: {'name': 'vpp_tou_reset_enable', 'scale': 1, 'unit': '', 'access': 'RW',
+                'values': {0: 'Normal', 1: 'Clear all periods'},
+                'desc': 'Set to 1 to clear all TOU periods on next write'},
 
         # Time-of-Use Programming (6 time slots)
         954: {'name': 'time1_enable', 'scale': 1, 'unit': '', 'access': 'RW',

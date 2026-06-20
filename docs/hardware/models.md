@@ -1,0 +1,267 @@
+# Supported Models and Sensor Availability
+
+---
+
+## How Auto-Detection Works
+
+When you add the integration, it attempts to identify your inverter automatically before asking you to choose a profile.
+
+![Auto-Detection Flow](../images/auto-detection-flow.svg)
+
+**Key points:**
+
+- VPP-capable inverters (DTC present) are identified with high confidence
+- Legacy inverters (no DTC) use model name probing — works for MIN, MIC, SPH families
+- If auto-detection picks the wrong profile, delete and re-add the integration with manual selection
+- The Universal Register Scanner (Developer Tools → Actions) shows the detection reasoning in its output
+
+---
+
+## Supported Models
+
+### Single-Phase Grid-Tied
+
+| Model | Range | PV Strings | VPP Support | Auto-detect | Tested | Notes |
+|-------|-------|-----------|-------------|-------------|--------|-------|
+| **MIC 600-3300TL-X** | 0.6–3.3 kW | 1 | Legacy only | Model name | ✅ | Micro inverter |
+| **MIN 3000-6000TL-X** | 3–6 kW | 2 | VPP + Legacy | Model name | ✅ | |
+| **MIN 7000-10000TL-X** | 7–10 kW | 3 | VPP + Legacy | Model name | ✅ | |
+
+### Single-Phase Hybrid (with Battery)
+
+| Model | Range | PV Strings | VPP Support | Auto-detect | Tested | Notes |
+|-------|-------|-----------|-------------|-------------|--------|-------|
+| **MIN TL-XH 3000-10000** | 3–10 kW | 2–3 | VPP | DTC 5100 | ✅ | 3–6kW: 2 strings; 7–10kW: 3 strings |
+| **SPA 3000-6000TL BL** | 3–6 kW | None | Legacy only | Auto | ✅ | AC-coupled storage only — no PV DC inputs |
+| **SPE 8000-12000 ES** | 8–12 kW | 2 | VPP-like | Model name | ✅ | Peak shaving, parallel operation |
+| **SPH 3000-6000** | 3–6 kW | 2 | VPP + Legacy | Model name | ✅ | |
+| **SPH 7000-10000** | 7–10 kW | 2 | VPP + Legacy | Model name | ✅ | |
+| **SPH/SPM 8000-10000 HU** | 8–10 kW | 3 | VPP + Legacy | DTC | ⚠️ | BMS monitoring (SOH, cell voltages) |
+
+### Single-Phase Off-Grid
+
+| Model | Range | PV Strings | VPP Support | Auto-detect | Tested | Notes |
+|-------|-------|-----------|-------------|-------------|--------|-------|
+| **SPF 3000-6000 ES PLUS** | 3–6 kW | 2 | Off-grid protocol | Manual | ✅ | No grid export; grid = AC input only |
+
+### Three-Phase
+
+| Model | Range | PV Strings | Battery | VPP Support | Auto-detect | Tested | Notes |
+|-------|-------|-----------|---------|-------------|-------------|--------|-------|
+| **MID 15000-25000TL3-X** | 15–25 kW | 2 | No | VPP + Legacy | Model name | ⚠️ | Grid-tied |
+| **MOD 6000-15000TL3-X** | 6–15 kW | 3 | No | VPP + Legacy | DTC 5400 | ⚠️ | Grid-tied; grid flow sensors require Growatt smart meter (GOSS-W / SPM-S) |
+| **MOD 6000-15000TL3-XH** | 6–15 kW | 3 | Yes | VPP + Legacy | DTC 5400 | ✅ | Battery monitoring only (control pending) |
+| **SPH-TL3 3000-10000** | 3–10 kW | 2 | Yes | VPP + Legacy | DTC | ✅ | Tested: SPH 8000TL3 BH-UP |
+| **WIT 4000-15000TL3** | 4–15 kW | 2 | Yes | VPP v2.02 | DTC 5603 | ✅ | Advanced VPP control |
+
+**Legend:** ✅ Tested with real hardware · ⚠️ Profile from documentation, community validation welcome
+
+> **VPP Protocol:** Growatt's Virtual Power Plant Protocol (registers 30000+) enables advanced monitoring and control, and allows automatic model identification via Device Type Code. Models with "VPP + Legacy" fall back to the legacy register range (0–3999) if VPP registers don't respond.
+
+> **Off-Grid Protocol:** SPF inverters use registers 0–97 only. VPP registers are never attempted for these models.
+
+> **Help us test!** If you have an untested model, run the Universal Register Scanner and open an issue with the CSV output.
+
+---
+
+## Sensor Availability by Model
+
+The **MOD** column below represents the **MOD TL3-XH** (hybrid, with battery). The grid-tied **MOD TL3-X** (no battery) is architecturally identical in the solar register range but its grid flow registers require a Growatt smart meter — see [Smart Meter Requirement](#smart-meter-requirement) below.
+
+| Sensor | MIC | MIN 3-6k | MIN 7-10k | MIN TL-XH | SPA | SPH 3-6k | SPH 7-10k | SPF | SPH-TL3 | MID | MOD XH | WIT |
+| -------- | :---: | :--------: | :---------: | :---------: | :---: | :--------: | :---------: | :---: | :-------: | :---: | :---: | :---: |
+| **Solar Input** | | | | | | | | | | | | |
+| PV1 Voltage/Current/Power | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| PV2 Voltage/Current/Power | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| PV3 Voltage/Current/Power | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| Solar Total Power | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **AC Output (Single-Phase)** | | | | | | | | | | | | |
+| AC Voltage / Current / Power | ✅ | ✅ | ✅ | ✅ | ⚠️† | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| AC Apparent Power | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| AC Frequency | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **AC Output (Three-Phase)** | | | | | | | | | | | | |
+| Phase R/S/T Voltage / Current / Power | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
+| AC Total Power | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
+| **Power Flow** | | | | | | | | | | | | |
+| Grid Export / Import Power | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| House Consumption (calculated) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Self Consumption | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Power to Grid / Load / User (registers) | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
+| **Battery (Hybrid/Off-Grid)** | | | | | | | | | | | | |
+| Battery Voltage / Current / Power | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
+| Battery SOC | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
+| Battery Temperature | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
+| BMS SOH / Cell Voltages | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅* | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Energy Totals** | | | | | | | | | | | | |
+| Energy Today / Total (PV) | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Energy to Grid Today / Total | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Load Energy Today / Total | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Charge / Discharge Energy Today / Total | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
+| AC Charge Energy Today / Total | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
+| **System & Diagnostics** | | | | | | | | | | | | |
+| Inverter / IPM Temperature | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Boost Temperature | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Status / Derating / Fault Codes | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+*HU variants only (SPH/SPM 8000-10000TL3-BH-HU)
+†AC voltage only (reg 1105, scale ×0.01); AC current/power and frequency not confirmed for SPA
+
+---
+
+## Smart Meter Requirement
+
+Several sensors only populate if a **Growatt smart meter** (GOSS-W or SPM-S CT clamp) is physically installed between the inverter and the grid connection. Without a meter the inverter has no way to measure AC import/export directly — the sensors appear in Home Assistant but always read zero.
+
+### Which sensors are affected
+
+| Sensor group | Without meter | With meter |
+| --- | --- | --- |
+| Grid Export / Import Power | Always 0 W | Live reading |
+| Power to Grid / Power to User (registers) | Always 0 W | Live reading |
+| Energy to Grid Today / Total | Always 0 kWh | Accumulating |
+| Load Energy Today / Total (register-based) | Always 0 kWh | Accumulating |
+
+> **`house_consumption` is never affected.** It is a calculated sensor (`solar_total_power + grid_import_power − grid_export_power`) and always reflects actual consumption regardless of meter presence — it just falls back to being solar-only when grid readings are zero.
+
+### Which models are affected
+
+| Model | Meter required? |
+| --- | --- |
+| **MOD 6000-15000TL3-X** (grid-tied, no battery) | **Yes** — 3000+ register range returns all zeros without meter |
+| **MOD 6000-15000TL3-XH** (hybrid) | Yes, for accurate grid registers; battery-side sensors unaffected |
+| **SPH-TL3, SPH, MIN TL-XH, WIT** (hybrid) | Yes, for meter-based grid registers; calculated `house_consumption` always works |
+| **MIC, MIN TL-X, MID** (grid-tied, no battery) | No — grid power is inferred from the inverter's own AC measurement |
+| **SPF** (off-grid) | N/A — grid connection is AC input only, no export |
+
+### What hardware to get
+
+Growatt sell two compatible meters:
+
+- **GOSS-W** — DIN-rail energy meter with RS485, suited for residential panels
+- **SPM-S** — split-core CT clamp version, easier retrofitting without rewiring
+
+The meter connects to the inverter's RS485 COM port (same bus as the Modbus adapter, or daisy-chained). Configuration is done via the Growatt inverter display or ShinePhone app — the integration does not configure the meter.
+
+> If you are unsure whether a meter is installed, check the **Energy to Grid Today** sensor at a time when you know the inverter is actively exporting. If it remains at 0 kWh while solar generation is high and house consumption is low, a meter is not present or not configured.
+
+---
+
+## Power Flow Notes
+
+### Grid-Tied Models (MIC, MIN TL-X, MID)
+
+No battery and no direct load measurement register. Power flow values are **calculated**:
+
+```text
+house_consumption  = solar_total_power - grid_export_power + grid_import_power
+self_consumption   = min(solar_total_power, house_consumption)
+grid_export_power  = max(0,  power_to_grid)
+grid_import_power  = max(0, -power_to_grid)
+```
+
+### Hybrid Models (SPH, TL-XH, MOD, WIT)
+
+Both calculated and register-based values are available. Register-based sensors (`power_to_load`, `power_to_user`, `power_to_grid`) are read directly from the inverter and are generally more accurate.
+
+**Battery power sign convention (all models):**
+
+- **Positive** = Battery is charging
+- **Negative** = Battery is discharging
+
+> SPF off-grid inverters have hardware that reports the opposite polarity. The integration inverts this automatically — you always see the standard convention regardless of model.
+
+---
+
+## Invert Grid Power
+
+> ⚠️ **v0.9.1b1 note:** A bug in the setup wizard's auto-detection caused **Invert Grid Power** to be incorrectly enabled for most users during initial configuration. If you set up the integration before v0.9.1b1 and your grid export/import sensors appear swapped after upgrading, go to **Settings → Devices & Services → Growatt Modbus → Configure** and turn **Invert Grid Power off**. The vast majority of Growatt inverters do not need this option.
+
+All models support an **Invert Grid Power** option. When enabled, the sign of the `Grid Power` sensor is flipped. This is only needed in the rare case where your inverter's registers report the opposite sign to the integration convention (positive = export).
+
+**When to enable:** Only if `Grid Power` shows a positive value while you are definitely importing from the grid (or negative while definitely exporting), and `Grid Export Power` / `Grid Import Power` still look correct. This indicates the inverter itself reports the opposite sign convention.
+
+**When NOT to enable:** Do not enable this to fix a swapped `Grid Export Power` / `Grid Import Power` display — those sensors derive directly from the physical register values and are independent of this setting since v0.9.1b1.
+
+**How to change:** Integration → **Configure** → toggle **Invert Grid Power**.
+
+---
+
+## Manual Model Selection Guide
+
+If auto-detection fails (or you want to override), choose based on:
+
+1. **Phase:** Single-phase or three-phase grid connection?
+2. **Battery:** Do you have battery storage connected?
+3. **PV strings:** How many separate solar array strings are connected?
+4. **Power range:** Inverter nameplate rating
+
+### Single-Phase Grid-Tied Models
+
+| Select this | PV Strings | Power | When |
+|-------------|-----------|-------|------|
+| MIC 600-3300TL-X | 1 | 0.6–3.3 kW | Micro inverter, single string |
+| MIN 3000-6000TL-X | 2 | 3–6 kW | Standard residential |
+| MIN 7000-10000TL-X | 3 | 7–10 kW | Larger residential |
+
+### Single-Phase Hybrid Models
+
+| Select this | PV Strings | Power | When |
+|-------------|-----------|-------|------|
+| MIN TL-XH 3000-10000 | 2–3 | 3–10 kW | Battery hybrid (3–6kW: 2 strings, 7–10kW: 3 strings) |
+| SPA 3000-6000TL BL | None | 3–6 kW | AC-coupled battery storage only (no PV inputs) |
+| SPE 8000-12000 ES | 2 | 8–12 kW | Battery hybrid, peak shaving |
+| SPF 3000-6000 ES PLUS | 2 | 3–6 kW | Off-grid with battery |
+| SPH 3000-6000 | 2 | 3–6 kW | Battery hybrid |
+| SPH 7000-10000 | 2 | 7–10 kW | Battery hybrid |
+| SPH/SPM 8000-10000 HU | 3 | 8–10 kW | Battery hybrid with BMS monitoring |
+
+### Three-Phase Models
+
+| Select this | PV Strings | Battery | Power | When |
+|-------------|-----------|---------|-------|------|
+| MID 15000-25000TL3-X | 2 | No | 15–25 kW | Grid-tied only |
+| MOD 6000-15000TL3-X | 3 | No | 6–15 kW | Grid-tied only; grid flow sensors require smart meter |
+| MOD 6000-15000TL3-XH | 3 | Yes | 6–15 kW | Hybrid with battery |
+| SPH-TL3 3000-10000 | 2 | Yes | 3–10 kW | Hybrid with battery |
+| WIT 4000-15000TL3 | 2 | Yes | 4–15 kW | Hybrid, advanced VPP control |
+
+---
+
+## Hardware Connection
+
+### Adapter Options
+
+| Adapter | Interface | Settings |
+| --- | --- | --- |
+| **EW11** | TCP/WiFi | TCP Server, 9600 baud, port 502 |
+| **USR-W630** | TCP/WiFi | Modbus TCP Gateway mode |
+| **USR-TCP232-410s** | TCP | TCP Server, 9600 baud, port 502 |
+| **Waveshare RS485-to-ETH** | TCP | 9600 8N1, port 502, RFC2217: On |
+| **Any RS485-to-USB** | Serial | `/dev/ttyUSB0` or `COM3`, 9600 baud |
+
+### Inverter Connector Pinout
+
+| Connector | RS485+ (A) | RS485− (B) |
+| --- | --- | --- |
+| 16-pin DRM/COM | Pin 3 | Pin 4 |
+| 4-pin COM | Pin 1 | Pin 2 |
+| RJ45 (485-3) | Pin 5 | Pin 1 |
+
+> If values look garbled or the connection is unstable, try swapping the A and B wires — adapter labelling is not always consistent with the inverter's convention.
+
+---
+
+## Device Information
+
+The integration reads and displays identifying information about your inverter at startup:
+
+| Field | Example | Notes |
+|-------|---------|-------|
+| Model Name | MIN-10000TL-X | From registers 125–132 |
+| Serial Number | AB12345678 | From registers 23–27 or 3000–3015 |
+| Firmware Version | 2.01 | |
+| Protocol Version | VPP V2.01 | VPP models only |
+
+---
+
+*For control entity details, see [CONTROL.md](../controls/entity-reference.md)*

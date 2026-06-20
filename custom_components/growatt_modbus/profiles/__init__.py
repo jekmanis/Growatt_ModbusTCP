@@ -9,8 +9,12 @@ Profile Structure:
 - mod.py: MOD series (6-15kW three-phase hybrid)
 - tl_xh.py: TL-XH series (3-10kW hybrid)
 - sph.py: SPH series (storage/battery)
+- sph_tl3.py: SPH-TL3 series (three-phase hybrid with battery)
+- spa.py: SPA series (AC-coupled battery storage, no PV inputs)
 - spf.py: SPF series (off-grid with battery)
+- spe.py: SPE series (off-grid, larger capacity, SPF protocol)
 - wit.py: WIT series (4-15kW three-phase hybrid with advanced storage)
+- tl3s.py: TL3-S series (3-15kW three-phase grid-tied, legacy protocol)
 """
 
 from typing import Dict, List, Optional
@@ -21,10 +25,13 @@ from .min import MIN_REGISTER_MAPS
 from .mid import MID_REGISTER_MAPS
 from .sph import SPH_REGISTER_MAPS
 from .sph_tl3 import SPH_TL3_REGISTER_MAPS
+from .spa import SPA_REGISTER_MAPS
 from .spf import SPF_REGISTER_MAPS
+from .spe import SPE_REGISTER_MAPS
 from .mod import MOD_REGISTER_MAPS
 from .tl_xh import TL_XH_REGISTER_MAPS
 from .wit import WIT_REGISTER_MAPS
+from .tl3s import TL3S_REGISTER_MAPS
 
 
 # Combine all register maps into single dict
@@ -34,10 +41,13 @@ REGISTER_MAPS = {
     **MID_REGISTER_MAPS,
     **SPH_REGISTER_MAPS,
     **SPH_TL3_REGISTER_MAPS,
+    **SPA_REGISTER_MAPS,
     **SPF_REGISTER_MAPS,
+    **SPE_REGISTER_MAPS,
     **MOD_REGISTER_MAPS,
     **TL_XH_REGISTER_MAPS,
     **WIT_REGISTER_MAPS,
+    **TL3S_REGISTER_MAPS,
 }
 
 

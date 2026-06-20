@@ -3,6 +3,7 @@ MOD_6000_15000TL3_XH = {
     'name': 'MOD TL3-XH Series',
     'description': 'Modular three-phase hybrid inverter with battery (6-15kW)',
     'notes': 'Uses 0-124 base range + 3000+ battery range. Validated with real hardware 2025-10-26.',
+    'use_mppt_energy_today': True,  # Reg 53/54 = system AC output incl. battery discharge; use per-MPPT DC sum instead
     'input_registers': {
         # === BASE RANGE (0-124) - Inverter Data ===
         # System Status
@@ -30,21 +31,23 @@ MOD_6000_15000TL3_XH = {
         13: {'name': 'pv3_power_high', 'scale': 1, 'unit': '', 'pair': 14},
         14: {'name': 'pv3_power_low', 'scale': 1, 'unit': '', 'pair': 13, 'combined_scale': 0.1, 'combined_unit': 'W'},
         
-        # Output Power Total (32-bit)
-        35: {'name': 'output_power_high', 'scale': 1, 'unit': '', 'pair': 36},
-        36: {'name': 'output_power_low', 'scale': 1, 'unit': '', 'pair': 35, 'combined_scale': 0.1, 'combined_unit': 'W'},
-        
+        # Output Power Total (32-bit) — true three-phase inverter output total.
+        # Aliased to ac_power so the generic ac_power sensor reflects the correct total.
+        # Do NOT alias ac_power_r (reg 40/41) — that is Phase R only, not total.
+        35: {'name': 'output_power_high', 'scale': 1, 'unit': '', 'pair': 36, 'alias': 'ac_power_high'},
+        36: {'name': 'output_power_low', 'scale': 1, 'unit': '', 'pair': 35, 'combined_scale': 0.1, 'combined_unit': 'W', 'alias': 'ac_power_low'},
+
         # === AC OUTPUT - THREE PHASE ===
         # Grid Frequency (shared across all phases)
         37: {'name': 'ac_frequency', 'scale': 0.01, 'unit': 'Hz', 'desc': 'AC output frequency'},
 
-        # Generic AC aliases (point to Phase R for compatibility with generic code)
-        # These allow the standard ac_voltage/current/power fields to work
+        # Phase R (L1) — ac_voltage/ac_current aliased for generic code; ac_power NOT aliased here
+        # (ac_power comes from output_power reg 35/36 which holds the true three-phase total)
         38: {'name': 'ac_voltage_r', 'scale': 0.1, 'unit': 'V', 'desc': 'Phase R AC voltage', 'alias': 'ac_voltage'},
         39: {'name': 'ac_current_r', 'scale': 0.1, 'unit': 'A', 'desc': 'Phase R AC current', 'alias': 'ac_current'},
-        40: {'name': 'ac_power_r_high', 'scale': 1, 'unit': '', 'pair': 41, 'alias': 'ac_power_high'},
-        41: {'name': 'ac_power_r_low', 'scale': 1, 'unit': '', 'pair': 40, 'combined_scale': 0.1, 'combined_unit': 'VA', 'alias': 'ac_power_low'},
-        
+        40: {'name': 'ac_power_r_high', 'scale': 1, 'unit': '', 'pair': 41},
+        41: {'name': 'ac_power_r_low', 'scale': 1, 'unit': '', 'pair': 40, 'combined_scale': 0.1, 'combined_unit': 'VA'},
+
         # Phase S (L2) - AC Output
         42: {'name': 'ac_voltage_s', 'scale': 0.1, 'unit': 'V', 'desc': 'Phase S AC voltage'},
         43: {'name': 'ac_current_s', 'scale': 0.1, 'unit': 'A', 'desc': 'Phase S AC current'},
@@ -65,22 +68,38 @@ MOD_6000_15000TL3_XH = {
         # Energy Today (32-bit) - VALIDATED: 8.1kWh
         53: {'name': 'energy_today_high', 'scale': 1, 'unit': '', 'pair': 54},
         54: {'name': 'energy_today_low', 'scale': 1, 'unit': '', 'pair': 53, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        
+
         # Energy Total (32-bit)
         55: {'name': 'energy_total_high', 'scale': 1, 'unit': '', 'pair': 56},
         56: {'name': 'energy_total_low', 'scale': 1, 'unit': '', 'pair': 55, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+
+        # PV String Energy (per MPPT, daily and lifetime) — confirmed in scan #228
+        59: {'name': 'pv1_energy_today_high', 'scale': 1, 'unit': '', 'pair': 60, 'desc': 'PV1 energy today HIGH'},
+        60: {'name': 'pv1_energy_today_low', 'scale': 1, 'unit': '', 'pair': 59, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        61: {'name': 'pv1_energy_total_high', 'scale': 1, 'unit': '', 'pair': 62, 'desc': 'PV1 DC energy total HIGH'},
+        62: {'name': 'pv1_energy_total_low', 'scale': 1, 'unit': '', 'pair': 61, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'PV1 DC energy total LOW'},
+        63: {'name': 'pv2_energy_today_high', 'scale': 1, 'unit': '', 'pair': 64, 'desc': 'PV2 energy today HIGH'},
+        64: {'name': 'pv2_energy_today_low', 'scale': 1, 'unit': '', 'pair': 63, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        65: {'name': 'pv2_energy_total_high', 'scale': 1, 'unit': '', 'pair': 66, 'desc': 'PV2 DC energy total HIGH'},
+        66: {'name': 'pv2_energy_total_low', 'scale': 1, 'unit': '', 'pair': 65, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'PV2 DC energy total LOW'},
+
+        # PV Total energy lifetime
+        91: {'name': 'pv_energy_total_high', 'scale': 1, 'unit': '', 'pair': 92, 'desc': 'PV energy total lifetime HIGH'},
+        92: {'name': 'pv_energy_total_low', 'scale': 1, 'unit': '', 'pair': 91, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
         # Temperatures
         93: {'name': 'inverter_temp', 'scale': 0.1, 'unit': '°C', 'signed': True},
         94: {'name': 'ipm_temp', 'scale': 0.1, 'unit': '°C', 'signed': True},
         95: {'name': 'boost_temp', 'scale': 0.1, 'unit': '°C', 'signed': True},
+        96: {'name': 'temp_sensor_1', 'scale': 0.1, 'unit': '°C', 'signed': True, 'desc': 'Additional temperature sensor 1 (possibly BMS/battery related)'},
+        97: {'name': 'temp_sensor_2', 'scale': 0.1, 'unit': '°C', 'signed': True, 'desc': 'Additional temperature sensor 2 (appears to match Growatt server Boost Temp)'},
 
         # Status
         100: {'name': 'power_factor', 'scale': 1, 'unit': ''},
         104: {'name': 'derating_mode', 'scale': 1, 'unit': ''},
         105: {'name': 'fault_code', 'scale': 1, 'unit': ''},
         112: {'name': 'warning_code', 'scale': 1, 'unit': ''},
-        
+
         # === BATTERY RANGE (3000+) - Battery & Power Flow ===
         # System Status
         3000: {'name': 'battery_status', 'scale': 1, 'unit': '', 'desc': 'Battery system status'},
@@ -108,41 +127,61 @@ MOD_6000_15000TL3_XH = {
         # Battery Diagnostics
         3086: {'name': 'battery_derating_mode', 'scale': 1, 'unit': ''},
         
-        # Battery - Discharge/Charge Energy (3000 range - legacy/alternative location)
-        # Note: Renamed with _legacy suffix to avoid conflict with official 31200 range
-        3125: {'name': 'discharge_energy_today_legacy_high', 'scale': 1, 'unit': '', 'pair': 3126},
-        3126: {'name': 'discharge_energy_today_legacy_low', 'scale': 1, 'unit': '', 'pair': 3125, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        3127: {'name': 'discharge_energy_total_legacy_high', 'scale': 1, 'unit': '', 'pair': 3128},
-        3128: {'name': 'discharge_energy_total_legacy_low', 'scale': 1, 'unit': '', 'pair': 3127, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        3129: {'name': 'charge_energy_today_legacy_high', 'scale': 1, 'unit': '', 'pair': 3130},
-        3130: {'name': 'charge_energy_today_legacy_low', 'scale': 1, 'unit': '', 'pair': 3129, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        3131: {'name': 'charge_energy_total_legacy_high', 'scale': 1, 'unit': '', 'pair': 3132},
-        3132: {'name': 'charge_energy_total_legacy_low', 'scale': 1, 'unit': '', 'pair': 3131, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        
-        # Battery State (3000 range - legacy/alternative location)
+        # Battery - Discharge/Charge Energy (3000 range - PRIMARY for MOD XH)
+        # Note: Order is discharge first, then charge (different from VPP which is charge first)
+        3125: {'name': 'discharge_energy_today_high', 'scale': 1, 'unit': '', 'pair': 3126, 'desc': 'Battery discharge energy today (primary source for MOD XH)'},
+        3126: {'name': 'discharge_energy_today_low', 'scale': 1, 'unit': '', 'pair': 3125, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        3127: {'name': 'discharge_energy_total_high', 'scale': 1, 'unit': '', 'pair': 3128, 'desc': 'Battery discharge energy total (primary source for MOD XH)'},
+        3128: {'name': 'discharge_energy_total_low', 'scale': 1, 'unit': '', 'pair': 3127, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        3129: {'name': 'charge_energy_today_high', 'scale': 1, 'unit': '', 'pair': 3130, 'desc': 'Battery charge energy today (primary source for MOD XH)'},
+        3130: {'name': 'charge_energy_today_low', 'scale': 1, 'unit': '', 'pair': 3129, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        3131: {'name': 'charge_energy_total_high', 'scale': 1, 'unit': '', 'pair': 3132, 'desc': 'Battery charge energy total (primary source for MOD XH)'},
+        3132: {'name': 'charge_energy_total_low', 'scale': 1, 'unit': '', 'pair': 3131, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+
+        # AC Charge Energy (grid→battery) - confirmed via hardware scan (MOD 10000TL3-XH, Feb 2026)
+        # Register 3133/3134: AC charge today = 4.0 kWh at scan time
+        # Register 3135/3136: AC charge total = 530.5 kWh at scan time (corrected from wrong battery_bms_temp mapping)
+        3133: {'name': 'ac_charge_energy_today_high', 'scale': 1, 'unit': '', 'pair': 3134, 'desc': 'AC charge energy today HIGH (grid→battery)'},
+        3134: {'name': 'ac_charge_energy_today_low', 'scale': 1, 'unit': '', 'pair': 3133, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'AC charge energy today (grid→battery)'},
+        3135: {'name': 'ac_charge_energy_total_high', 'scale': 1, 'unit': '', 'pair': 3136, 'desc': 'AC charge energy total HIGH (grid→battery lifetime)'},
+        3136: {'name': 'ac_charge_energy_total_low', 'scale': 1, 'unit': '', 'pair': 3135, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'AC charge energy total (grid→battery lifetime)'},
+
+        # Battery State (3000 range - PRIMARY for MOD XH with ARK battery)
+        # Note: VPP 31200+ range doesn't respond on MOD 10000TL3-XH, so 3000+ is primary
         3144: {'name': 'priority_mode', 'scale': 1, 'unit': '', 'desc': '0=Load, 1=Battery, 2=Grid'},
-        3169: {'name': 'battery_voltage_legacy', 'scale': 0.01, 'unit': 'V'},
-        3170: {'name': 'battery_current_legacy', 'scale': 0.1, 'unit': 'A', 'signed': True},
-        3171: {'name': 'battery_soc_legacy', 'scale': 1, 'unit': '%'},
-        3176: {'name': 'battery_temp_legacy', 'scale': 0.1, 'unit': '°C', 'signed': True},
+        3169: {'name': 'battery_voltage', 'scale': 0.01, 'unit': 'V', 'desc': 'Battery voltage (0.01V/unit; use VPP 31214 as primary — it overrides this via max-value selection)'},
+        3170: {'name': 'battery_current', 'scale': 0.1, 'unit': 'A', 'signed': True, 'desc': 'Battery current (primary source for MOD XH)'},
+        3171: {'name': 'battery_soc', 'scale': 1, 'unit': '%', 'desc': 'Battery SOC (primary source for MOD XH)'},
+        3176: {'name': 'battery_temp', 'scale': 0.1, 'unit': '°C', 'signed': True, 'desc': 'Battery temperature (primary source for MOD XH)'},
+
+        # Battery Power (3000 range - separate charge/discharge registers)
+        # These follow the MIN TL-XH pattern for ARK battery systems
+        3178: {'name': 'discharge_power_high', 'scale': 1, 'unit': '', 'pair': 3179, 'desc': 'Battery discharge power HIGH (unsigned)'},
+        3179: {'name': 'discharge_power_low', 'scale': 1, 'unit': '', 'pair': 3178, 'combined_scale': 0.1, 'combined_unit': 'W', 'desc': 'Battery discharge power (unsigned, positive=discharging)'},
+        3180: {'name': 'charge_power_high', 'scale': 1, 'unit': '', 'pair': 3181, 'desc': 'Battery charge power HIGH (unsigned)'},
+        3181: {'name': 'charge_power_low', 'scale': 1, 'unit': '', 'pair': 3180, 'combined_scale': 0.1, 'combined_unit': 'W', 'desc': 'Battery charge power (unsigned, positive=charging)'},
 
         # === BATTERY INFORMATION 1 (31200-31299) - Official VPP Protocol V2.01 ===
         # This is the official battery data range for MOD series per Growatt VPP Protocol
         # Ref: GROWATT VPP COMMUNICATION PROTOCOL OF INVERTER V2.01 (2024.9.20)
 
-        # Battery Power (signed: positive=charging, negative=discharging)
-        31200: {'name': 'battery_power_high', 'scale': 1, 'unit': '', 'pair': 31201},
-        31201: {'name': 'battery_power_low', 'scale': 1, 'unit': '', 'pair': 31200, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
+        # Battery Power (VPP range - NOT responding on MOD 10000TL3-XH, kept for other MOD variants)
+        # Renamed with _vpp suffix to avoid conflict with 3000+ range (primary source)
+        # Signed: positive=charging, negative=discharging
+        31200: {'name': 'battery_power_high', 'scale': 1, 'unit': '', 'pair': 31201, 'desc': 'Battery power HIGH (VPP range — confirmed responding on MOD XH)'},
+        31201: {'name': 'battery_power_low', 'scale': 1, 'unit': '', 'pair': 31200, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True, 'desc': 'Battery power signed (VPP range — confirmed responding on MOD XH, positive=charging)'},
 
-        # Battery Energy - Daily (Note: protocol lists charge first, then discharge)
-        31202: {'name': 'charge_energy_today_high', 'scale': 1, 'unit': '', 'pair': 31203},
-        31203: {'name': 'charge_energy_today_low', 'scale': 1, 'unit': '', 'pair': 31202, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        31204: {'name': 'charge_energy_total_high', 'scale': 1, 'unit': '', 'pair': 31205},
-        31205: {'name': 'charge_energy_total_low', 'scale': 1, 'unit': '', 'pair': 31204, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        31206: {'name': 'discharge_energy_today_high', 'scale': 1, 'unit': '', 'pair': 31207},
-        31207: {'name': 'discharge_energy_today_low', 'scale': 1, 'unit': '', 'pair': 31206, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        31208: {'name': 'discharge_energy_total_high', 'scale': 1, 'unit': '', 'pair': 31209},
-        31209: {'name': 'discharge_energy_total_low', 'scale': 1, 'unit': '', 'pair': 31208, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        # Battery Energy (VPP range - NOT responding on MOD 10000TL3-XH, kept for other MOD variants)
+        # Renamed with _vpp suffix to avoid conflict with 3000+ range (primary source)
+        # Note: VPP protocol lists charge first, then discharge (opposite of 3000+ range)
+        31202: {'name': 'charge_energy_today_vpp_high', 'scale': 1, 'unit': '', 'pair': 31203},
+        31203: {'name': 'charge_energy_today_vpp_low', 'scale': 1, 'unit': '', 'pair': 31202, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        31204: {'name': 'charge_energy_total_vpp_high', 'scale': 1, 'unit': '', 'pair': 31205},
+        31205: {'name': 'charge_energy_total_vpp_low', 'scale': 1, 'unit': '', 'pair': 31204, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        31206: {'name': 'discharge_energy_today_vpp_high', 'scale': 1, 'unit': '', 'pair': 31207},
+        31207: {'name': 'discharge_energy_today_vpp_low', 'scale': 1, 'unit': '', 'pair': 31206, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        31208: {'name': 'discharge_energy_total_vpp_high', 'scale': 1, 'unit': '', 'pair': 31209},
+        31209: {'name': 'discharge_energy_total_vpp_low', 'scale': 1, 'unit': '', 'pair': 31208, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
         # Battery Power Limits
         31210: {'name': 'battery_max_charge_power_high', 'scale': 1, 'unit': '', 'pair': 31211},
@@ -150,19 +189,20 @@ MOD_6000_15000TL3_XH = {
         31212: {'name': 'battery_max_discharge_power_high', 'scale': 1, 'unit': '', 'pair': 31213},
         31213: {'name': 'battery_max_discharge_power_low', 'scale': 1, 'unit': '', 'pair': 31212, 'combined_scale': 0.1, 'combined_unit': 'W'},
 
-        # Battery State
-        31214: {'name': 'battery_voltage', 'scale': 0.1, 'unit': 'V', 'signed': True},
-        31215: {'name': 'battery_current_high', 'scale': 1, 'unit': '', 'pair': 31216},
-        31216: {'name': 'battery_current_low', 'scale': 1, 'unit': '', 'pair': 31215, 'combined_scale': 0.1, 'combined_unit': 'A', 'signed': True},
-        31217: {'name': 'battery_soc', 'scale': 1, 'unit': '%'},
+        # Battery State (VPP range - NOT responding on MOD 10000TL3-XH, kept for other MOD variants)
+        # Renamed with _vpp suffix to avoid conflict with 3000+ range (primary source)
+        31214: {'name': 'battery_voltage_vpp', 'scale': 0.1, 'unit': 'V', 'signed': True, 'maps_to': 'battery_voltage', 'desc': 'Battery voltage VPP (0.1V/unit; maps_to battery_voltage so it wins over 3169 in max-value selection)'},
+        31215: {'name': 'battery_current_vpp_high', 'scale': 1, 'unit': '', 'pair': 31216},
+        31216: {'name': 'battery_current_vpp_low', 'scale': 1, 'unit': '', 'pair': 31215, 'combined_scale': 0.1, 'combined_unit': 'A', 'signed': True},
+        31217: {'name': 'battery_soc_vpp', 'scale': 1, 'unit': '%', 'desc': 'Battery SOC (VPP range, may not respond on XH variants)'},
         31218: {'name': 'battery_soh', 'scale': 1, 'unit': '%'},
 
         # Battery Capacity
         31219: {'name': 'battery_fcc_high', 'scale': 1, 'unit': '', 'pair': 31220},
         31220: {'name': 'battery_fcc_low', 'scale': 1, 'unit': '', 'pair': 31219, 'combined_scale': 1, 'combined_unit': 'Ah'},
 
-        # Battery Temperature
-        31223: {'name': 'battery_temp', 'scale': 0.1, 'unit': '°C', 'signed': True},
+        # Battery Temperature (VPP range)
+        31223: {'name': 'battery_temp_vpp', 'scale': 0.1, 'unit': '°C', 'signed': True, 'desc': 'Battery temp (VPP range, may not respond on XH variants)'},
 
         # Battery System Info
         31225: {'name': 'battery_cluster_sum', 'scale': 1, 'unit': ''},
@@ -193,14 +233,66 @@ MOD_6000_15000TL3_XH = {
         31318: {'name': 'battery2_soh', 'scale': 1, 'unit': '%'},
         31323: {'name': 'battery2_temp', 'scale': 0.1, 'unit': '°C', 'signed': True},
 
-        # === V2.01 VPP ADDITIONAL REGISTERS ===
-        # Grid/Meter Power (same as PtoGrid at 3043/3044)
-        31112: {'name': 'meter_power_high', 'scale': 1, 'unit': '', 'pair': 31113, 'maps_to': 'power_to_grid', 'desc': 'Meter power (same as PtoGrid)'},
-        31113: {'name': 'meter_power_low', 'scale': 1, 'unit': '', 'pair': 31112, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
+        # === V2.01 VPP ADDITIONAL REGISTERS (31100+ range) ===
+        # Per VPP 2.01 protocol spec (same layout as MID — confirmed on MID via #245 scan):
 
-        # Load Power (same as PtoLoad at 3045/3046)
-        31118: {'name': 'load_power_high_vpp', 'scale': 1, 'unit': '', 'pair': 31119, 'maps_to': 'power_to_load'},
-        31119: {'name': 'load_power_low_vpp', 'scale': 1, 'unit': '', 'pair': 31118, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        # Active power (INT32 signed, 0.1W) — spec item 45
+        # Positive = export to grid, Negative = import from grid.
+        # Register 3043/3044 (power_to_grid_high/low) returns 0 on some firmware when the VPP
+        # range is active; 31100/31101 carries the authoritative signed active power value.
+        # maps_to power_to_grid_low so coordinator sees grid export (positive=export).
+        31100: {'name': 'ac_active_power_high', 'scale': 1, 'unit': '', 'pair': 31101,
+                'desc': 'Active power HIGH (INT32 signed, positive=export)'},
+        31101: {'name': 'ac_active_power_low', 'scale': 1, 'unit': '', 'pair': 31100,
+                'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True,
+                'maps_to': 'power_to_grid_low',
+                'desc': 'Active power LOW — maps_to power_to_grid (positive=export per VPP 2.01 item 45)'},
+
+        # Meter power (INT32 signed, 0.1W) — spec item 55
+        # NOTE: sign convention OPPOSITE to active power — positive = IMPORT from grid.
+        # maps_to power_to_user_low so coordinator sees grid import directly.
+        31112: {'name': 'meter_power_high', 'scale': 1, 'unit': '', 'pair': 31113,
+                'desc': 'Meter power HIGH (INT32, positive=import)'},
+        31113: {'name': 'meter_power_low', 'scale': 1, 'unit': '', 'pair': 31112,
+                'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True,
+                'maps_to': 'power_to_user_low',
+                'desc': 'Meter power LOW — maps_to power_to_user (positive=import per VPP 2.01 item 55)'},
+
+        # === VPP 2.01 GRID ENERGY COUNTERS (31118-31125) — spec items 60-63 ===
+        # Per VPP 2.01 spec (same layout as MID — confirmed #245).
+        # These are VPP fallbacks — 3000-range (3067-3074) takes priority per coordinator ordering.
+
+        # Item 60: Power to user daily (UINT32, 0.1kWh) — grid import energy today
+        31118: {'name': 'energy_to_user_today_vpp_high', 'scale': 1, 'unit': '', 'pair': 31119,
+                'desc': 'Grid import energy today HIGH (VPP 2.01 item 60)'},
+        31119: {'name': 'energy_to_user_today_vpp_low', 'scale': 1, 'unit': '', 'pair': 31118,
+                'combined_scale': 0.1, 'combined_unit': 'kWh',
+                'maps_to': 'energy_to_user_today_low',
+                'desc': 'Grid import energy today LOW (VPP 2.01 item 60)'},
+
+        # Item 61: Total power to user (UINT32, 0.1kWh) — grid import energy total
+        31120: {'name': 'energy_to_user_total_vpp_high', 'scale': 1, 'unit': '', 'pair': 31121,
+                'desc': 'Grid import energy total HIGH (VPP 2.01 item 61)'},
+        31121: {'name': 'energy_to_user_total_vpp_low', 'scale': 1, 'unit': '', 'pair': 31120,
+                'combined_scale': 0.1, 'combined_unit': 'kWh',
+                'maps_to': 'energy_to_user_total_low',
+                'desc': 'Grid import energy total LOW (VPP 2.01 item 61)'},
+
+        # Item 62: Power to grid daily (UINT32, 0.1kWh) — grid export energy today
+        31122: {'name': 'energy_to_grid_today_vpp_high', 'scale': 1, 'unit': '', 'pair': 31123,
+                'desc': 'Grid export energy today HIGH (VPP 2.01 item 62)'},
+        31123: {'name': 'energy_to_grid_today_vpp_low', 'scale': 1, 'unit': '', 'pair': 31122,
+                'combined_scale': 0.1, 'combined_unit': 'kWh',
+                'maps_to': 'energy_to_grid_today_low',
+                'desc': 'Grid export energy today LOW (VPP 2.01 item 62)'},
+
+        # Item 63: Total power to grid (UINT32, 0.1kWh) — grid export energy total
+        31124: {'name': 'energy_to_grid_total_vpp_high', 'scale': 1, 'unit': '', 'pair': 31125,
+                'desc': 'Grid export energy total HIGH (VPP 2.01 item 63)'},
+        31125: {'name': 'energy_to_grid_total_vpp_low', 'scale': 1, 'unit': '', 'pair': 31124,
+                'combined_scale': 0.1, 'combined_unit': 'kWh',
+                'maps_to': 'energy_to_grid_total_low',
+                'desc': 'Grid export energy total LOW (VPP 2.01 item 63)'},
 
         # Status
         31000: {'name': 'equipment_status', 'scale': 1, 'unit': '', 'desc': 'Equipment running status'},
@@ -211,6 +303,16 @@ MOD_6000_15000TL3_XH = {
         0: {'name': 'on_off', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': '0=Off, 1=On'},
         3: {'name': 'active_power_rate', 'scale': 1, 'unit': '%', 'access': 'RW', 'desc': 'Max output power %'},
         30: {'name': 'modbus_address', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': 'Modbus address 1-254'},
+
+        # Battery SOC charge/discharge limits — scan #228 confirms hardware responds (all Read OK)
+        1071: {'name': 'discharge_stopped_soc', 'scale': 1, 'unit': '%', 'access': 'RW',
+               'valid_range': (0, 100), 'desc': 'SOC level to stop battery discharge'},
+        1090: {'name': 'charge_power_rate', 'scale': 1, 'unit': '%', 'access': 'RW',
+               'valid_range': (0, 100), 'desc': 'Battery charge power rate limit (0-100%)'},
+        1091: {'name': 'charge_stopped_soc', 'scale': 1, 'unit': '%', 'access': 'RW',
+               'valid_range': (0, 100), 'desc': 'SOC level to stop battery charge'},
+        1092: {'name': 'ac_charge_enable', 'scale': 1, 'unit': '', 'access': 'RW',
+               'valid_range': (0, 1), 'desc': 'Enable charging from AC (grid)'},
 
         # Device identification
         30000: {'name': 'dtc_code', 'scale': 1, 'unit': '', 'access': 'RO', 'desc': 'Device Type Code: 5400 for MOD-XH/MID-XH', 'default': 5400},
@@ -240,6 +342,65 @@ MOD_6000_15000TL3_XH = {
             'valid_range': (0, 1000),
             'note': '0=0%, 1000=100.0%'
         },
+
+        # Power rate limits for Grid First and Battery First modes
+        # Scan #228 confirmed: 3036=100 (Read OK, GridFirstDischargePowerRate), 3047=80 (Read OK, BatFirstPowerRate)
+        3036: {'name': 'grid_first_discharge_power_rate', 'scale': 1, 'unit': '%', 'access': 'RW',
+               'valid_range': (1, 100), 'desc': 'Discharge power rate when Grid First mode (1-100%)'},
+
+        # TOU (Time-of-Use) schedule (FC04 holding, registers 3038-3045)
+        # Start registers: bit15=enable, bit13-14=priority(0=Load,1=Battery,2=Grid), bit8-12=hour, bit0-7=minute
+        # End registers: bit8-12=hour, bit0-7=minute (same hex-packed as SPH time periods)
+        3038: {'name': 'mod_tou_1_start', 'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 1 start: bit15=enable, bit13-14=priority(0=Load,1=Batt,2=Grid), bit8-12=hour, bit0-7=min'},
+        3039: {'name': 'mod_tou_1_end',   'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 1 end: bit8-12=hour, bit0-7=min'},
+        3040: {'name': 'mod_tou_2_start', 'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 2 start: bit15=enable, bit13-14=priority, bit8-12=hour, bit0-7=min'},
+        3041: {'name': 'mod_tou_2_end',   'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 2 end: bit8-12=hour, bit0-7=min'},
+        3042: {'name': 'mod_tou_3_start', 'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 3 start: bit15=enable, bit13-14=priority, bit8-12=hour, bit0-7=min'},
+        3043: {'name': 'mod_tou_3_end',   'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 3 end: bit8-12=hour, bit0-7=min'},
+        3044: {'name': 'mod_tou_4_start', 'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 4 start: bit15=enable, bit13-14=priority, bit8-12=hour, bit0-7=min'},
+        3045: {'name': 'mod_tou_4_end',   'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 4 end: bit8-12=hour, bit0-7=min'},
+
+        # EMS / grid-charge controls (3046-3049) — NOT TOU slots
+        3047: {'name': 'batt_first_charge_power_rate', 'scale': 1, 'unit': '%', 'access': 'RW',
+               'valid_range': (1, 100), 'desc': 'Charge power rate when Battery First mode (1-100%)'},
+        3049: {'name': 'allow_grid_charge', 'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'Allow Grid Charge — must be Enabled (1) for TOU writes to persist (GEN4)'},
+
+        # TOU slots 5-9 (3050-3059; gap at 3046-3049 is intentional — EMS/grid-charge regs)
+        3050: {'name': 'mod_tou_5_start', 'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 5 start: bit15=enable, bit13-14=priority, bit8-12=hour, bit0-7=min'},
+        3051: {'name': 'mod_tou_5_end',   'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 5 end: bit8-12=hour, bit0-7=min'},
+        3052: {'name': 'mod_tou_6_start', 'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 6 start: bit15=enable, bit13-14=priority, bit8-12=hour, bit0-7=min'},
+        3053: {'name': 'mod_tou_6_end',   'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 6 end: bit8-12=hour, bit0-7=min'},
+        3054: {'name': 'mod_tou_7_start', 'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 7 start: bit15=enable, bit13-14=priority, bit8-12=hour, bit0-7=min'},
+        3055: {'name': 'mod_tou_7_end',   'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 7 end: bit8-12=hour, bit0-7=min'},
+        3056: {'name': 'mod_tou_8_start', 'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 8 start: bit15=enable, bit13-14=priority, bit8-12=hour, bit0-7=min'},
+        3057: {'name': 'mod_tou_8_end',   'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 8 end: bit8-12=hour, bit0-7=min'},
+        3058: {'name': 'mod_tou_9_start', 'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 9 start: bit15=enable, bit13-14=priority, bit8-12=hour, bit0-7=min'},
+        3059: {'name': 'mod_tou_9_end',   'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'TOU Period 9 end: bit8-12=hour, bit0-7=min'},
+
+        # Safety/compliance diagnostic registers (read-only, Issue #282)
+        235: {'name': 'ntognd_detect',     'scale': 1, 'unit': '', 'access': 'R', 'desc': '0=Disable, 1=Enable — NToGND detection'},
+        236: {'name': 'nonstd_vac_enable', 'scale': 1, 'unit': '', 'access': 'R', 'desc': '0=Disable, 1=Grade1, 2=Grade2 — non-standard VAC'},
+        237: {'name': 'enable_spec_set',   'scale': 1, 'unit': '', 'access': 'R', 'desc': 'Regional spec bitmask (Bit0=Hungary)'},
+        238: {'name': 'fast_mppt_enable',  'scale': 1, 'unit': '', 'access': 'R', 'desc': '0-2 — fast MPPT (Reserved)'},
     }
 }
 
@@ -275,19 +436,22 @@ MOD_6000_15000TL3_X = {
         13: {'name': 'pv3_power_high', 'scale': 1, 'unit': '', 'pair': 14},
         14: {'name': 'pv3_power_low', 'scale': 1, 'unit': '', 'pair': 13, 'combined_scale': 0.1, 'combined_unit': 'W'},
 
-        # Output Power Total (32-bit)
-        35: {'name': 'output_power_high', 'scale': 1, 'unit': '', 'pair': 36},
-        36: {'name': 'output_power_low', 'scale': 1, 'unit': '', 'pair': 35, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        # Output Power Total (32-bit) — true three-phase inverter output total.
+        # Aliased to ac_power so the generic ac_power sensor reflects the correct total.
+        # Do NOT alias ac_power_r (reg 40/41) — that is Phase R only, not total.
+        35: {'name': 'output_power_high', 'scale': 1, 'unit': '', 'pair': 36, 'alias': 'ac_power_high'},
+        36: {'name': 'output_power_low', 'scale': 1, 'unit': '', 'pair': 35, 'combined_scale': 0.1, 'combined_unit': 'W', 'alias': 'ac_power_low'},
 
         # === AC OUTPUT - THREE PHASE ===
         # Grid Frequency (shared across all phases)
         37: {'name': 'ac_frequency', 'scale': 0.01, 'unit': 'Hz', 'desc': 'AC output frequency'},
 
-        # Generic AC aliases (point to Phase R for compatibility)
+        # Phase R (L1) — ac_voltage/ac_current aliased for generic code; ac_power NOT aliased here
+        # (ac_power comes from output_power reg 35/36 which holds the true three-phase total)
         38: {'name': 'ac_voltage_r', 'scale': 0.1, 'unit': 'V', 'desc': 'Phase R AC voltage', 'alias': 'ac_voltage'},
         39: {'name': 'ac_current_r', 'scale': 0.1, 'unit': 'A', 'desc': 'Phase R AC current', 'alias': 'ac_current'},
-        40: {'name': 'ac_power_r_high', 'scale': 1, 'unit': '', 'pair': 41, 'alias': 'ac_power_high'},
-        41: {'name': 'ac_power_r_low', 'scale': 1, 'unit': '', 'pair': 40, 'combined_scale': 0.1, 'combined_unit': 'VA', 'alias': 'ac_power_low'},
+        40: {'name': 'ac_power_r_high', 'scale': 1, 'unit': '', 'pair': 41},
+        41: {'name': 'ac_power_r_low', 'scale': 1, 'unit': '', 'pair': 40, 'combined_scale': 0.1, 'combined_unit': 'VA'},
 
         # Phase S (L2) - AC Output
         42: {'name': 'ac_voltage_s', 'scale': 0.1, 'unit': 'V', 'desc': 'Phase S AC voltage'},
@@ -355,6 +519,12 @@ MOD_6000_15000TL3_X = {
             'valid_range': (0, 1000),
             'note': '0=0%, 1000=100.0%'
         },
+
+        # Safety/compliance diagnostic registers (read-only, Issue #282)
+        235: {'name': 'ntognd_detect',     'scale': 1, 'unit': '', 'access': 'R', 'desc': '0=Disable, 1=Enable — NToGND detection'},
+        236: {'name': 'nonstd_vac_enable', 'scale': 1, 'unit': '', 'access': 'R', 'desc': '0=Disable, 1=Grade1, 2=Grade2 — non-standard VAC'},
+        237: {'name': 'enable_spec_set',   'scale': 1, 'unit': '', 'access': 'R', 'desc': 'Regional spec bitmask (Bit0=Hungary)'},
+        238: {'name': 'fast_mppt_enable',  'scale': 1, 'unit': '', 'access': 'R', 'desc': '0-2 — fast MPPT (Reserved)'},
     }
 }
 

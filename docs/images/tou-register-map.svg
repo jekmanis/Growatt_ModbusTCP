@@ -1,0 +1,115 @@
+<svg viewBox="0 0 900 320" xmlns="http://www.w3.org/2000/svg" font-family="monospace, 'Courier New'" font-size="12">
+  <defs>
+    <style>
+      .label    { font-size: 11px; fill: #333; }
+      .reg      { font-size: 10px; fill: #555; }
+      .head     { font-size: 13px; font-weight: bold; fill: #222; }
+      .note     { font-size: 10px; fill: #666; font-style: italic; }
+    </style>
+  </defs>
+
+  <!-- Title -->
+  <text x="450" y="28" text-anchor="middle" class="head">MOD GEN4 TOU Register Map  (Holding Registers 3038–3059)</text>
+
+  <!-- ── Legend ── -->
+  <rect x="30"  y="44" width="14" height="14" rx="3" fill="#4caf50"/>
+  <text x="50"  y="55" class="label">TOU slots 1–4 (currently active)</text>
+  <rect x="240" y="44" width="14" height="14" rx="3" fill="#ff9800"/>
+  <text x="260" y="55" class="label">EMS / gate controls</text>
+  <rect x="420" y="44" width="14" height="14" rx="3" fill="#2196f3"/>
+  <text x="440" y="55" class="label">TOU slots 5–9 (new in v0.6.8)</text>
+  <rect x="640" y="44" width="14" height="14" rx="3" fill="#f44336"/>
+  <text x="660" y="55" class="label">Register 3049 — prerequisite gate</text>
+
+  <!-- ── Row 1: Slots 1–4 (3038–3045) ── -->
+  <!-- Pair 1 -->
+  <rect x="30"  y="80" width="90" height="44" rx="4" fill="#c8e6c9" stroke="#4caf50" stroke-width="1.5"/>
+  <text x="75"  y="98"  text-anchor="middle" class="label" font-weight="bold">3038</text>
+  <text x="75"  y="112" text-anchor="middle" class="reg">Period 1 Start</text>
+
+  <rect x="128" y="80" width="90" height="44" rx="4" fill="#c8e6c9" stroke="#4caf50" stroke-width="1.5"/>
+  <text x="173" y="98"  text-anchor="middle" class="label" font-weight="bold">3039</text>
+  <text x="173" y="112" text-anchor="middle" class="reg">Period 1 End</text>
+
+  <!-- Pair 2 -->
+  <rect x="226" y="80" width="90" height="44" rx="4" fill="#c8e6c9" stroke="#4caf50" stroke-width="1.5"/>
+  <text x="271" y="98"  text-anchor="middle" class="label" font-weight="bold">3040</text>
+  <text x="271" y="112" text-anchor="middle" class="reg">Period 2 Start</text>
+
+  <rect x="324" y="80" width="90" height="44" rx="4" fill="#c8e6c9" stroke="#4caf50" stroke-width="1.5"/>
+  <text x="369" y="98"  text-anchor="middle" class="label" font-weight="bold">3041</text>
+  <text x="369" y="112" text-anchor="middle" class="reg">Period 2 End</text>
+
+  <!-- Pair 3 -->
+  <rect x="422" y="80" width="90" height="44" rx="4" fill="#c8e6c9" stroke="#4caf50" stroke-width="1.5"/>
+  <text x="467" y="98"  text-anchor="middle" class="label" font-weight="bold">3042</text>
+  <text x="467" y="112" text-anchor="middle" class="reg">Period 3 Start</text>
+
+  <rect x="520" y="80" width="90" height="44" rx="4" fill="#c8e6c9" stroke="#4caf50" stroke-width="1.5"/>
+  <text x="565" y="98"  text-anchor="middle" class="label" font-weight="bold">3043</text>
+  <text x="565" y="112" text-anchor="middle" class="reg">Period 3 End</text>
+
+  <!-- Pair 4 -->
+  <rect x="618" y="80" width="90" height="44" rx="4" fill="#c8e6c9" stroke="#4caf50" stroke-width="1.5"/>
+  <text x="663" y="98"  text-anchor="middle" class="label" font-weight="bold">3044</text>
+  <text x="663" y="112" text-anchor="middle" class="reg">Period 4 Start</text>
+
+  <rect x="716" y="80" width="90" height="44" rx="4" fill="#c8e6c9" stroke="#4caf50" stroke-width="1.5"/>
+  <text x="761" y="98"  text-anchor="middle" class="label" font-weight="bold">3045</text>
+  <text x="761" y="112" text-anchor="middle" class="reg">Period 4 End</text>
+
+  <!-- Start/End annotation row 1 -->
+  <text x="75"  y="136" text-anchor="middle" class="note">bit15=enable</text>
+  <text x="75"  y="148" text-anchor="middle" class="note">bit13-14=priority</text>
+  <text x="173" y="136" text-anchor="middle" class="note">hour·256+min</text>
+
+  <!-- ── Gap: EMS registers 3046–3049 ── -->
+  <rect x="30"  y="165" width="90" height="44" rx="4" fill="#ffe0b2" stroke="#ff9800" stroke-width="1.5"/>
+  <text x="75"  y="183" text-anchor="middle" class="label" font-weight="bold">3046</text>
+  <text x="75"  y="197" text-anchor="middle" class="reg">(reserved)</text>
+
+  <rect x="128" y="165" width="90" height="44" rx="4" fill="#ffe0b2" stroke="#ff9800" stroke-width="1.5"/>
+  <text x="173" y="183" text-anchor="middle" class="label" font-weight="bold">3047</text>
+  <text x="173" y="197" text-anchor="middle" class="reg">EMS Discharge%</text>
+
+  <rect x="226" y="165" width="90" height="44" rx="4" fill="#ffe0b2" stroke="#ff9800" stroke-width="1.5"/>
+  <text x="271" y="183" text-anchor="middle" class="label" font-weight="bold">3048</text>
+  <text x="271" y="197" text-anchor="middle" class="reg">EMS Stop SOC</text>
+
+  <!-- 3049 highlighted as gate -->
+  <rect x="324" y="160" width="90" height="54" rx="4" fill="#ffcdd2" stroke="#f44336" stroke-width="2.5"/>
+  <text x="369" y="180" text-anchor="middle" class="label" font-weight="bold" fill="#b71c1c">3049</text>
+  <text x="369" y="194" text-anchor="middle" class="reg" fill="#b71c1c">Allow Grid Charge</text>
+  <text x="369" y="207" text-anchor="middle" font-size="10" fill="#b71c1c">⚠ MUST BE 1</text>
+
+  <!-- Gap label -->
+  <text x="210" y="226" text-anchor="middle" class="note" fill="#e65100">Gap 3046–3049: EMS controls (not TOU slots)</text>
+
+  <!-- ── Row 3: Slots 5–9 (3050–3059) ── -->
+  <rect x="30"  y="240" width="90" height="44" rx="4" fill="#bbdefb" stroke="#2196f3" stroke-width="1.5"/>
+  <text x="75"  y="258" text-anchor="middle" class="label" font-weight="bold">3050</text>
+  <text x="75"  y="272" text-anchor="middle" class="reg">Period 5 Start</text>
+
+  <rect x="128" y="240" width="90" height="44" rx="4" fill="#bbdefb" stroke="#2196f3" stroke-width="1.5"/>
+  <text x="173" y="258" text-anchor="middle" class="label" font-weight="bold">3051</text>
+  <text x="173" y="272" text-anchor="middle" class="reg">Period 5 End</text>
+
+  <rect x="226" y="240" width="90" height="44" rx="4" fill="#bbdefb" stroke="#2196f3" stroke-width="1.5"/>
+  <text x="271" y="258" text-anchor="middle" class="label" font-weight="bold">3052–3053</text>
+  <text x="271" y="272" text-anchor="middle" class="reg">Period 6</text>
+
+  <rect x="324" y="240" width="90" height="44" rx="4" fill="#bbdefb" stroke="#2196f3" stroke-width="1.5"/>
+  <text x="369" y="258" text-anchor="middle" class="label" font-weight="bold">3054–3055</text>
+  <text x="369" y="272" text-anchor="middle" class="reg">Period 7</text>
+
+  <rect x="422" y="240" width="90" height="44" rx="4" fill="#bbdefb" stroke="#2196f3" stroke-width="1.5"/>
+  <text x="467" y="258" text-anchor="middle" class="label" font-weight="bold">3056–3057</text>
+  <text x="467" y="272" text-anchor="middle" class="reg">Period 8</text>
+
+  <rect x="520" y="240" width="90" height="44" rx="4" fill="#bbdefb" stroke="#2196f3" stroke-width="1.5"/>
+  <text x="565" y="258" text-anchor="middle" class="label" font-weight="bold">3058–3059</text>
+  <text x="565" y="272" text-anchor="middle" class="reg">Period 9</text>
+
+  <!-- Row annotations -->
+  <text x="30"  y="296" class="note">Start register format: bit15=enable · bit14=Grid First · bit13=Battery First · bit8-12=hour · bit0-7=minute</text>
+</svg>

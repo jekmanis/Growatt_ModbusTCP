@@ -46,6 +46,14 @@ def detect_profile_from_model_name(model_name: str) -> Optional[str]:
         'MIC2500': 'mic_600_3300tl_x',
         'MIC3000': 'mic_600_3300tl_x',
         'MIC3300': 'mic_600_3300tl_x',
+        'MIC2500MTL': 'mic_2500_5500mtl_s',
+        'MIC3000MTL': 'mic_2500_5500mtl_s',
+        'MIC3500MTL': 'mic_2500_5500mtl_s',
+        'MIC4000MTL': 'mic_2500_5500mtl_s',
+        'MIC4200MTL': 'mic_2500_5500mtl_s',
+        'MIC4200': 'mic_2500_5500mtl_s',
+        'MIC5000MTL': 'mic_2500_5500mtl_s',
+        'MIC5500MTL': 'mic_2500_5500mtl_s',
         
         # MIN series
         'MIN3000': 'min_3000_6000_tl_x',
@@ -110,6 +118,14 @@ def detect_profile_from_model_name(model_name: str) -> Optional[str]:
         'WIT12000': 'wit_4000_15000tl3',
         'WIT15000': 'wit_4000_15000tl3',
 
+        # SPE series (single-phase hybrid, 8-12kW, SPF protocol)
+        'SPE8000': 'spe_8000_12000_es',
+        'SPE10000': 'spe_8000_12000_es',
+        'SPE12000': 'spe_8000_12000_es',
+        'SPE8K': 'spe_8000_12000_es',
+        'SPE10K': 'spe_8000_12000_es',
+        'SPE12K': 'spe_8000_12000_es',
+
     }
     
     # Try to find a match - check longer patterns first to match specific models
@@ -141,16 +157,16 @@ async def async_read_serial_number(
     try:
         # Read 10 registers starting at address 23
         result = await hass.async_add_executor_job(
-            lambda: client.client.read_holding_registers(address=23, count=10)
+            client.read_holding_registers, 23, 10
         )
-        
-        if result.isError():
-            _LOGGER.debug(f"Error reading serial number: {result}")
+
+        if result is None:
+            _LOGGER.debug("Error reading serial number: no response")
             return None
-        
+
         # Convert registers to string
         serial_bytes = []
-        for register in result.registers:
+        for register in result:
             high_byte = (register >> 8) & 0xFF
             low_byte = register & 0xFF
             serial_bytes.extend([high_byte, low_byte])
@@ -188,16 +204,16 @@ async def async_read_model_name(
     try:
         # Read 5 registers starting at address 0
         result = await hass.async_add_executor_job(
-            lambda: client.client.read_holding_registers(address=0, count=5)
+            client.read_holding_registers, 0, 5
         )
-        
-        if result.isError():
-            _LOGGER.debug(f"Error reading model name: {result}")
+
+        if result is None:
+            _LOGGER.debug("Error reading model name: no response")
             return None
-        
+
         # Convert registers to string
         model_bytes = []
-        for register in result.registers:
+        for register in result:
             high_byte = (register >> 8) & 0xFF
             low_byte = register & 0xFF
             model_bytes.extend([high_byte, low_byte])
@@ -240,7 +256,12 @@ async def async_read_dtc_code_offgrid(
     Returns:
         DTC code (int) or None if read fails
     """
-    # Try input register 44 first (Protocol v0.11 standard)
+    # SPF OffGrid DTC codes (Protocol v0.11): only these values are valid at input 44.
+    # V1.39 grid-tied inverters (MIN, SPH, etc.) use input 44 for TP (tracker/phase count),
+    # which is non-zero but not a DTC — accepting it here would short-circuit before holding 43.
+    _SPF_DTC_CODES = (3400, 3401, 3402, 3403)
+
+    # Try input register 44 first (Protocol v0.11 standard — SPF only)
     try:
         result = await hass.async_add_executor_job(
             client.read_input_registers, 44, 1
@@ -248,9 +269,11 @@ async def async_read_dtc_code_offgrid(
 
         if result is not None and len(result) > 0:
             dtc_code = result[0]
-            if dtc_code and dtc_code > 0:
+            if dtc_code and dtc_code in _SPF_DTC_CODES:
                 _LOGGER.info(f"✓ OffGrid DTC Detection - Read DTC code: {dtc_code} from input register 44")
                 return dtc_code
+            elif dtc_code and dtc_code > 0:
+                _LOGGER.debug(f"Input register 44 returned {dtc_code} — not an SPF DTC code (likely TP field), continuing to holding 43")
 
     except Exception as e:
         _LOGGER.debug(f"Could not read DTC from input register 44: {str(e)}")
@@ -258,11 +281,11 @@ async def async_read_dtc_code_offgrid(
     # Fallback to holding register 43
     try:
         result = await hass.async_add_executor_job(
-            lambda: client.client.read_holding_registers(address=43, count=1)
+            client.read_holding_registers, 43, 1
         )
 
-        if not result.isError():
-            dtc_code = result.registers[0]
+        if result is not None:
+            dtc_code = result[0]
             if dtc_code and dtc_code > 0:
                 _LOGGER.info(f"✓ OffGrid DTC Detection - Read DTC code: {dtc_code} from holding register 43")
                 return dtc_code
@@ -313,14 +336,14 @@ async def async_read_dtc_code(
     try:
         # Read DTC from holding register 30000
         result = await hass.async_add_executor_job(
-            lambda: client.client.read_holding_registers(address=30000, count=1)
+            client.read_holding_registers, 30000, 1
         )
 
-        if result.isError():
-            _LOGGER.warning(f"Failed to read DTC code from register 30000: {result}")
+        if result is None:
+            _LOGGER.warning("Failed to read DTC code from register 30000: no response")
             return None
 
-        dtc_code = result.registers[0]
+        dtc_code = result[0]
         if dtc_code and dtc_code > 0:
             _LOGGER.info(f"✓ VPP DTC Detection - Read DTC code: {dtc_code} from holding register 30000")
             return dtc_code
@@ -330,6 +353,56 @@ async def async_read_dtc_code(
 
     except Exception as e:
         _LOGGER.warning(f"Exception reading DTC code from register 30000: {str(e)}")
+        return None
+
+
+async def async_read_protocol_version(
+    hass: HomeAssistant,
+    client: GrowattModbus,
+    device_id: int = 1
+) -> Optional[int]:
+    """
+    Read VPP Protocol Version from holding register 30099.
+
+    Returns:
+        - 200: V2.00
+        - 201: V2.01
+        - 202: V2.02
+        - 0 or None: Legacy protocol (V1.39/V3.05) - no V2.01 support
+
+    Args:
+        hass: HomeAssistant instance
+        client: GrowattModbus client
+        device_id: Modbus device ID (default 1)
+
+    Returns:
+        Protocol version code (int) or None if not readable
+    """
+    try:
+        # Read protocol version from holding register 30099
+        result = await hass.async_add_executor_job(
+            client.read_holding_registers, 30099, 1
+        )
+
+        if result is None:
+            _LOGGER.debug("Protocol version register 30099 not readable (legacy inverter)")
+            return None
+
+        protocol_version = result[0]
+
+        if protocol_version == 0:
+            _LOGGER.info(f"✓ Protocol version check - Register 30099 = 0 (Legacy protocol, no V2.01 support)")
+            return 0
+        elif protocol_version in (200, 201, 202):
+            version_str = f"V{protocol_version // 100}.{protocol_version % 100:02d}"
+            _LOGGER.info(f"✓ Protocol version check - Register 30099 = {protocol_version} (Protocol {version_str})")
+            return protocol_version
+        else:
+            _LOGGER.warning(f"Unexpected protocol version value: {protocol_version}")
+            return protocol_version
+
+    except Exception as e:
+        _LOGGER.debug(f"Exception reading protocol version from register 30099: {str(e)}")
         return None
 
 
@@ -355,7 +428,7 @@ def detect_profile_from_dtc(dtc_code: int) -> Optional[str]:
     - MIN 2500-6000TL-XH/XH(P): 5100
     - MIC/MIN 2500-6000TL-X/X2: 5200
     - MIN 7000-10000TL-X/X2: 5201
-    - MOD-XH\MID-XH: 5400
+    - MOD-XH/MID-XH: 5400
     - WIT 4-15kW: 5603
     - WIT 100KTL3-H: 5601
     - WIS 215KTL3: 5800
@@ -366,13 +439,35 @@ def detect_profile_from_dtc(dtc_code: int) -> Optional[str]:
     Returns:
         Profile key or None if no match
     """
-    # Only official DTC codes from Growatt VPP 2.01 Protocol documentation Table 3-1
+    # Official DTC codes from Growatt VPP 2.03 Protocol documentation Table 3-1
+    # Note: Some legacy models use DTC register but don't support full V2.01 protocol
     dtc_map = {
-        # SPH series - Official Growatt DTCs
-        3502: 'sph_3000_6000_v201',       # SPH 3000-6000TL BL
-        3735: 'sph_3000_6000_v201',       # SPA 3000-6000TL BL (similar to SPH)
-        3601: 'sph_tl3_3000_10000_v201',  # SPH 4000-10000TL3 BH-UP
-        3725: 'sph_tl3_3000_10000_v201',  # SPA 4000-10000TL3 BH-UP
+        # Legacy protocol models — DTC at holding register 43, no VPP support
+        210:  'mic_2500_5500mtl_s',     # MIC 2500-5500MTL-S: single-phase dual-string, firmware AH1.0
+        2049: 'tl3_s_3000_15000',      # TL3-S 3000-15000: three-phase grid-tied string, firmware DH1.0
+
+        # SPH series - Official Growatt DTCs (VPP 2.03 Table 3-1)
+        3501: 'sph_3000_6000_v201',       # SPH 3000-6000TL BL
+        3502: 'sph_3000_6000_v201',       # SPH 3000-6000TL BL-UP
+        3503: 'sph_3000_6000_v201',       # SPH 3000-6000TL HU
+        3504: 'sph_3000_6000_v201',       # SPH 3000-6000TL HUB
+        3601: 'sph_tl3_3000_10000_v201',  # SPH 4-10KTL3 BH-UP (confirmed DTC)
+        21303: 'sph_8000_10000_hu',       # SPH/SPM 8000-10000TL-HU (firmware UL2.21, DTC confirmed scan #303)
+
+        # SPA series - Official Growatt DTCs (VPP 2.03 Table 3-1)
+        # SPA variants share the sph_3000_6000_v201 register layout for VPP.
+        # Non-VPP SPA (firmware RH1.0) is caught by async_detect_inverter_series()
+        # battery voltage check before DTC lookup and never reaches this map.
+        3701: 'sph_3000_6000_v201',       # SPA 1000-3000TL BL
+        3715: 'sph_3000_6000_v201',       # SPA 3000-6000TL AU
+        3716: 'sph_3000_6000_v201',       # SPA 3000-6000TL AUB
+        3725: 'sph_tl3_3000_10000_v201',  # SPA 4-10KTL3 BH-UP (confirmed DTC)
+        3735: 'sph_3000_6000_v201',       # SPA 3000-6000TL BL (VPP-capable variant, confirmed DTC)
+        # TODO #249: SPA VPP register applicability notes (from Growatt VPP 2.01/2.03 docs):
+        #   30406 (Load Priority Discharge Cutoff SOC): Only DTC 3502, 3735, 3750, 3601
+        #   30208 (Export Limitation Protection Mode): NOT used by DTC 3725, 3601, 5601, 5800
+        #   30157 (EPS Offline Voltage): Different valid ranges per model —
+        #     consult Growatt documentation for per-model min/max before writing
 
         # SPF series - Off-Grid (034xx range from SPF protocol documentation)
         3400: 'spf_3000_6000_es_plus',         # SPF 3000-6000 ES PLUS (off-grid)
@@ -380,19 +475,34 @@ def detect_profile_from_dtc(dtc_code: int) -> Optional[str]:
         3402: 'spf_3000_6000_es_plus',         # SPF 3000-6000 ES PLUS variant
         3403: 'spf_3000_6000_es_plus',         # SPF 3000-6000 ES PLUS variant
 
-        # MIN/TL-XH/MIC series - Official Growatt DTCs
-        5100: 'tl_xh_3000_10000_v201',    # MIN 2500-6000TL-XH/XH(P) - covers TL-XH
-        5200: 'min_3000_6000_tl_x_v201',  # MIC/MIN 2500-6000TL-X/X2 - shared code, prioritize MIN
-        5201: 'min_7000_10000_tl_x_v201', # MIN 7000-10000TL-X/X2
+        # SPE series - Single-phase hybrid (SPF protocol variant, 8-12kW)
+        64541: 'spe_8000_12000_es',            # SPE 8000-12000 ES (confirmed from issue #212 register scan)
 
-        # MOD/MID series - Official Growatt DTC
-        5400: 'mod_6000_15000tl3_xh_v201', # MOD-XH\MID-XH - covers both MOD and MID
+        # MIN-XH series - Official Growatt DTCs (VPP 2.03 Table 3-1)
+        5100: 'tl_xh_3000_10000_v201',    # MIN 2500-6000TL-XH/XH2/XHE/XA
 
-        # WIT/WIS series - Official Growatt DTCs
+        # MIC/MIN-X series - Official Growatt DTCs (VPP 2.03 Table 3-1)
+        5200: 'min_3000_6000_tl_x_v201',  # MIC 600-3300TL-X/X2; MIN 2500-6000TL-X/X2 — refined by testing regs 59-62
+        5201: 'min_7000_10000_tl_x_v201', # MIN 7-10KTL-X/X2
+
+        # MOD/MID-XH series — Official Growatt DTCs (VPP 2.03 Table 3-1)
+        5400: 'mod_6000_15000tl3_xh_v201', # MOD 3-10KTL3-XH/BP; MID 11-30KTL3-XH; MID 8-15KTL3-XHL/JP
+        5401: 'mod_6000_15000tl3_xh_v201', # MOD 3-15KTL3-HU; MID 33-50KTL3-HU (confirmed scan #228)
+
+        # MOD/MID/MAC-X series — grid-tied (no battery, no CT meter) — VPP 2.03 Table 3-1
+        # These report VPP 2.01 registers (31100-31115 active) but grid-power registers
+        # (3041-3044, 31112-31113) are always zero — no built-in CT at grid connection point.
+        5001: 'mid_15000_25000tl3_x_v201', # MID 17-25KTL3-X; MID 20-30KTL3-X2; MID 33-50KTL3-X2 (confirmed #242)
+        5002: 'mid_15000_25000tl3_x_v201', # MID 33-36KTL3-X(Pro.E); MID 3-33KTL3-X3; MOD 3-15KTL3-X; MOD 3-15KTL3-X2
+        5003: 'mid_15000_25000tl3_x_v201', # MAC 30-70KTL3-X; MAC 15-36KTL3-XL; MAC 50-70KTL3-X2 (best-effort, no profile)
+
+        # WIT/WIS series - Official Growatt DTCs (VPP 2.03 Table 3-1)
         # Register 988 can distinguish: 0=WIT, 1=WIS
         5603: 'wit_4000_15000tl3',          # WIT 4-15kW (residential three-phase hybrid) - Protocol V2.02
-        5601: 'mid_15000_25000tl3_x_v201',  # WIT 100KTL3-H (commercial)
-        5800: 'mid_15000_25000tl3_x_v201',  # WIS 215KTL3 (commercial)
+        5600: 'mid_15000_25000tl3_x_v201',  # WIS 100K-AM; WIT 50-100K-H/HE/HU/A/AE/AU (large commercial)
+        5601: 'mid_15000_25000tl3_x_v201',  # WIT 29.9-50K-XHU
+        5800: 'mid_15000_25000tl3_x_v201',  # WIS 210K
+        5801: 'mid_15000_25000tl3_x_v201',  # WIS 215K-AM
     }
 
     profile_key = dtc_map.get(dtc_code)
@@ -402,6 +512,40 @@ def detect_profile_from_dtc(dtc_code: int) -> Optional[str]:
 
     _LOGGER.warning(f"✗ DTC Detection - Unknown DTC code: {dtc_code} (not in supported models)")
     return None
+
+
+def convert_to_legacy_profile(profile_key: str) -> str:
+    """
+    Convert V2.01 profile key to legacy equivalent when inverter doesn't support V2.01.
+
+    This is needed for inverters that have DTC codes in register 30000 but return
+    protocol version 0 from register 30099, indicating legacy protocol support only.
+
+    Args:
+        profile_key: V2.01 profile key (e.g., 'sph_3000_6000_v201')
+
+    Returns:
+        Legacy profile key (e.g., 'sph_3000_6000') or original if no conversion needed
+    """
+    # Mapping from V2.01 profiles to legacy equivalents
+    v201_to_legacy = {
+        'sph_3000_6000_v201': 'sph_3000_6000',
+        'sph_7000_10000_v201': 'sph_7000_10000',
+        'sph_tl3_3000_10000_v201': 'sph_tl3_3000_10000',
+        'min_3000_6000_tl_x_v201': 'min_3000_6000_tl_x',
+        'min_7000_10000_tl_x_v201': 'min_7000_10000_tl_x',
+        'tl_xh_3000_10000_v201': 'tl_xh_3000_10000',
+        'mic_600_3300tl_x_v201': 'mic_600_3300tl_x',
+        'mod_6000_15000tl3_xh_v201': 'mod_6000_15000tl3_xh',
+        'mid_15000_25000tl3_x_v201': 'mid_15000_25000tl3_x',
+    }
+
+    legacy_key = v201_to_legacy.get(profile_key, profile_key)
+
+    if legacy_key != profile_key:
+        _LOGGER.info(f"Converting V2.01 profile '{profile_key}' to legacy '{legacy_key}' (protocol version 0)")
+
+    return legacy_key
 
 
 async def async_detect_inverter_series(
@@ -425,8 +569,59 @@ async def async_detect_inverter_series(
         if not await hass.async_add_executor_job(client.connect):
             _LOGGER.error("Failed to connect to inverter for detection")
             return None
-        
-        # CHECK MIN SERIES FIRST (uses 3000 range)
+
+        # CHECK MIC SERIES FIRST (uses 0-179 range, legacy V3.05 protocol)
+        # MIC micro inverters use compact register range and should be detected before MIN
+        # Test for PV1 voltage at register 3 (0-179 range indicator)
+        mic_test = await hass.async_add_executor_job(
+            client.read_input_registers, 3, 1
+        )
+        if mic_test is not None and len(mic_test) > 0:
+            # Verify this is MIC not MIN by checking that 3000 range is NOT available
+            # MIN uses 3000+, MIC uses 0-179
+            min_range_test = await hass.async_add_executor_job(
+                client.read_input_registers, 3003, 1
+            )
+            if min_range_test is None:
+                # Has 0-179 range but NOT 3000 range.
+                # Guard: MIC micro inverters have PV voltage < ~80V (raw < 800).
+                # A raw value > 800 at reg 3 indicates a legacy string inverter
+                # (e.g. MID DM1.0 firmware with 3-string, ~600V PV) that happens
+                # to lack the 3000+ range — not a MIC micro inverter.
+                if mic_test[0] > 800:
+                    _LOGGER.info(
+                        f"PV voltage {mic_test[0] * 0.1:.1f}V at reg 3 too high for MIC "
+                        f"(raw={mic_test[0]}, threshold=800) — likely legacy string inverter. "
+                        f"Defaulting to min_7000_10000_tl_x as closest approximation."
+                    )
+                    await hass.async_add_executor_job(client.disconnect)
+                    return 'min_7000_10000_tl_x'
+                _LOGGER.debug("Detected 0-179 range without 3000 range - MIC micro inverter")
+                await hass.async_add_executor_job(client.disconnect)
+                return 'mic_600_3300tl_x'
+
+        # CHECK SPA SERIES (pure AC-coupled storage, no PV inputs) — BEFORE MIN
+        # SPA responds to ALL register ranges with zeros (not exceptions), which fools the MIN
+        # detection. The distinguishing test is battery voltage at reg 1013 (always populated
+        # on SPA, ~530 raw = 53V) combined with no AC voltage at reg 38 (SPA never populates
+        # the 0-124 base range). SPH-TL3 always has reg 38 > 0 (grid voltage, even at night).
+        # SPH 3-6kW has battery at reg 13, not 1013, so reg 1013 = 0 on SPH 3-6kW.
+        spa_battery_test = await hass.async_add_executor_job(
+            client.read_input_registers, 1013, 1
+        )
+        if spa_battery_test is not None and len(spa_battery_test) > 0 and spa_battery_test[0] > 100:
+            base_ac_test = await hass.async_add_executor_job(
+                client.read_input_registers, 38, 1
+            )
+            if base_ac_test is None or len(base_ac_test) == 0 or base_ac_test[0] == 0:
+                _LOGGER.info(
+                    f"Detected SPA series: battery voltage at reg 1013 = {spa_battery_test[0] * 0.1:.1f}V "
+                    f"(raw={spa_battery_test[0]}), no AC voltage in base range (reg 38 = 0)"
+                )
+                await hass.async_add_executor_job(client.disconnect)
+                return 'spa_3000_6000_tl_bl'
+
+        # CHECK MIN SERIES (uses 3000 range)
         # Test for PV1 at register 3003 to confirm MIN series
         min_test = await hass.async_add_executor_job(
             client.read_input_registers, 3003, 1
@@ -498,8 +693,28 @@ async def async_detect_inverter_series(
                     return 'mod_6000_15000tl3_xh'
             else:
                 _LOGGER.debug("Detected single-phase hybrid - SPH or TL-XH series")
-                await hass.async_add_executor_job(client.disconnect)
-                return 'sph_7000_10000'  # Default to SPH 7-10k
+
+                # Check for storage range 1000+ (SPH HU models)
+                storage_test = await hass.async_add_executor_job(
+                    client.read_input_registers, 1086, 1  # BMS SOC at 1086
+                )
+                if storage_test is not None:
+                    _LOGGER.debug("Detected storage range with BMS - SPH/SPM 8000-10000TL-HU")
+                    await hass.async_add_executor_job(client.disconnect)
+                    return 'sph_8000_10000_hu'
+
+                # Check for PV3 (7-10kW has 3 strings, 3-6kW has 2 strings)
+                pv3_test = await hass.async_add_executor_job(
+                    client.read_input_registers, 11, 1  # PV3 voltage
+                )
+                if pv3_test is not None and len(pv3_test) > 0 and pv3_test[0] > 0:
+                    _LOGGER.debug("Detected PV3 string - SPH 7-10kW")
+                    await hass.async_add_executor_job(client.disconnect)
+                    return 'sph_7000_10000'
+                else:
+                    _LOGGER.debug("No PV3 string - SPH 3-6kW")
+                    await hass.async_add_executor_job(client.disconnect)
+                    return 'sph_3000_6000'
         
         # Test for 3-phase at register 38 (MID/MAX/MOD-X grid-tied)
         result = await hass.async_add_executor_job(
@@ -550,6 +765,7 @@ async def async_refine_dtc_detection(
     Refine DTC detection for models that share the same DTC code.
 
     Uses additional V2.01 register checks to differentiate (with legacy fallback):
+    - SPH-TL3 4-10kW (DTC 3601): Check protocol version (30099); downgrade to base if 0
     - SPH 3-6kW vs 7-10kW (DTC 3502): Check PV3 presence (31018 or 11)
     - MOD vs MID (DTC 5400): Check battery SOC (31217) or voltage (3169)
     - MIC vs MIN (DTC 5200): Check MIN range (31010 or 3003)
@@ -568,9 +784,42 @@ async def async_refine_dtc_detection(
         Refined profile key
     """
     try:
-        # DTC 3502: SPH 3-6kW vs 7-10kW - Check for PV3 (3PV = 7-10kW, 2PV = 3-6kW)
+        # DTC 3601: SPH-TL3 4-10kW — validate V2.01 protocol support via register 30099.
+        # Some units report DTC 3601 but protocol version 0 (legacy register layout, no V2.01).
+        # Reading 30099 here gives an early, data-validated downgrade before the protocol version
+        # step in async_determine_inverter_type(), protecting against timing blips where 30099
+        # transiently returns 201 at inverter startup then settles to 0.
+        if dtc_code == 3601:
+            try:
+                result = await hass.async_add_executor_job(
+                    client.read_holding_registers, 30099, 1
+                )
+                if result is not None and len(result) > 0 and result[0] == 0:
+                    _LOGGER.info(
+                        "DTC 3601 refinement: register 30099 = 0 (legacy protocol) "
+                        "→ using base sph_tl3_3000_10000 instead of V201"
+                    )
+                    return 'sph_tl3_3000_10000'
+                # Non-zero (e.g. 201): V2.01 confirmed, fall through to return initial_profile_key
+            except Exception as e:
+                _LOGGER.debug("DTC 3601 refinement: could not read register 30099: %s", e)
+                # Don't downgrade on read error — let protocol version step in
+                # async_determine_inverter_type() decide
+            return initial_profile_key
+
+        # DTC 3502: SPH 3-6kW vs 7-10kW vs 8-10kW HU
+        # Priority: Storage Range (HU) > PV3 (7-10kW) > No PV3 (3-6kW)
         if dtc_code == 3502:
-            # Check V2.01 PV3 voltage register first (31018)
+            # Check for storage range 1000-1124 (SPH/SPM 8000-10000TL-HU exclusive)
+            # HU models have extended storage range with BMS registers at 1082+
+            result = await hass.async_add_executor_job(
+                client.read_input_registers, 1086, 1  # BMS SOC register (HU-specific)
+            )
+            if result is not None:
+                _LOGGER.info("Detected storage range 1000+ with BMS registers - SPH/SPM 8000-10000TL-HU")
+                return 'sph_8000_10000_hu'
+
+            # Check V2.01 PV3 voltage register (31018)
             result = await hass.async_add_executor_job(
                 client.read_input_registers, 31018, 1  # V2.01 PV3 voltage
             )
@@ -578,7 +827,7 @@ async def async_refine_dtc_detection(
                 _LOGGER.info("Detected PV3 in V2.01 range (3PV) - SPH 7-10kW")
                 return 'sph_7000_10000_v201'
 
-            # Fallback to legacy register 11 (base range)
+            # Fallback to legacy register 11 (base range PV3 voltage)
             result = await hass.async_add_executor_job(
                 client.read_input_registers, 11, 1  # Legacy PV3 voltage
             )
@@ -644,26 +893,80 @@ async def async_refine_dtc_detection(
                 _LOGGER.info("No 3000+ range detected - Standard TL-XH with 0-124 range")
                 return 'tl_xh_3000_10000_v201'
 
-        # DTC 5200: MIC vs MIN - Check register range (MIC uses 0-179, MIN uses 3000+)
+        # DTC 5200: MIC vs MIN - Use per-MPPT energy registers to differentiate
+        # Hardware difference: MIC has per-MPPT energy tracking (registers 59-62), MIN doesn't
+        # Some MIC models use MIN register layout (0-124 + 3000-3124) but retain MIC features
         elif dtc_code == 5200:
-            # Try V2.01 MIN range first (31010 - PV1 voltage in V2.01)
-            result = await hass.async_add_executor_job(
-                client.read_input_registers, 31010, 1  # V2.01 MIN PV1 voltage
-            )
-            if result is not None:
-                _LOGGER.info("Detected V2.01 31000+ range - MIN series")
-                return 'min_3000_6000_tl_x_v201'
+            _LOGGER.info("DTC 5200 detected - Testing registers 59-62 for MIC per-MPPT energy tracking")
 
-            # Fallback to legacy MIN's 3000 range
+            # Test MIC-specific per-MPPT energy registers (59-62)
+            # MIC hardware: registers contain plausible energy values (high word typically 0-100)
+            # MIN hardware: registers may return garbage/system values (e.g., DTC code 5200)
+            mic_registers_found = False
+
+            # Check register 59-60 (PV1 energy today)
             result = await hass.async_add_executor_job(
-                client.read_input_registers, 3003, 1  # Legacy MIN PV1 voltage
+                client.read_input_registers, 59, 2  # PV1 energy today (high/low)
+            )
+            if result is not None and len(result) == 2:
+                high_word = result[0]
+                low_word = result[1]
+                # Valid energy data: high word should be small (0-100 for reasonable energy values)
+                # MIN inverters return garbage (e.g., 5200 = DTC code) - reject these
+                if 0 < high_word < 100 or (high_word == 0 and low_word > 0):
+                    mic_registers_found = True
+                    _LOGGER.info(f"Register 59-60 (PV1 energy) = {high_word}/{low_word} - Valid MIC per-MPPT energy data detected")
+                elif high_word >= 100:
+                    _LOGGER.info(f"Register 59-60 = {high_word}/{low_word} - Invalid (garbage/system data, not energy)")
+
+            # Also check register 61-62 (PV2 energy today) for confirmation
+            if not mic_registers_found:
+                result = await hass.async_add_executor_job(
+                    client.read_input_registers, 61, 2  # PV2 energy today (high/low)
+                )
+                if result is not None and len(result) == 2:
+                    high_word = result[0]
+                    low_word = result[1]
+                    # Same validation: high word should be small for plausible energy
+                    if 0 < high_word < 100 or (high_word == 0 and low_word > 0):
+                        mic_registers_found = True
+                        _LOGGER.info(f"Register 61-62 (PV2 energy) = {high_word}/{low_word} - Valid MIC per-MPPT energy data detected")
+                    elif high_word >= 100:
+                        _LOGGER.info(f"Register 61-62 = {high_word}/{low_word} - Invalid (garbage/system data, not energy)")
+
+            # If MIC per-MPPT registers found, this is a MIC inverter
+            if mic_registers_found:
+                # Check if it uses MIN register layout (3000+ range)
+                result = await hass.async_add_executor_job(
+                    client.read_input_registers, 3003, 1  # MIN PV1 voltage
+                )
+                if result is not None:
+                    _LOGGER.info("MIC hardware detected with MIN register layout (hybrid) - MIC 2500-6000TL-X MIN range variant")
+                    return 'mic_2500_6000tl_x_min_range'
+                else:
+                    _LOGGER.info("MIC hardware detected with standard 0-179 layout - MIC 600-3300TL-X")
+                    return 'mic_600_3300tl_x_v201'
+
+            # No MIC per-MPPT registers - this is a MIN inverter
+            # Verify by checking 3000+ range (MIN register layout)
+            result = await hass.async_add_executor_job(
+                client.read_input_registers, 3003, 1  # MIN PV1 voltage
             )
             if result is not None:
-                _LOGGER.info("Detected legacy 3000+ range - MIN series")
+                _LOGGER.info("No MIC per-MPPT registers, 3000+ range present - MIN 3000-6000TL-X series")
                 return 'min_3000_6000_tl_x_v201'
             else:
-                _LOGGER.info("No 3000+ range - MIC series")
-                return 'mic_600_3300tl_x_v201'
+                # Fallback: Try V2.01 MIN range (31010)
+                result = await hass.async_add_executor_job(
+                    client.read_input_registers, 31010, 1  # V2.01 MIN PV1 voltage
+                )
+                if result is not None:
+                    _LOGGER.info("No MIC per-MPPT registers, V2.01 31000+ range present - MIN series")
+                    return 'min_3000_6000_tl_x_v201'
+                else:
+                    # Shouldn't reach here with DTC 5200, but default to MIN
+                    _LOGGER.warning("DTC 5200 but no clear register pattern - defaulting to MIN")
+                    return 'min_3000_6000_tl_x_v201'
 
     except Exception as e:
         _LOGGER.debug(f"Error during DTC refinement: {e}")
@@ -684,12 +987,18 @@ async def async_determine_inverter_type(
     1. Try OffGrid DTC (register 34/43) FIRST - prevents SPF power resets
     2. Try VPP DTC (register 30000) if OffGrid fails - standard method
     3. For ambiguous DTCs (shared codes), refine with additional register checks
-    4. Read model name from holding registers and match
-    5. If no match, detect series by probing registers
-    6. Return the appropriate profile
+    4. Verify protocol version (register 30099) - convert to legacy if version is 0
+    5. Read model name from holding registers and match
+    6. If no match, detect series by probing registers
+    7. Return the appropriate profile
 
     CRITICAL: OffGrid inverters (SPF) will RESET if VPP registers (30000+, 31000+)
     are accessed! We detect OffGrid models first to prevent this.
+
+    Protocol Version Check:
+    - Register 30099 = 201: Full V2.01 support, use V2.01 profiles
+    - Register 30099 = 0 or not readable: Legacy protocol only, use legacy profiles
+    - This handles inverters with DTC codes but legacy firmware (e.g., SPH 3-6kW pre-UP)
 
     Args:
         hass: HomeAssistant instance
@@ -726,8 +1035,32 @@ async def async_determine_inverter_type(
                 _LOGGER.info(f"✓ Auto-detected from OffGrid DTC code {dtc_code}: {profile['name']}")
                 return profile_key, profile
 
-    # Step 2: Try VPP 2.01 DTC (register 30000) if OffGrid detection failed
-    # Safe now because SPF would have been detected in Step 1
+    # Step 1.5: Quick check for legacy protocol before attempting VPP registers
+    # This prevents long timeouts on MIC and other legacy inverters that don't support VPP
+    # Try reading PV1 voltage at register 3 (exists in most legacy inverters)
+    try:
+        legacy_test = await hass.async_add_executor_job(
+            client.read_input_registers, 3, 1
+        )
+        if legacy_test is not None and len(legacy_test) > 0:
+            # Legacy registers responding - check if this is MIC (0-179 range without 3000 range)
+            min_range_test = await hass.async_add_executor_job(
+                client.read_input_registers, 3003, 1
+            )
+            if min_range_test is None:
+                # Has 0-179 range but NOT 3000 range = MIC series
+                # Skip VPP detection to avoid timeout
+                _LOGGER.info("✓ Legacy register detection - MIC micro inverter detected (0-179 range only)")
+                _LOGGER.info("⚠ Skipping VPP register probing to avoid timeout on legacy MIC protocol")
+                profile_key = 'mic_600_3300tl_x'
+                profile = get_profile(profile_key)
+                if profile:
+                    return profile_key, profile
+    except Exception as e:
+        _LOGGER.debug(f"Legacy register quick check failed: {e}")
+
+    # Step 2: Try VPP 2.01 DTC (register 30000) if OffGrid and legacy detection failed
+    # Safe now because SPF would have been detected in Step 1, and MIC in Step 1.5
     dtc_code = await async_read_dtc_code(hass, client, device_id)
 
     if dtc_code:
@@ -736,6 +1069,17 @@ async def async_determine_inverter_type(
         if profile_key:
             # Step 2.5: Refine DTC detection for ambiguous codes
             profile_key = await async_refine_dtc_detection(hass, client, dtc_code, profile_key, device_id)
+
+            # Step 2.6: Verify protocol version support
+            # Some inverters have DTC codes but don't support full V2.01 protocol
+            # Check register 30099: 201 = V2.01, 0 = Legacy protocol
+            protocol_version = await async_read_protocol_version(hass, client, device_id)
+
+            if protocol_version == 0 or protocol_version is None:
+                # Protocol version 0 or not readable = Legacy protocol only
+                # Convert V2.01 profile to legacy equivalent
+                profile_key = convert_to_legacy_profile(profile_key)
+                _LOGGER.info(f"✓ Using legacy profile due to protocol version 0 or not readable")
 
             profile = get_profile(profile_key)
             if profile:

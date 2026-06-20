@@ -1,0 +1,124 @@
+<svg viewBox="0 0 860 400" xmlns="http://www.w3.org/2000/svg" font-family="'Segoe UI', Arial, sans-serif" font-size="12">
+  <defs>
+    <style>
+      .head  { font-size:14px; font-weight:bold; fill:#1a1a1a; }
+      .grp   { font-size:12px; font-weight:bold; fill:#fff; }
+      .lbl   { font-size:11px; fill:#333; }
+      .reg   { font-size:10px; fill:#555; }
+      .note  { font-size:10px; fill:#777; font-style:italic; }
+      .exist { fill:#c8e6c9; stroke:#388e3c; stroke-width:1.5; }
+      .new   { fill:#bbdefb; stroke:#1976d2; stroke-width:1.5; }
+      .ctrl  { fill:#f3e5f5; stroke:#7b1fa2; stroke-width:1.5; }
+    </style>
+  </defs>
+
+  <text x="430" y="24" text-anchor="middle" class="head">SPH GEN3 Time Period Register Layout</text>
+
+  <!-- Legend -->
+  <rect x="30"  y="38" width="12" height="12" rx="2" class="exist"/>
+  <text x="48"  y="49" class="lbl">Existing (3 periods — v0.6.7)</text>
+  <rect x="240" y="38" width="12" height="12" rx="2" class="new"/>
+  <text x="258" y="49" class="lbl">New in v0.6.8 (6 extra periods)</text>
+  <rect x="470" y="38" width="12" height="12" rx="2" class="ctrl"/>
+  <text x="488" y="49" class="lbl">Priority mode (global — register 1044)</text>
+
+  <!-- ── Row A: Priority mode ── -->
+  <rect x="30" y="65" width="160" height="44" rx="5" class="ctrl"/>
+  <text x="110" y="83" text-anchor="middle" class="lbl" font-weight="bold">1044 — Priority Mode</text>
+  <text x="110" y="97" text-anchor="middle" class="reg">Load First / Battery First / Grid First</text>
+  <text x="204" y="90" class="lbl" fill="#555"> — sets inverter default; time periods override per-slot</text>
+
+  <!-- ── Row B: AC Charge periods 1-3 (existing) ── -->
+  <text x="30" y="132" class="lbl" font-weight="bold" fill="#2e7d32">AC Charge Time Periods 1–3  (registers 1100–1108)</text>
+
+  <!-- Period 1 -->
+  <rect x="30"  y="142" width="76" height="40" rx="4" class="exist"/>
+  <text x="68"  y="158" text-anchor="middle" class="lbl" font-weight="bold">1100</text>
+  <text x="68"  y="172" text-anchor="middle" class="reg">P1 Start</text>
+
+  <rect x="114" y="142" width="76" height="40" rx="4" class="exist"/>
+  <text x="152" y="158" text-anchor="middle" class="lbl" font-weight="bold">1101</text>
+  <text x="152" y="172" text-anchor="middle" class="reg">P1 End</text>
+
+  <rect x="198" y="142" width="76" height="40" rx="4" class="exist"/>
+  <text x="236" y="158" text-anchor="middle" class="lbl" font-weight="bold">1102</text>
+  <text x="236" y="172" text-anchor="middle" class="reg">P1 Enable</text>
+
+  <!-- Period 2 -->
+  <rect x="302" y="142" width="76" height="40" rx="4" class="exist"/>
+  <text x="340" y="158" text-anchor="middle" class="lbl" font-weight="bold">1103–1104</text>
+  <text x="340" y="172" text-anchor="middle" class="reg">P2 Start/End</text>
+
+  <rect x="386" y="142" width="76" height="40" rx="4" class="exist"/>
+  <text x="424" y="158" text-anchor="middle" class="lbl" font-weight="bold">1105</text>
+  <text x="424" y="172" text-anchor="middle" class="reg">P2 Enable</text>
+
+  <!-- Period 3 -->
+  <rect x="490" y="142" width="76" height="40" rx="4" class="exist"/>
+  <text x="528" y="158" text-anchor="middle" class="lbl" font-weight="bold">1106–1107</text>
+  <text x="528" y="172" text-anchor="middle" class="reg">P3 Start/End</text>
+
+  <rect x="574" y="142" width="76" height="40" rx="4" class="exist"/>
+  <text x="612" y="158" text-anchor="middle" class="lbl" font-weight="bold">1108</text>
+  <text x="612" y="172" text-anchor="middle" class="reg">P3 Enable</text>
+
+  <!-- ── Row C: Battery First ext 4-6 (new) ── -->
+  <text x="30" y="210" class="lbl" font-weight="bold" fill="#1565c0">Battery First Extended Slots 4–6  (registers 1017–1025)  — NEW</text>
+
+  <rect x="30"  y="220" width="76" height="40" rx="4" class="new"/>
+  <text x="68"  y="236" text-anchor="middle" class="lbl" font-weight="bold">1017–1018</text>
+  <text x="68"  y="250" text-anchor="middle" class="reg">BF P4 S/E</text>
+
+  <rect x="114" y="220" width="76" height="40" rx="4" class="new"/>
+  <text x="152" y="236" text-anchor="middle" class="lbl" font-weight="bold">1019</text>
+  <text x="152" y="250" text-anchor="middle" class="reg">BF P4 Enable</text>
+
+  <rect x="218" y="220" width="76" height="40" rx="4" class="new"/>
+  <text x="256" y="236" text-anchor="middle" class="lbl" font-weight="bold">1020–1021</text>
+  <text x="256" y="250" text-anchor="middle" class="reg">BF P5 S/E</text>
+
+  <rect x="302" y="220" width="76" height="40" rx="4" class="new"/>
+  <text x="340" y="236" text-anchor="middle" class="lbl" font-weight="bold">1022</text>
+  <text x="340" y="250" text-anchor="middle" class="reg">BF P5 Enable</text>
+
+  <rect x="406" y="220" width="76" height="40" rx="4" class="new"/>
+  <text x="444" y="236" text-anchor="middle" class="lbl" font-weight="bold">1023–1024</text>
+  <text x="444" y="250" text-anchor="middle" class="reg">BF P6 S/E</text>
+
+  <rect x="490" y="220" width="76" height="40" rx="4" class="new"/>
+  <text x="528" y="236" text-anchor="middle" class="lbl" font-weight="bold">1025</text>
+  <text x="528" y="250" text-anchor="middle" class="reg">BF P6 Enable</text>
+
+  <!-- ── Row D: Grid First ext 4-6 (new) ── -->
+  <text x="30" y="288" class="lbl" font-weight="bold" fill="#1565c0">Grid First Extended Slots 4–6  (registers 1026–1034)  — NEW</text>
+
+  <rect x="30"  y="298" width="76" height="40" rx="4" class="new"/>
+  <text x="68"  y="314" text-anchor="middle" class="lbl" font-weight="bold">1026–1027</text>
+  <text x="68"  y="328" text-anchor="middle" class="reg">GF P4 S/E</text>
+
+  <rect x="114" y="298" width="76" height="40" rx="4" class="new"/>
+  <text x="152" y="314" text-anchor="middle" class="lbl" font-weight="bold">1028</text>
+  <text x="152" y="328" text-anchor="middle" class="reg">GF P4 Enable</text>
+
+  <rect x="218" y="298" width="76" height="40" rx="4" class="new"/>
+  <text x="256" y="314" text-anchor="middle" class="lbl" font-weight="bold">1029–1030</text>
+  <text x="256" y="328" text-anchor="middle" class="reg">GF P5 S/E</text>
+
+  <rect x="302" y="298" width="76" height="40" rx="4" class="new"/>
+  <text x="340" y="314" text-anchor="middle" class="lbl" font-weight="bold">1031</text>
+  <text x="340" y="328" text-anchor="middle" class="reg">GF P5 Enable</text>
+
+  <rect x="406" y="298" width="76" height="40" rx="4" class="new"/>
+  <text x="444" y="314" text-anchor="middle" class="lbl" font-weight="bold">1032–1033</text>
+  <text x="444" y="328" text-anchor="middle" class="reg">GF P6 S/E</text>
+
+  <rect x="490" y="298" width="76" height="40" rx="4" class="new"/>
+  <text x="528" y="314" text-anchor="middle" class="lbl" font-weight="bold">1034</text>
+  <text x="528" y="328" text-anchor="middle" class="reg">GF P6 Enable</text>
+
+  <!-- Grid First ext 7-9 note -->
+  <text x="30" y="358" class="lbl" font-weight="bold" fill="#1565c0">Grid First Extended Slots 7–9  (registers 1080–1088)  — NEW</text>
+  <text x="30" y="372" class="reg">1080–1081 (P7 S/E) · 1082 (P7 Enable) · 1083–1084 (P8 S/E) · 1085 (P8 Enable) · 1086–1087 (P9 S/E) · 1088 (P9 Enable)</text>
+
+  <text x="30" y="395" class="note">S/E = Start / End (hex-packed: hour × 256 + minute, e.g. 06:30 → 0x0630 = 1584) · BF = Battery First · GF = Grid First</text>
+</svg>

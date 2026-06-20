@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 960 560" xmlns="http://www.w3.org/2000/svg"
+     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 Z" fill="#94A3B8"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="960" height="560" fill="#F8FAFC" rx="10"/>
+
+  <!-- Title -->
+  <text x="480" y="28" text-anchor="middle" font-size="13" font-weight="700" fill="#1E293B">Troubleshooting Guide</text>
+  <line x1="20" y1="36" x2="940" y2="36" stroke="#E2E8F0" stroke-width="1"/>
+
+  <!-- START -->
+  <rect x="340" y="46" width="280" height="30" rx="15" fill="#1E293B"/>
+  <text x="480" y="66" text-anchor="middle" font-size="11" font-weight="700" fill="#FFFFFF">Something is not working</text>
+  <line x1="480" y1="76" x2="480" y2="96" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- ════  MAIN DECISION  ════ -->
+  <rect x="310" y="98" width="340" height="44" rx="7" fill="#F1F5F9" stroke="#475569" stroke-width="1.5"/>
+  <text x="480" y="115" text-anchor="middle" font-size="11" font-weight="600" fill="#334155">What is the symptom?</text>
+  <text x="480" y="131" text-anchor="middle" font-size="9" fill="#64748B">Choose the category that best describes the problem</text>
+
+  <!-- Six branches radiating from the decision box -->
+
+  <!-- Branch 1: Sensor wrong value → down-left far -->
+  <line x1="330" y1="120" x2="160" y2="180" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="220" y="152" text-anchor="middle" font-size="9" fill="#64748B">Wrong value</text>
+
+  <!-- Branch 2: Sensor unavailable → down-left near -->
+  <line x1="370" y1="142" x2="320" y2="180" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="330" y="168" text-anchor="middle" font-size="9" fill="#64748B">Unavailable</text>
+
+  <!-- Branch 3: Battery zeros → straight down -->
+  <line x1="480" y1="142" x2="480" y2="180" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="504" y="168" text-anchor="start" font-size="9" fill="#64748B">Battery = 0</text>
+
+  <!-- Branch 4: Grid backwards → down-right near -->
+  <line x1="590" y1="142" x2="640" y2="180" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="630" y="168" text-anchor="middle" font-size="9" fill="#64748B">Grid backwards</text>
+
+  <!-- Branch 5: Wrong model → down-right far -->
+  <line x1="630" y1="120" x2="800" y2="180" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="748" y="156" text-anchor="middle" font-size="9" fill="#64748B">Wrong model</text>
+
+  <!-- ════  COLUMN 1: Wrong value  ════ -->
+  <rect x="50" y="182" width="200" height="44" rx="7" fill="#FEF3C7" stroke="#F59E0B" stroke-width="1.5"/>
+  <text x="150" y="199" text-anchor="middle" font-size="10" font-weight="600" fill="#92400E">Working before?</text>
+  <text x="150" y="215" text-anchor="middle" font-size="9" fill="#78350F">Did it used to show correct values?</text>
+
+  <line x1="150" y1="226" x2="150" y2="248" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="170" y="243" text-anchor="start" font-size="9" fill="#64748B">Yes</text>
+
+  <rect x="50" y="250" width="200" height="44" rx="7" fill="#FEF3C7" stroke="#F59E0B" stroke-width="1.5"/>
+  <text x="150" y="267" text-anchor="middle" font-size="10" font-weight="600" fill="#92400E">Reverts after change?</text>
+  <text x="150" y="283" text-anchor="middle" font-size="9" fill="#78350F">Value returns to old figure</text>
+
+  <!-- Reverts → cloud fix -->
+  <line x1="150" y1="294" x2="150" y2="316" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="170" y="311" text-anchor="start" font-size="9" fill="#64748B">Yes — reverts</text>
+
+  <rect x="30" y="318" width="240" height="50" rx="7" fill="#FEE2E2" stroke="#EF4444" stroke-width="1.5"/>
+  <text x="150" y="335" text-anchor="middle" font-size="10" font-weight="700" fill="#991B1B">ShineWiFi overwrite</text>
+  <text x="150" y="349" text-anchor="middle" font-size="9" fill="#7F1D1D">Disconnect ShineWiFi dongle</text>
+  <text x="150" y="361" text-anchor="middle" font-size="9" fill="#7F1D1D">or disable cloud control</text>
+
+  <!-- No, never worked → scanner -->
+  <line x1="50" y1="204" x2="20" y2="204" stroke="#94A3B8" stroke-width="1.5"/>
+  <line x1="20" y1="204" x2="20" y2="440" stroke="#94A3B8" stroke-width="1.5"/>
+  <line x1="20" y1="440" x2="340" y2="440" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="14" y="330" font-size="9" fill="#64748B" text-anchor="middle" transform="rotate(-90,14,330)">Never worked</text>
+
+  <!-- ════  COLUMN 2: Unavailable  ════ -->
+  <rect x="278" y="182" width="200" height="44" rx="7" fill="#EFF6FF" stroke="#3B82F6" stroke-width="1.5"/>
+  <text x="378" y="199" text-anchor="middle" font-size="10" font-weight="600" fill="#1D4ED8">Inverter online?</text>
+  <text x="378" y="215" text-anchor="middle" font-size="9" fill="#1E40AF">Is it currently producing power?</text>
+
+  <!-- Night → expected -->
+  <line x1="278" y1="204" x2="240" y2="250" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="244" y="234" text-anchor="middle" font-size="9" fill="#64748B">Night-time</text>
+
+  <rect x="196" y="252" width="178" height="50" rx="7" fill="#DCFCE7" stroke="#16A34A" stroke-width="1.5"/>
+  <text x="285" y="269" text-anchor="middle" font-size="10" font-weight="700" fill="#15803D">Expected behaviour</text>
+  <text x="285" y="283" text-anchor="middle" font-size="9" fill="#166534">Sensors hold last values.</text>
+  <text x="285" y="295" text-anchor="middle" font-size="9" fill="#166534">Resume at sunrise.</text>
+
+  <!-- Online but unavailable → connection check -->
+  <line x1="478" y1="204" x2="516" y2="250" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="518" y="234" text-anchor="start" font-size="9" fill="#64748B">Online</text>
+
+  <rect x="470" y="252" width="178" height="50" rx="7" fill="#FEE2E2" stroke="#EF4444" stroke-width="1.5"/>
+  <text x="559" y="269" text-anchor="middle" font-size="10" font-weight="700" fill="#991B1B">Check connection</text>
+  <text x="559" y="283" text-anchor="middle" font-size="9" fill="#7F1D1D">Wiring A/B · IP &amp; port 502</text>
+  <text x="559" y="295" text-anchor="middle" font-size="9" fill="#7F1D1D">Slave ID = 1</text>
+
+  <!-- ════  COLUMN 3: Battery zeros  ════ -->
+  <rect x="396" y="182" width="200" height="44" rx="7" fill="#EFF6FF" stroke="#3B82F6" stroke-width="1.5"/>
+  <text x="496" y="199" text-anchor="middle" font-size="10" font-weight="600" fill="#1D4ED8">Hybrid profile set?</text>
+  <text x="496" y="215" text-anchor="middle" font-size="9" fill="#1E40AF">SPH · MIN TL-XH · MOD · WIT</text>
+
+  <!-- No → switch profile -->
+  <line x1="396" y1="204" x2="360" y2="250" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="356" y="234" text-anchor="middle" font-size="9" fill="#64748B">No</text>
+
+  <rect x="298" y="252" width="130" height="50" rx="7" fill="#FEE2E2" stroke="#EF4444" stroke-width="1.5"/>
+  <text x="363" y="269" text-anchor="middle" font-size="10" font-weight="700" fill="#991B1B">Switch profile</text>
+  <text x="363" y="283" text-anchor="middle" font-size="9" fill="#7F1D1D">Re-add with hybrid</text>
+  <text x="363" y="295" text-anchor="middle" font-size="9" fill="#7F1D1D">profile selected</text>
+
+  <!-- Yes → scanner -->
+  <line x1="596" y1="204" x2="620" y2="250" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="622" y="234" text-anchor="start" font-size="9" fill="#64748B">Yes</text>
+  <!-- Arrow from battery-yes down to scanner (use the scanner arrow at bottom) -->
+  <line x1="630" y1="300" x2="630" y2="440" stroke="#94A3B8" stroke-width="1.5"/>
+  <line x1="630" y1="440" x2="650" y2="440" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- placeholder box for "run scanner" -->
+  <rect x="585" y="252" width="120" height="46" rx="7" fill="#F3E8FF" stroke="#8B5CF6" stroke-width="1.5"/>
+  <text x="645" y="269" text-anchor="middle" font-size="9" font-weight="600" fill="#5B21B6">Run Universal</text>
+  <text x="645" y="282" text-anchor="middle" font-size="9" fill="#4C1D95">Register Scanner</text>
+  <text x="645" y="295" text-anchor="middle" font-size="8" fill="#7C3AED" font-style="italic">see below</text>
+
+  <!-- ════  COLUMN 4: Grid backwards  ════ -->
+  <rect x="594" y="182" width="200" height="44" rx="7" fill="#EFF6FF" stroke="#3B82F6" stroke-width="1.5"/>
+  <text x="694" y="199" text-anchor="middle" font-size="10" font-weight="600" fill="#1D4ED8">Grid values swapped</text>
+  <text x="694" y="215" text-anchor="middle" font-size="9" fill="#1E40AF">Import/export arrows wrong direction</text>
+
+  <line x1="694" y1="226" x2="694" y2="248" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="584" y="250" width="220" height="66" rx="7" fill="#DCFCE7" stroke="#16A34A" stroke-width="1.5"/>
+  <text x="694" y="267" text-anchor="middle" font-size="10" font-weight="700" fill="#15803D">Run orientation service</text>
+  <text x="694" y="281" text-anchor="middle" font-size="9" fill="#166534">growatt_modbus.detect_grid_orientation</text>
+  <text x="694" y="295" text-anchor="middle" font-size="9" fill="#166534">— or toggle Invert Grid Power</text>
+  <text x="694" y="309" text-anchor="middle" font-size="9" fill="#166534">in integration options</text>
+
+  <!-- ════  COLUMN 5: Wrong model  ════ -->
+  <rect x="726" y="182" width="200" height="44" rx="7" fill="#EFF6FF" stroke="#3B82F6" stroke-width="1.5"/>
+  <text x="826" y="199" text-anchor="middle" font-size="10" font-weight="600" fill="#1D4ED8">Wrong model detected</text>
+  <text x="826" y="215" text-anchor="middle" font-size="9" fill="#1E40AF">Sensors missing or incorrect</text>
+
+  <line x1="826" y1="226" x2="826" y2="248" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="726" y="250" width="200" height="66" rx="7" fill="#DCFCE7" stroke="#16A34A" stroke-width="1.5"/>
+  <text x="826" y="267" text-anchor="middle" font-size="10" font-weight="700" fill="#15803D">Re-add manually</text>
+  <text x="826" y="281" text-anchor="middle" font-size="9" fill="#166534">Settings → Devices &amp; Services</text>
+  <text x="826" y="295" text-anchor="middle" font-size="9" fill="#166534">→ delete → re-add with</text>
+  <text x="826" y="309" text-anchor="middle" font-size="9" fill="#166534">manual model selection</text>
+
+  <!-- ════  SCANNER (bottom) — shared resolution  ════ -->
+  <line x1="340" y1="440" x2="660" y2="440" stroke="#94A3B8" stroke-width="1.5"/>
+  <rect x="300" y="442" width="360" height="50" rx="7" fill="#F3E8FF" stroke="#8B5CF6" stroke-width="2"/>
+  <text x="480" y="459" text-anchor="middle" font-size="11" font-weight="700" fill="#5B21B6">Run Universal Register Scanner</text>
+  <text x="480" y="473" text-anchor="middle" font-size="9" fill="#4C1D95">Developer Tools → Services → "Growatt Modbus: Universal Register Scanner"</text>
+  <text x="480" y="486" text-anchor="middle" font-size="8" fill="#7C3AED" font-style="italic">Confirms which registers your hardware responds to · best first step for any unexplained issue</text>
+
+  <!-- Note bar -->
+  <rect x="20" y="500" width="920" height="50" rx="6" fill="#F1F5F9" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="480" y="517" text-anchor="middle" font-size="9" fill="#475569" font-weight="600">Enable debug logging if problems persist:</text>
+  <text x="480" y="531" text-anchor="middle" font-size="9" fill="#64748B">logger: default: info | logs: custom_components.growatt_modbus: debug</text>
+  <text x="480" y="545" text-anchor="middle" font-size="9" fill="#94A3B8">Open a GitHub issue and attach the scanner CSV output for community help.</text>
+
+</svg>

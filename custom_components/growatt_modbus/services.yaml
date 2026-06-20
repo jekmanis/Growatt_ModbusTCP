@@ -1,33 +1,3 @@
-read_inverter_data:
-  name: Read Inverter Data
-  description: Manually trigger a data read from the Growatt inverter
-  fields:
-    device_id:
-      name: Device
-      description: The Growatt inverter device
-      required: true
-      selector:
-        device:
-          integration: growatt_modbus
-    force_refresh:
-      name: Force Refresh
-      description: Force a fresh read even if within minimum interval
-      default: false
-      selector:
-        boolean:
-
-test_connection:
-  name: Test Connection
-  description: Test the connection to the Growatt inverter
-  fields:
-    device_id:
-      name: Device
-      description: The Growatt inverter device
-      required: true
-      selector:
-        device:
-          integration: growatt_modbus
-
 get_register_data:
   name: Get Register Data
   description: Read specific Modbus registers for debugging
@@ -67,41 +37,47 @@ get_register_data:
           max: 50
           mode: box
 
-update_register_map:
-  name: Update Register Map
-  description: Change the register mapping for the inverter
+export_register_dump:
+  name: Universal Register Scanner
+  description: >
+    Scan ALL register ranges, auto-detect your inverter model, and export a complete register dump
+    to CSV. Select a configured device below to automatically use its connection settings and include
+    current entity values in the scan. Alternatively leave the device blank and enter connection
+    parameters manually (useful for scanning a new inverter before adding it to the integration).
+    File saved to /config/growatt_register_scan_[timestamp].csv
   fields:
-    device_id:
-      name: Device
-      description: The Growatt inverter device
-      required: true
+    config_entry:
+      name: Device (recommended)
+      description: >
+        Select your Growatt inverter from the list. Connection details and current entity values
+        are pulled directly from the integration — no manual IP/serial entry needed.
+        Leave blank to enter connection parameters manually.
+      required: false
       selector:
-        device:
+        config_entry:
           integration: growatt_modbus
-    register_map:
-      name: Register Map
-      description: Select the register mapping to use
-      default: "MIN_10000_VARIANT_A"
+    connection_type:
+      name: Connection Type (manual only)
+      description: Select TCP or Serial. Ignored when a device is selected above.
+      required: false
+      default: "tcp"
       selector:
         select:
           options:
-            - "MIN_SERIES_STANDARD"
-            - "MIN_10000_VARIANT_A"
-
-export_register_dump:
-  name: Universal Register Scanner
-  description: Scan ALL register ranges, auto-detect your inverter model, and export complete register dump to CSV. File saved to /config/growatt_register_scan_[timestamp].csv
-  fields:
+            - label: "TCP (Ethernet)"
+              value: "tcp"
+            - label: "Serial (USB)"
+              value: "serial"
     host:
-      name: IP Address
-      description: IP address of your RS485-TCP adapter
-      required: true
+      name: IP Address (manual TCP only)
+      description: IP address of your RS485-TCP adapter. Ignored when a device is selected above.
+      required: false
       example: "192.168.1.60"
       selector:
         text:
     port:
-      name: Port
-      description: Modbus TCP port (usually 502)
+      name: Port (manual TCP only)
+      description: Modbus TCP port (usually 502). Ignored when a device is selected above.
       required: false
       default: 502
       selector:
@@ -109,9 +85,30 @@ export_register_dump:
           min: 1
           max: 65535
           mode: box
+    device:
+      name: Serial Device (manual Serial only)
+      description: Serial port path for USB adapter (e.g. /dev/ttyUSB0 or COM3). Ignored when a device is selected above.
+      required: false
+      example: "/dev/ttyUSB0 or COM3"
+      selector:
+        text:
+    baudrate:
+      name: Baudrate (manual Serial only)
+      description: Serial communication speed (usually 9600 for Growatt). Ignored when a device is selected above.
+      required: false
+      default: "9600"
+      selector:
+        select:
+          options:
+            - "4800"
+            - "9600"
+            - "19200"
+            - "38400"
+            - "57600"
+            - "115200"
     slave_id:
-      name: Slave ID
-      description: Modbus slave/unit ID (usually 1)
+      name: Slave ID (manual only)
+      description: Modbus slave/unit ID (usually 1). Ignored when a device is selected above.
       required: false
       default: 1
       selector:
@@ -133,13 +130,62 @@ export_register_dump:
       default: false
       selector:
         boolean:
-    device_id:
-      name: Device (Optional - for Entity Values)
-      description: "Optional: Select your Growatt device to include calculated entity values in the CSV. This helps verify that register scaling and calculations are correct by showing both raw register values and the actual entity values displayed in Home Assistant. Leave empty to scan without entity values."
+    scan_legacy:
+      name: Scan Legacy Registers (0-249)
+      description: "Restrict scan to: base and extended legacy registers (all models). Leave all scan options unchecked to scan every range (recommended)."
       required: false
+      default: false
       selector:
-        device:
-          integration: growatt_modbus
+        boolean:
+    scan_storage:
+      name: Scan Storage Registers (1000-1124)
+      description: "Restrict scan to: battery/storage control registers (SPH, SPM, MIN battery models)."
+      required: false
+      default: false
+      selector:
+        boolean:
+    scan_mod_extended:
+      name: Scan MIN/MOD Extended Registers (3000-3249)
+      description: "Restrict scan to: extended data registers used by MIN and MOD series inverters."
+      required: false
+      default: false
+      selector:
+        boolean:
+    scan_wit:
+      name: Scan WIT/WIS Battery Registers (8000-8124)
+      description: "Restrict scan to: battery registers specific to WIT and WIS commercial hybrid inverters."
+      required: false
+      default: false
+      selector:
+        boolean:
+    scan_vpp_control:
+      name: Scan VPP Control Registers (30100-30499)
+      description: "Restrict scan to: VPP system, AC power, and battery control registers (MOD TL3-XH, MID-XH, VPP V2.01 inverters)."
+      required: false
+      default: false
+      selector:
+        boolean:
+    scan_vpp_data:
+      name: Scan VPP Data Registers (31000-31399)
+      description: "Restrict scan to: VPP protocol data registers for status, PV, grid, load, and battery cluster data."
+      required: false
+      default: false
+      selector:
+        boolean:
+    block_size:
+      name: Block Size
+      description: "Number of registers read per Modbus request. 125 is fastest (default). Use 25 or 1 for inverters that reject large block reads (e.g. older RS485 models, TL3-S)."
+      required: false
+      default: 125
+      selector:
+        select:
+          options:
+            - label: "125 registers (default, fastest)"
+              value: "125"
+            - label: "25 registers (for finicky inverters)"
+              value: "25"
+            - label: "1 register (single-register scan, slowest)"
+              value: "1"
 
 write_register:
   name: Write Modbus Register
@@ -184,3 +230,221 @@ detect_grid_orientation:
       selector:
         device:
           integration: growatt_modbus
+
+read_register:
+  name: Read Register
+  description: Read a specific Modbus register with detailed profile-aware output. Shows raw value, scale, paired register calculations, and entity values in a persistent notification.
+  fields:
+    device_id:
+      name: Device
+      description: The Growatt inverter device
+      required: true
+      selector:
+        device:
+          integration: growatt_modbus
+    register:
+      name: Register Address
+      description: Register address to read (e.g., 3 for PV1 voltage, 31201 for battery power)
+      required: true
+      example: 3
+      selector:
+        number:
+          min: 0
+          max: 65535
+          mode: box
+    register_type:
+      name: Register Type
+      description: Type of register to read
+      default: "input"
+      selector:
+        select:
+          options:
+            - label: "Input Register (Read-Only Sensors)"
+              value: "input"
+            - label: "Holding Register (Settings/Control)"
+              value: "holding"
+
+set_battery_mode:
+  name: Set Battery Mode (VPP)
+  description: "Set battery charge/discharge/preserve_soc mode via VPP protocol registers (30xxx). For WIT/WIS inverters only. CHARGE: Forces battery charging from grid+PV. DISCHARGE: Forces battery discharging to load. PRESERVE_SOC: Battery idle, PV charges battery, surplus exports to grid."
+  fields:
+    device_id:
+      name: Device
+      description: The Growatt inverter device (WIT/WIS series)
+      required: true
+      selector:
+        device:
+          integration: growatt_modbus
+    mode:
+      name: Mode
+      description: "Battery operating mode: charge, discharge, or preserve_soc"
+      required: true
+      selector:
+        select:
+          options:
+            - label: "Charge (from grid+PV)"
+              value: "charge"
+            - label: "Discharge (to load)"
+              value: "discharge"
+            - label: "Preserve SOC (battery idle, PV charges)"
+              value: "preserve_soc"
+    power_percent:
+      name: Power Percentage
+      description: Charge/discharge power as percentage of rated power (1-100%)
+      required: false
+      default: 100
+      selector:
+        number:
+          min: 1
+          max: 100
+          unit_of_measurement: "%"
+
+write_registers:
+  name: Write Multiple Modbus Registers
+  description: Write multiple consecutive holding registers using Modbus function 0x10. Required for atomic multi-register writes such as TOU period configuration.
+  fields:
+    device_id:
+      name: Device
+      description: The Growatt inverter device
+      required: true
+      selector:
+        device:
+          integration: growatt_modbus
+    register:
+      name: Start Address
+      description: Starting holding register address
+      required: true
+      example: 30412
+      selector:
+        number:
+          min: 0
+          max: 65535
+          mode: box
+    values:
+      name: Values
+      description: List of values to write to consecutive registers
+      required: true
+      example: "[0, 120, 100]"
+      selector:
+        object:
+
+sync_tou_schedule:
+  name: Sync TOU Schedule
+  description: "Write Time-of-Use schedule to inverter for autonomous operation. The inverter will follow this schedule even if Home Assistant goes offline. Maximum 20 periods. CRITICAL: Periods CANNOT overlap! Use XX:59 end times (e.g., 119 for 01:59) then start next at XX:00 (e.g., 120 for 02:00). For PRESERVE SOC mode, use power=0 (battery idle)."
+  fields:
+    device_id:
+      name: Device
+      description: The Growatt inverter device (WIT/WIS series)
+      required: true
+      selector:
+        device:
+          integration: growatt_modbus
+    periods:
+      name: Schedule Periods
+      description: "List of TOU periods. CRITICAL: NO OVERLAPPING! Use XX:59 end times. power=0 for PRESERVE SOC (battery idle), +100 for charge, -100 for discharge."
+      required: true
+      example: '[{"start": 0, "end": 119, "power": 100}, {"start": 120, "end": 1019, "power": 0}, {"start": 1020, "end": 1259, "power": -100}]'
+      selector:
+        object:
+    default_mode:
+      name: Default Mode
+      description: "Behavior outside scheduled periods: 0=Load first (self-consumption/HOLD), 1=Battery first, 2=Grid first"
+      required: false
+      default: 0
+      selector:
+        select:
+          options:
+            - label: "Load first (self-consumption/HOLD)"
+              value: "0"
+            - label: "Battery first"
+              value: "1"
+            - label: "Grid first"
+              value: "2"
+
+set_wit_mode:
+  name: Set WIT Inverter Mode
+  description: >
+    Set WIT inverter operating mode with atomic multi-register write.
+    Combines battery power, export rate, AC charge mode, and SOC limits
+    into a single command. For WIT/WIS inverters with VPP protocol only.
+  fields:
+    device_id:
+      name: Device
+      description: The Growatt WIT inverter device
+      required: true
+      selector:
+        device:
+          integration: growatt_modbus
+    mode:
+      name: Mode
+      description: >
+        Operating mode preset.
+        grid_charge: Charge battery from grid (+ PV supplement).
+        discharge_to_load: Discharge battery to cover home load, zero export.
+        discharge_to_grid: Discharge battery with export allowed (for selling).
+        max_export: Full discharge + unrestricted export.
+        preserve_soc: Battery idle, PV charges battery, surplus exports to grid.
+        hold: Alias for preserve_soc (backward compatibility).
+        passthrough: Release all overrides, return to panel-configured base mode.
+      required: true
+      selector:
+        select:
+          options:
+            - grid_charge
+            - discharge_to_load
+            - discharge_to_grid
+            - max_export
+            - preserve_soc
+            - hold
+            - passthrough
+    power_percent:
+      name: Power Percent
+      description: "Charge/discharge power level (1-100%). Default: 100."
+      default: 100
+      selector:
+        number:
+          min: 1
+          max: 100
+          unit_of_measurement: "%"
+    duration_minutes:
+      name: Duration
+      description: "How long the override stays active (1-1440 minutes). Default: 60. Inverter reverts to base mode when duration expires."
+      default: 60
+      selector:
+        number:
+          min: 1
+          max: 1440
+          unit_of_measurement: "min"
+    export_rate:
+      name: Export Rate
+      description: "Grid export power rate (0-100%). 0=zero export, 100=full export. If omitted, mode defaults apply."
+      selector:
+        number:
+          min: 0
+          max: 100
+          unit_of_measurement: "%"
+    ac_charge_mode:
+      name: AC Charge Mode
+      description: "AC/grid charging behavior. disabled=solar only, pv_priority=PV first + AC supplement, ac_priority=AC first."
+      selector:
+        select:
+          options:
+            - disabled
+            - pv_priority
+            - ac_priority
+    charge_cutoff_soc:
+      name: Charge Cutoff SOC
+      description: "Stop charging when battery reaches this SOC. Hardware range: 70-100%."
+      selector:
+        number:
+          min: 70
+          max: 100
+          unit_of_measurement: "%"
+    discharge_cutoff_soc:
+      name: Discharge Cutoff SOC
+      description: "Stop discharging when battery drops to this SOC. Hardware range: 10-30%. Preserve SOC uses 30 (max) by default."
+      selector:
+        number:
+          min: 10
+          max: 30
+          unit_of_measurement: "%"

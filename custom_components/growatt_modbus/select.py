@@ -5,7 +5,7 @@ from typing import Any
 
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.entity import EntityCategory
@@ -14,11 +14,51 @@ from .const import (
     DOMAIN,
     WRITABLE_REGISTERS,
     CONF_REGISTER_MAP,
+    DEVICE_TYPE_INVERTER,
     get_device_type_for_control,
+    DEVICE_TYPE_BATTERY,
+    MOD_TOU_PERIODS,
 )
 from .coordinator import GrowattModbusCoordinator
+from .growatt_modbus import ModbusWriteError
 
 _LOGGER = logging.getLogger(__name__)
+
+# Preset parameter maps for dashboard-friendly mode selection.
+# Each preset calls set_wit_mode with these defaults (user can override via service directly).
+WIT_MODE_PRESETS = {
+    "Grid Charge": {
+        "mode": "grid_charge",
+        "power_percent": 100,
+        "duration_minutes": 120,
+        "ac_charge_mode": "pv_priority",
+        "charge_cutoff_soc": 100,
+    },
+    "Discharge to Load": {
+        "mode": "discharge_to_load",
+        "power_percent": 100,
+        "duration_minutes": 120,
+        "discharge_cutoff_soc": 10,
+    },
+    "Discharge to Grid": {
+        "mode": "discharge_to_grid",
+        "power_percent": 100,
+        "duration_minutes": 120,
+        "discharge_cutoff_soc": 10,
+    },
+    "Max Export": {
+        "mode": "max_export",
+        "duration_minutes": 120,
+        "discharge_cutoff_soc": 10,
+    },
+    "Preserve SOC": {
+        "mode": "preserve_soc",
+        "discharge_cutoff_soc": 30,
+    },
+    "Passthrough": {
+        "mode": "passthrough",
+    },
+}
 
 
 async def async_setup_entry(
@@ -43,8 +83,26 @@ async def async_setup_entry(
     # ---------------------------------------------------------------------
     is_wit = str(register_map_name).upper() == "WIT_4000_15000TL3"
     if is_wit:
+        # WIT Mode Preset select (direct control)
+        entities.append(GrowattWitModePresetSelect(coordinator, config_entry))
+
         if 202 in holding_registers:
             entities.append(GrowattWitWorkModeSelect(coordinator, config_entry))
+
+        # VPP TOU Default Mode (30476) - behavior outside scheduled periods
+        if 30476 in holding_registers:
+            entities.append(GrowattWitVppTouDefaultModeSelect(coordinator, config_entry))
+
+        # VPP Remote Control selects (30100, 30200, 30407)
+        for control_name in ['control_authority', 'remote_power_control_enable', 'vpp_export_limit_enable']:
+            if control_name in WRITABLE_REGISTERS:
+                control_config = WRITABLE_REGISTERS[control_name]
+                register_num = control_config['register']
+                if register_num in holding_registers:
+                    entities.append(
+                        GrowattGenericSelect(coordinator, config_entry, control_name, control_config)
+                    )
+                    _LOGGER.info("%s control enabled (register %d found)", control_name, register_num)
 
         if entities:
             entry_name = config_entry.data.get("name", config_entry.title)
@@ -65,20 +123,107 @@ async def async_setup_entry(
         if register_num not in holding_registers:
             continue  # Skip if register not in this profile
 
+        # allow_grid_charge is handled by GrowattModAllowGridChargeSelect below
+        if control_name == 'allow_grid_charge':
+            continue
+
+        # VPP export limit requires live confirmation that the inverter responds to 30200
+        if control_name == 'vpp_export_limit_enable':
+            if coordinator.data is None or not coordinator.data.vpp_export_limit_available:
+                _LOGGER.debug("Skipping vpp_export_limit_enable: register 30200 not confirmed responsive")
+                continue
+
+        # control_authority requires live confirmation that the inverter responds to 30100
+        if control_name == 'control_authority':
+            if coordinator.data is None or not coordinator.data.vpp_control_authority_available:
+                _LOGGER.debug("Skipping control_authority: register 30100 not confirmed responsive")
+                continue
+
         entities.append(
             GrowattGenericSelect(coordinator, config_entry, control_name, control_config)
         )
         _LOGGER.info("%s control enabled (register %d found)", control_name, register_num)
+
+    # MOD TL3-XH TOU priority and enable selects (9 periods × 2 = 18 entities)
+    if 3038 in holding_registers:
+        for period_def in MOD_TOU_PERIODS:
+            entities.append(GrowattModTouPriority(coordinator, config_entry, period_def))
+            entities.append(GrowattModTouEnable(coordinator, config_entry, period_def))
+        _LOGGER.info("MOD TOU priority/enable controls enabled (%d select entities for %d periods)",
+                     len(MOD_TOU_PERIODS) * 2, len(MOD_TOU_PERIODS))
+
+    # MOD GEN4 Allow Grid Charge gate (register 3049) — prerequisite for TOU persistence
+    if 3049 in holding_registers:
+        entities.append(GrowattModAllowGridChargeSelect(coordinator, config_entry))
+        _LOGGER.info("MOD Allow Grid Charge control enabled (register 3049)")
 
     if entities:
         entry_name = config_entry.data.get("name", config_entry.title)
         _LOGGER.info("Created %d select entities for %s", len(entities), entry_name)
         async_add_entities(entities)
 
+    # Deferred registration for VPP controls that require live hardware confirmation.
+    # vpp_export_limit_enable and control_authority are only created once the inverter
+    # has confirmed the relevant registers respond (vpp_export_limit_available /
+    # vpp_control_authority_available flags set during first real poll). Because
+    # async_config_entry_first_refresh seeds coordinator.data with an empty placeholder,
+    # these flags are always False at setup time — so the controls are always skipped.
+    # Register a coordinator listener that adds them once real data arrives. (Issue #262)
+    deferred_vpp: list[tuple[str, dict]] = []
+    for ctrl in ("vpp_export_limit_enable", "control_authority"):
+        if ctrl not in WRITABLE_REGISTERS:
+            continue
+        cfg = WRITABLE_REGISTERS[ctrl]
+        if cfg["register"] not in holding_registers:
+            continue
+        # Only defer if it was actually skipped above (flag was False at setup time)
+        already_created = any(
+            getattr(e, "_control_name", None) == ctrl for e in entities
+        )
+        if not already_created:
+            deferred_vpp.append((ctrl, cfg))
+
+    if deferred_vpp:
+        _LOGGER.debug(
+            "%d VPP select(s) deferred pending first real inverter data: %s",
+            len(deferred_vpp),
+            [ctrl for ctrl, _ in deferred_vpp],
+        )
+
+        @callback
+        def _async_check_deferred_vpp() -> None:
+            if not coordinator.has_real_data:
+                return
+            new_entities: list[SelectEntity] = []
+            still_waiting: list[tuple[str, dict]] = []
+            for ctrl_name, ctrl_cfg in deferred_vpp:
+                available = (
+                    coordinator.data.vpp_export_limit_available
+                    if ctrl_name == "vpp_export_limit_enable"
+                    else coordinator.data.vpp_control_authority_available
+                )
+                if available:
+                    new_entities.append(
+                        GrowattGenericSelect(coordinator, config_entry, ctrl_name, ctrl_cfg)
+                    )
+                    _LOGGER.debug("Deferred VPP control %s now available — adding entity", ctrl_name)
+                else:
+                    still_waiting.append((ctrl_name, ctrl_cfg))
+            deferred_vpp.clear()
+            deferred_vpp.extend(still_waiting)
+            if new_entities:
+                async_add_entities(new_entities)
+            if not deferred_vpp:
+                _remove_vpp_listener()
+
+        _remove_vpp_listener = coordinator.async_add_listener(_async_check_deferred_vpp)
+        config_entry.async_on_unload(_remove_vpp_listener)
+
 
 class GrowattGenericSelect(CoordinatorEntity, SelectEntity):
     """Generic select entity for any control with options."""
 
+    _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(
@@ -97,8 +242,7 @@ class GrowattGenericSelect(CoordinatorEntity, SelectEntity):
 
         # Generate friendly name (e.g., "output_config" -> "Output Config")
         friendly_name = control_name.replace('_', ' ').title()
-        entry_name = config_entry.data.get("name", config_entry.title)
-        self._attr_name = f"{entry_name} {friendly_name}"
+        self._attr_name = friendly_name
         self._attr_unique_id = f"{config_entry.entry_id}_{control_name}"
 
         # Set icon based on control type
@@ -151,20 +295,71 @@ class GrowattGenericSelect(CoordinatorEntity, SelectEntity):
             _LOGGER.error("Invalid option selected: %s", option)
             return
 
-        # Write to Modbus register
-        register = self._control_config['register']
-        success = await self.hass.async_add_executor_job(
-            self.coordinator.modbus_client.write_register,
-            register,
-            value
-        )
+        # Look up register address from profile (supports multiple profiles with same control name)
+        register_addr = self.coordinator.modbus_client._find_register_by_name(self._control_name)
+        if not register_addr:
+            # Fallback to hardcoded register if not in profile
+            register_addr = self._control_config['register']
+            _LOGGER.debug("Using fallback register %d for %s", register_addr, self._control_name)
 
-        if success:
-            _LOGGER.info("Set %s to %s (value=%d)", self._control_name, option, value)
-            # Request immediate refresh to show new value
+        # WIT side-effect: disabling control_authority (30100=0) transiently resets register 122
+        # (export_limit_mode) to 0. On older WIT firmware it may not auto-restore when re-enabled.
+        # Save before disabling so we can restore after re-enabling.
+        is_wit = 'WIT' in self.coordinator.modbus_client.register_map.get('name', '')
+        if self._control_name == 'control_authority' and is_wit:
+            if value == 0:
+                saved = await self.hass.async_add_executor_job(
+                    self.coordinator.modbus_client.read_holding_registers, 122, 1
+                )
+                self.coordinator._saved_export_limit_mode_wit = saved[0] if saved else 0
+                _LOGGER.debug(
+                    "WIT: saved export_limit_mode=%d before disabling control authority",
+                    self.coordinator._saved_export_limit_mode_wit,
+                )
+
+        # Write to Modbus register with read-back verification
+        try:
+            write_ok, verified = await self.hass.async_add_executor_job(
+                self.coordinator.modbus_client.write_register_verified,
+                register_addr,
+                value,
+            )
+        except ModbusWriteError:
+            _LOGGER.error("Failed to write %s (register %d)", self._control_name, register_addr)
+            return
+
+        if write_ok:
+            if verified:
+                _LOGGER.info("Set %s to %s (value=%d, verified)", self._control_name, option, value)
+            else:
+                _LOGGER.warning(
+                    "%s: write succeeded but value reverted. Possible causes: "
+                    "ShineWiFi/cloud dongle overriding local writes, inverter firmware "
+                    "rejecting the value, or a prerequisite setting not enabled.",
+                    self._control_name,
+                )
+            self.coordinator.track_write(register_addr, value, self._control_name)
+
+            # WIT: restore export_limit_mode after re-enabling control authority
+            if self._control_name == 'control_authority' and is_wit and value == 1:
+                saved = self.coordinator._saved_export_limit_mode_wit
+                if saved > 0:
+                    await asyncio.sleep(0.3)
+                    restored = await self.hass.async_add_executor_job(
+                        self.coordinator.modbus_client.write_register, 122, saved
+                    )
+                    if restored:
+                        _LOGGER.info(
+                            "WIT: restored export_limit_mode=%d after re-enabling control authority",
+                            saved,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "WIT: failed to restore export_limit_mode=%d after re-enabling control authority",
+                            saved,
+                        )
+
             await self.coordinator.async_request_refresh()
-        else:
-            _LOGGER.error("Failed to write %s", self._control_name)
 
 
 class GrowattWitWorkModeSelect(CoordinatorEntity, SelectEntity):
@@ -246,3 +441,315 @@ class GrowattWitWorkModeSelect(CoordinatorEntity, SelectEntity):
             await self.coordinator.async_request_refresh()
         else:
             _LOGGER.error("[WIT] Failed to write work_mode")
+
+
+class GrowattWitVppTouDefaultModeSelect(CoordinatorEntity, SelectEntity):
+    """WIT VPP: TOU default mode (behavior outside scheduled periods)."""
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_icon = "mdi:calendar-clock"
+    _attr_options = ["Load First (Hold)", "Battery First", "Grid First"]
+
+    VPP_TOU_DEFAULT_MODE = 30476
+
+    def __init__(
+        self,
+        coordinator: GrowattModbusCoordinator,
+        config_entry: ConfigEntry,
+    ) -> None:
+        super().__init__(coordinator)
+        self._config_entry = config_entry
+        entry_name = config_entry.data.get("name", config_entry.title)
+        self._attr_name = f"{entry_name} TOU Default Mode"
+        self._attr_unique_id = f"{config_entry.entry_id}_vpp_tou_default_mode"
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        device_type = get_device_type_for_control("work_mode")
+        return self.coordinator.get_device_info(device_type)
+
+    @property
+    def current_option(self) -> str | None:
+        last_mode = getattr(self.coordinator, "wit_vpp_tou_default_mode", 0)
+        mode_map = {0: "Load First (Hold)", 1: "Battery First", 2: "Grid First"}
+        return mode_map.get(last_mode, "Load First (Hold)")
+
+    async def async_select_option(self, option: str) -> None:
+        mode_map = {"Load First (Hold)": 0, "Battery First": 1, "Grid First": 2}
+        value = mode_map.get(option)
+
+        if value is None:
+            _LOGGER.error("[WIT-VPP] Invalid TOU default mode: %s", option)
+            return
+
+        _LOGGER.info("[WIT-VPP] Setting TOU default mode to %s (value=%d)", option, value)
+
+        try:
+            success = await self.hass.async_add_executor_job(
+                self.coordinator.modbus_client.write_register,
+                self.VPP_TOU_DEFAULT_MODE,
+                value
+            )
+
+            if success:
+                setattr(self.coordinator, "wit_vpp_tou_default_mode", value)
+                _LOGGER.info("[WIT-VPP] Successfully set TOU default mode to %s", option)
+                await self.coordinator.async_request_refresh()
+            else:
+                _LOGGER.error("[WIT-VPP] Failed to set TOU default mode")
+
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.exception("[WIT-VPP] Failed to set TOU default mode: %s", err)
+
+
+class GrowattModTouPriority(CoordinatorEntity, SelectEntity):
+    """Priority select for one MOD TL3-XH TOU period.
+
+    Extracts bits 13-14 from the period's start register.
+    Write uses read-modify-write to preserve time (bits 0-12) and enable (bit 15).
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_icon = "mdi:priority-high"
+    _attr_options = ["Load Priority", "Battery Priority", "Grid Priority"]
+
+    _PRIORITY_MAP = {0: "Load Priority", 1: "Battery Priority", 2: "Grid Priority"}
+    _PRIORITY_REVERSE = {"Load Priority": 0, "Battery Priority": 1, "Grid Priority": 2}
+
+    def __init__(self, coordinator, config_entry, period_def: dict) -> None:
+        """Initialize priority select."""
+        super().__init__(coordinator)
+        self._config_entry = config_entry
+        self._period = period_def["period"]
+        self._start_reg = period_def["start_reg"]
+        self._end_reg = period_def["end_reg"]
+        self._start_field = period_def["start_field"]
+        self._end_field = period_def["end_field"]
+
+        entry_name = config_entry.data.get("name", config_entry.title)
+        self._attr_name = f"{entry_name} TOU Period {self._period} Priority"
+        self._attr_unique_id = f"{config_entry.entry_id}_mod_tou_{self._period}_priority"
+
+    @property
+    def device_info(self):
+        """Return device information."""
+        return self.coordinator.get_device_info(DEVICE_TYPE_BATTERY)
+
+    @property
+    def current_option(self) -> str | None:
+        """Return current priority option."""
+        data = self.coordinator.data
+        if data is None:
+            return None
+        raw = getattr(data, self._start_field, 0)
+        priority = (int(raw) >> 13) & 0x3
+        return self._PRIORITY_MAP.get(priority)
+
+    async def async_select_option(self, option: str) -> None:
+        """Write new priority atomically — always write start+end together as a single FC16 transaction."""
+        priority = self._PRIORITY_REVERSE.get(option)
+        if priority is None:
+            return
+        data = self.coordinator.data
+        current_raw = getattr(data, self._start_field, 0) if data else 0
+        new_raw = (int(current_raw) & 0x9FFF) | (priority << 13)
+        current_end = int(getattr(data, self._end_field, 0) if data else 0)
+        try:
+            success = await self.hass.async_add_executor_job(
+                self.coordinator.modbus_client.write_registers,
+                self._start_reg,
+                [new_raw, current_end],
+            )
+        except ModbusWriteError:
+            _LOGGER.error("Failed to write MOD TOU period %d priority (register %d, atomic FC16)", self._period, self._start_reg)
+            return
+        if success:
+            _LOGGER.info("Set MOD TOU period %d priority to %s (start=0x%04X, end=0x%04X, atomic FC16)", self._period, option, new_raw, current_end)
+            self.coordinator.track_write(self._start_reg, new_raw, self._start_field)
+            self.coordinator.track_write(self._end_reg, current_end, self._end_field)
+            await self.coordinator.async_request_refresh()
+
+
+class GrowattModTouEnable(CoordinatorEntity, SelectEntity):
+    """Enable/disable select for one MOD TL3-XH TOU period.
+
+    Extracts bit 15 from the period's start register.
+    Write uses read-modify-write to preserve time (bits 0-12) and priority (bits 13-14).
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_icon = "mdi:toggle-switch-outline"
+    _attr_options = ["Disabled", "Enabled"]
+
+    def __init__(self, coordinator, config_entry, period_def: dict) -> None:
+        """Initialize enable select."""
+        super().__init__(coordinator)
+        self._config_entry = config_entry
+        self._period = period_def["period"]
+        self._start_reg = period_def["start_reg"]
+        self._end_reg = period_def["end_reg"]
+        self._start_field = period_def["start_field"]
+        self._end_field = period_def["end_field"]
+
+        entry_name = config_entry.data.get("name", config_entry.title)
+        self._attr_name = f"{entry_name} TOU Period {self._period} Enable"
+        self._attr_unique_id = f"{config_entry.entry_id}_mod_tou_{self._period}_enable"
+
+    @property
+    def device_info(self):
+        """Return device information."""
+        return self.coordinator.get_device_info(DEVICE_TYPE_BATTERY)
+
+    @property
+    def current_option(self) -> str | None:
+        """Return current enable state."""
+        data = self.coordinator.data
+        if data is None:
+            return None
+        raw = getattr(data, self._start_field, 0)
+        enabled = (int(raw) >> 15) & 0x1
+        return "Enabled" if enabled else "Disabled"
+
+    async def async_select_option(self, option: str) -> None:
+        """Write new enable state atomically — always write start+end together as a single FC16 transaction."""
+        enable = 1 if option == "Enabled" else 0
+        data = self.coordinator.data
+        current_raw = getattr(data, self._start_field, 0) if data else 0
+        new_raw = (int(current_raw) & 0x7FFF) | (enable << 15)
+        current_end = int(getattr(data, self._end_field, 0) if data else 0)
+        try:
+            success = await self.hass.async_add_executor_job(
+                self.coordinator.modbus_client.write_registers,
+                self._start_reg,
+                [new_raw, current_end],
+            )
+        except ModbusWriteError:
+            _LOGGER.error("Failed to write MOD TOU period %d enable (register %d, atomic FC16)", self._period, self._start_reg)
+            return
+        if success:
+            _LOGGER.info("Set MOD TOU period %d enable to %s (start=0x%04X, end=0x%04X, atomic FC16)", self._period, option, new_raw, current_end)
+            self.coordinator.track_write(self._start_reg, new_raw, self._start_field)
+            self.coordinator.track_write(self._end_reg, current_end, self._end_field)
+            await self.coordinator.async_request_refresh()
+
+
+class GrowattModAllowGridChargeSelect(CoordinatorEntity, SelectEntity):
+    """Select entity for the MOD GEN4 'Allow Grid Charge' gate (register 3049).
+
+    This register must be set to Enabled (1) before TOU time slot registers
+    (3038-3059) will persist on GEN4 hardware.  Plain 0/1 register — no bit masking.
+    """
+
+    _REGISTER = 3049
+    _DATA_FIELD = "allow_grid_charge"
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_icon = "mdi:transmission-tower-export"
+    _attr_options = ["Disabled", "Enabled"]
+
+    def __init__(self, coordinator, config_entry) -> None:
+        """Initialize the Allow Grid Charge select."""
+        super().__init__(coordinator)
+        self._config_entry = config_entry
+        entry_name = config_entry.data.get("name", config_entry.title)
+        self._attr_name = f"{entry_name} Allow Grid Charge"
+        self._attr_unique_id = f"{config_entry.entry_id}_allow_grid_charge"
+
+    @property
+    def device_info(self):
+        """Return device information."""
+        return self.coordinator.get_device_info(DEVICE_TYPE_BATTERY)
+
+    @property
+    def current_option(self) -> str | None:
+        """Return current state."""
+        data = self.coordinator.data
+        if data is None:
+            return None
+        raw = getattr(data, self._DATA_FIELD, 0)
+        return "Enabled" if int(raw) else "Disabled"
+
+    async def async_select_option(self, option: str) -> None:
+        """Write new state to register 3049."""
+        value = 1 if option == "Enabled" else 0
+        try:
+            write_ok, verified = await self.hass.async_add_executor_job(
+                self.coordinator.modbus_client.write_register_verified, self._REGISTER, value,
+            )
+        except ModbusWriteError:
+            _LOGGER.error("Failed to write allow_grid_charge (register %d)", self._REGISTER)
+            return
+        if write_ok:
+            if verified:
+                _LOGGER.info("Set allow_grid_charge to %s (value=%d, verified)", option, value)
+            else:
+                _LOGGER.warning(
+                    "allow_grid_charge: write succeeded but value reverted. "
+                    "Possible causes: ShineWiFi/cloud dongle overriding local writes, "
+                    "or inverter firmware rejecting the value."
+                )
+            self.coordinator.track_write(self._REGISTER, value, self._DATA_FIELD)
+            await self.coordinator.async_request_refresh()
+
+
+class GrowattWitModePresetSelect(CoordinatorEntity, SelectEntity):
+    """WIT inverter mode preset selector."""
+
+    _attr_icon = "mdi:state-machine"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_options = list(WIT_MODE_PRESETS.keys())
+
+    def __init__(self, coordinator, config_entry):
+        super().__init__(coordinator)
+        self._config_entry = config_entry
+        entry_name = config_entry.data.get("name", config_entry.title)
+        self._attr_name = f"{entry_name} Mode Preset"
+        self._attr_unique_id = f"{config_entry.entry_id}_wit_mode_preset"
+
+    @property
+    def device_info(self):
+        return self.coordinator.get_device_info(DEVICE_TYPE_INVERTER)
+
+    @property
+    def current_option(self) -> str | None:
+        # Prefer optimistic state from last command (instant UI feedback)
+        last = getattr(self.coordinator, "wit_mode_preset_last", None)
+        if last in self._attr_options:
+            return last
+
+        # Fallback to computed state from polled registers
+        data = self.coordinator.data
+        if data is None:
+            return None
+        status = getattr(data, 'wit_mode_status', None)
+        if status in self._attr_options:
+            return status
+        return None
+
+    async def async_select_option(self, option: str) -> None:
+        preset = WIT_MODE_PRESETS.get(option)
+        if preset is None:
+            _LOGGER.error("[WIT] Unknown mode preset: %s", option)
+            return
+
+        # Resolve device_id from device registry
+        from homeassistant.helpers import device_registry as dr
+        device_reg = dr.async_get(self.hass)
+        entry_id = self._config_entry.entry_id
+        inverter_identifier = (DOMAIN, f"{entry_id}_inverter")
+
+        device_entry = device_reg.async_get_device(identifiers={inverter_identifier})
+        if device_entry is None:
+            _LOGGER.error("[WIT] Could not resolve device_id for mode preset")
+            return
+
+        service_data = {"device_id": device_entry.id, **preset}
+
+        await self.hass.services.async_call(
+            DOMAIN, "set_wit_mode", service_data
+        )
+
+        # Optimistic UI update — don't wait for next poll cycle
+        self.coordinator.wit_mode_preset_last = option
+        self.async_write_ha_state()
+        _LOGGER.info("[WIT] Mode preset applied: %s", option)

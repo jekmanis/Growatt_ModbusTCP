@@ -1,6 +1,6 @@
 """Binary sensor platform for Growatt Modbus Integration."""
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.binary_sensor import (
@@ -40,6 +40,7 @@ async def async_setup_entry(
 class GrowattInverterOnlineSensor(CoordinatorEntity, BinarySensorEntity):
     """Binary sensor for inverter online status."""
 
+    _attr_has_entity_name = True
     _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
@@ -52,7 +53,7 @@ class GrowattInverterOnlineSensor(CoordinatorEntity, BinarySensorEntity):
         super().__init__(coordinator)
 
         self._config_entry = config_entry
-        self._attr_name = f"{config_entry.data['name']} Inverter Online"
+        self._attr_name = "Inverter Online"
         self._attr_unique_id = f"{config_entry.entry_id}_inverter_online"
         self._attr_icon = "mdi:solar-power-variant"
 
@@ -64,12 +65,7 @@ class GrowattInverterOnlineSensor(CoordinatorEntity, BinarySensorEntity):
     @property
     def is_on(self) -> bool:
         """Return true if inverter is online (responding to Modbus)."""
-        if self.coordinator.last_successful_update is None:
-            return False
-        
-        # Consider online if last update was within 5 minutes
-        time_since_update = datetime.now() - self.coordinator.last_successful_update
-        return time_since_update < timedelta(minutes=5)
+        return self.coordinator.is_online
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:

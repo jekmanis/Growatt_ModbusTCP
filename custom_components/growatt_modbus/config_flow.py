@@ -20,12 +20,18 @@ from .const import (
     CONF_CONNECTION_TYPE,
     CONF_DEVICE_PATH,
     CONF_BAUDRATE,
+    CONF_INVERT_BATTERY_POWER,
     DEFAULT_PORT,
     DEFAULT_SLAVE_ID,
     DEFAULT_BAUDRATE,
     DOMAIN,
 )
-from .device_profiles import get_available_profiles, get_profile
+from .device_profiles import (
+    get_available_profiles,
+    get_profile,
+    resolve_profile_selection,
+    get_display_name_for_profile,
+)
 from .growatt_modbus import GrowattModbus
 from .auto_detection import async_determine_inverter_type
 
@@ -34,12 +40,14 @@ _LOGGER = logging.getLogger(__name__)
 
 def _detect_grid_orientation(client: GrowattModbus) -> tuple[bool, str]:
     """
-    Detect if grid power needs inversion for Home Assistant compatibility.
+    Detect if grid power sign needs inversion.
+
+    Integration convention is positive = export, negative = import. Inversion is
+    only enabled when the inverter reports the opposite (negative while exporting).
+    Handles SPH-TL3 dual-register configuration (power_to_grid + power_to_user).
 
     Returns:
         tuple: (invert_needed, detection_message)
-            - invert_needed: True if inversion should be enabled
-            - detection_message: Human-readable explanation of detection result
     """
     try:
         # Read current data from inverter
@@ -49,7 +57,11 @@ def _detect_grid_orientation(client: GrowattModbus) -> tuple[bool, str]:
 
         pv_power = getattr(data, "pv_total_power", 0)
         consumption = getattr(data, "house_consumption", 0) or getattr(data, "power_to_load", 0)
-        raw_grid_power = getattr(data, "power_to_grid", 0)
+
+        # SPH-TL3 specific: Check both power_to_grid AND power_to_user
+        # Different CT sensor configs (no sensor/single/dual) affect which registers are active
+        power_to_grid = getattr(data, "power_to_grid", 0)
+        power_to_user = getattr(data, "power_to_user", 0)
 
         # Check if conditions are good for detection
         if pv_power < 1000:
@@ -59,19 +71,25 @@ def _detect_grid_orientation(client: GrowattModbus) -> tuple[bool, str]:
         if expected_export < 100:
             return False, f"⚠️ Not exporting enough ({expected_export:.0f}W) - using default (no inversion). Run detection service later."
 
-        # Analyze grid power sign
-        # IEC 61850: positive = export, negative = import
-        # HA: negative = export, positive = import
+        # Determine which register has the actual grid power value.
+        # Integration convention: positive = export, negative = import.
+        # Inversion is only needed when the inverter itself reports the opposite sign.
+        if abs(power_to_grid) > abs(power_to_user):
+            raw_grid_power = power_to_grid
+            register_name = "power_to_grid"
+        else:
+            # power_to_user is dominant — negate so positive still means export
+            raw_grid_power = -power_to_user
+            register_name = "power_to_user"
 
         if raw_grid_power > 100:
-            # Positive while exporting = IEC standard → need inversion for HA
-            return True, f"✅ Auto-detected: IEC 61850 standard (exporting {raw_grid_power:.0f}W shows as positive) - inversion enabled"
+            # Positive while exporting = matches our convention → no inversion needed
+            return False, f"✅ Auto-detected: positive = export ({register_name}={power_to_grid if register_name == 'power_to_grid' else power_to_user:.0f}W while exporting) - no inversion needed"
         elif raw_grid_power < -100:
-            # Negative while exporting = already HA format → no inversion
-            return False, f"✅ Auto-detected: Already HA format (exporting shows as negative) - no inversion needed"
+            # Negative while exporting = inverter reports opposite sign → inversion needed
+            return True, f"✅ Auto-detected: negative = export ({register_name}={power_to_grid if register_name == 'power_to_grid' else power_to_user:.0f}W while exporting) - inversion enabled"
         else:
-            # Too close to zero
-            return False, f"⚠️ Grid power near zero ({raw_grid_power:.0f}W) - using default (no inversion). Run detection service later."
+            return False, f"⚠️ Grid power near zero (power_to_grid={power_to_grid:.0f}W, power_to_user={power_to_user:.0f}W) - using default (no inversion). Run detection service later."
 
     except Exception as e:
         _LOGGER.debug(f"Grid orientation detection failed: {e}")
@@ -383,12 +401,15 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
                         # Auto-detection successful!
                         _LOGGER.info(f"✓ Auto-detected: {profile['name']}")
 
-                        # Store discovered info for confirmation step
+                        # Store discovered info for confirmation step.
+                        # vpp_protocol_confirmed is the authoritative flag used by the
+                        # reconfigure flow to decide which profile variant to resolve.
                         self._discovered_data.update({
                             CONF_INVERTER_SERIES: profile_key,
                             CONF_REGISTER_MAP: profile["register_map"],
                             "detected_profile": profile,
                             "auto_detected": True,
+                            "vpp_protocol_confirmed": "_v201" in profile_key,
                         })
 
                         # Show confirmation step
@@ -447,13 +468,14 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
                     CONF_INVERTER_SERIES: self._discovered_data[CONF_INVERTER_SERIES],
                     CONF_REGISTER_MAP: self._discovered_data[CONF_REGISTER_MAP],
                     "register_map": self._discovered_data[CONF_REGISTER_MAP],
+                    "vpp_protocol_confirmed": self._discovered_data.get("vpp_protocol_confirmed", False),
                 }
 
                 # Add connection-specific parameters
                 if connection_type == "tcp":
                     config_data[CONF_HOST] = self._discovered_data[CONF_HOST]
                     config_data[CONF_PORT] = self._discovered_data[CONF_PORT]
-                    unique_id = f"{config_data[CONF_HOST]}_{config_data[CONF_SLAVE_ID]}"
+                    unique_id = f"{config_data[CONF_HOST]}:{config_data[CONF_PORT]}_{config_data[CONF_SLAVE_ID]}"
                 else:  # serial
                     config_data[CONF_DEVICE_PATH] = self._discovered_data[CONF_DEVICE_PATH]
                     config_data[CONF_BAUDRATE] = self._discovered_data[CONF_BAUDRATE]
@@ -506,6 +528,7 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
                     "offline_scan_interval": 300,  # 5 minutes when offline
                     "timeout": 10,  # 10 seconds connection timeout
                     "invert_grid_power": invert_grid_power,  # Auto-detected or default
+                    "modbus_delay": 250,  # 250ms inter-request delay
                 }
 
                 # Create notification about grid orientation detection
@@ -537,6 +560,28 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
                         "notification_id": f"growatt_setup_{config_data.get(CONF_HOST, 'device')}",
                     },
                 )
+
+                # Cloud override warning for battery-enabled profiles
+                detected_profile = self._discovered_data.get("detected_profile", {})
+                if detected_profile.get("has_battery", False):
+                    await self.hass.services.async_call(
+                        "persistent_notification",
+                        "create",
+                        {
+                            "title": "Growatt: Cloud Control Warning",
+                            "message": (
+                                "**Important:** If your inverter has a ShineWiFi or ShineLink dongle "
+                                "connected to the Growatt cloud, the cloud server may override local "
+                                "Modbus control changes (priority mode, time schedules, export limits, "
+                                "etc.) within seconds.\n\n"
+                                "**To ensure reliable local control:**\n"
+                                "- Disconnect the ShineWiFi/ShineLink dongle from the inverter, OR\n"
+                                "- Disable remote control in the ShinePhone/Growatt app\n\n"
+                                "Sensor monitoring (read-only) is **not affected** by the cloud connection."
+                            ),
+                            "notification_id": "growatt_cloud_warning",
+                        },
+                    )
 
                 return self.async_create_entry(
                     title=f"{config_data[CONF_NAME]} ({profile_name})",
@@ -577,7 +622,21 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
 
         if user_input is not None:
             try:
-                series = user_input.get(CONF_INVERTER_SERIES, "min_7000_10000_tl_x")
+                # User selected a friendly name - resolve to actual profile ID
+                display_name = user_input.get(CONF_INVERTER_SERIES, "MIN (7-10kW)")
+
+                # V2.01 support is confirmed only when auto-detection selected a _v201 profile.
+                # auto_detected=True means *any* detection method worked (including register
+                # probing which returns legacy profiles) — it is NOT evidence of V2.01 support.
+                # Using auto_detected here caused non-VPP units to be assigned _v201 profiles.
+                detected_series = self._discovered_data.get(CONF_INVERTER_SERIES, "")
+                supports_v201 = "_v201" in detected_series
+
+                # Resolve friendly name to actual profile ID
+                series = resolve_profile_selection(display_name, supports_v201=supports_v201)
+
+                _LOGGER.info(f"User selected '{display_name}', resolved to profile '{series}' (V2.01: {supports_v201})")
+
                 profile = get_profile(series)
 
                 if not profile:
@@ -594,13 +653,14 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
                         CONF_INVERTER_SERIES: series,
                         CONF_REGISTER_MAP: series,
                         "register_map": profile["register_map"],
+                        "vpp_protocol_confirmed": self._discovered_data.get("vpp_protocol_confirmed", False),
                     }
 
                     # Add connection-specific parameters
                     if connection_type == "tcp":
                         config_data[CONF_HOST] = self._discovered_data[CONF_HOST]
                         config_data[CONF_PORT] = self._discovered_data[CONF_PORT]
-                        unique_id = f"{config_data[CONF_HOST]}_{config_data[CONF_SLAVE_ID]}"
+                        unique_id = f"{config_data[CONF_HOST]}:{config_data[CONF_PORT]}_{config_data[CONF_SLAVE_ID]}"
                     else:  # serial
                         config_data[CONF_DEVICE_PATH] = self._discovered_data[CONF_DEVICE_PATH]
                         config_data[CONF_BAUDRATE] = self._discovered_data[CONF_BAUDRATE]
@@ -683,6 +743,27 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
                         },
                     )
 
+                    # Cloud override warning for battery-enabled profiles
+                    if profile.get("has_battery", False):
+                        await self.hass.services.async_call(
+                            "persistent_notification",
+                            "create",
+                            {
+                                "title": "Growatt: Cloud Control Warning",
+                                "message": (
+                                    "**Important:** If your inverter has a ShineWiFi or ShineLink dongle "
+                                    "connected to the Growatt cloud, the cloud server may override local "
+                                    "Modbus control changes (priority mode, time schedules, export limits, "
+                                    "etc.) within seconds.\n\n"
+                                    "**To ensure reliable local control:**\n"
+                                    "- Disconnect the ShineWiFi/ShineLink dongle from the inverter, OR\n"
+                                    "- Disable remote control in the ShinePhone/Growatt app\n\n"
+                                    "Sensor monitoring (read-only) is **not affected** by the cloud connection."
+                                ),
+                                "notification_id": "growatt_cloud_warning",
+                            },
+                        )
+
                     return self.async_create_entry(
                         title=f"{config_data[CONF_NAME]} ({profile['name']})",
                         data=config_data,
@@ -693,16 +774,15 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
                 _LOGGER.exception("Unexpected error during manual selection")
                 errors["base"] = "unknown"
         
-        # Build manual selection schema
-        # Only show legacy profiles (V2.01 profiles excluded)
-        # If auto-detection failed, the inverter doesn't support register 30000+ (V2.01)
-        available_profiles = get_available_profiles(legacy_only=True)
+        # Build manual selection schema with user-friendly names
+        # friendly_names=True returns display names that hide protocol versions
+        available_profiles = get_available_profiles(legacy_only=False, friendly_names=True)
 
         schema = vol.Schema({
             vol.Required(
                 CONF_INVERTER_SERIES,
-                default="min_7000_10000_tl_x"
-            ): vol.In(available_profiles),
+                default="MIN (7-10kW)"
+            ): vol.In(list(available_profiles.keys())),
         })
 
         # Prepare description based on whether auto-detection was attempted
@@ -711,12 +791,15 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
             info_text = (
                 f"⚠️ Auto-Detection Results:\n"
                 f"• DTC Code (register 30000): {dtc_result}\n"
-                f"• Conclusion: V2.01 protocol not supported\n\n"
-                f"Please manually select your inverter series below.\n"
+                f"• Result: V2.01 protocol not supported\n\n"
+                f"Please select your inverter model below.\n"
                 f"Legacy protocol will be used automatically."
             )
         else:
-            info_text = "Please select your inverter series. Legacy protocol will be used."
+            info_text = (
+                "Please select your inverter model below.\n"
+                "Protocol version will be detected automatically."
+            )
 
         return self.async_show_form(
             step_id="manual",
@@ -756,10 +839,27 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
                 changed = True
             
             if CONF_INVERTER_SERIES in user_input:
-                profile = get_profile(user_input[CONF_INVERTER_SERIES])
+                # Resolve friendly display name to actual profile ID
+                selected_display_name = user_input[CONF_INVERTER_SERIES]
+                current_series = new_data.get(CONF_INVERTER_SERIES, "min_7000_10000_tl_x")
+
+                # Use the stored vpp_protocol_confirmed flag set at initial setup.
+                # Falling back to '_v201' in current_series was a self-reinforcing bug:
+                # once incorrectly on a _v201 profile, the user could never reconfigure
+                # back to legacy because the flag stayed True.
+                # For existing installs without the flag: default False (legacy) — safe,
+                # and legitimate V2.01 users can re-run setup to restore it correctly.
+                supports_v201 = self.config_entry.data.get("vpp_protocol_confirmed", False)
+
+                # Resolve to actual profile ID
+                new_series = resolve_profile_selection(selected_display_name, supports_v201=supports_v201)
+
+                _LOGGER.info(f"Options: selected '{selected_display_name}', resolved to '{new_series}' (current: '{current_series}')")
+
+                profile = get_profile(new_series)
                 if profile:
-                    new_data[CONF_INVERTER_SERIES] = user_input[CONF_INVERTER_SERIES]
-                    new_data[CONF_REGISTER_MAP] = user_input[CONF_INVERTER_SERIES]
+                    new_data[CONF_INVERTER_SERIES] = new_series
+                    new_data[CONF_REGISTER_MAP] = new_series
                     new_data["register_map"] = profile["register_map"]
                     changed = True
                     _LOGGER.info(f"Profile changed to: {profile['name']}")
@@ -789,9 +889,16 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
         current_scan_interval = self.config_entry.options.get("scan_interval", 60)  # Default 60 seconds
         current_offline_scan_interval = self.config_entry.options.get("offline_scan_interval", 300)
         current_timeout = self.config_entry.options.get("timeout", 10)
-        current_invert = self.config_entry.options.get("invert_grid_power", False)
+        current_invert_grid = self.config_entry.options.get("invert_grid_power", False)
+        current_invert_battery = self.config_entry.options.get("invert_battery_power", False)
+        current_bvr = self.config_entry.options.get("battery_voltage_range", "Auto-detect")
+        current_modbus_delay = self.config_entry.options.get("modbus_delay", 250)
 
-        available_profiles = get_available_profiles()
+        # Get user-friendly profiles
+        available_profiles = get_available_profiles(legacy_only=False, friendly_names=True)
+
+        # Convert current profile ID to display name for default
+        current_display_name = get_display_name_for_profile(current_series)
 
         options_schema = vol.Schema({
             vol.Required(
@@ -800,8 +907,8 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
             ): str,
             vol.Required(
                 CONF_INVERTER_SERIES,
-                default=current_series
-            ): vol.In(available_profiles),
+                default=current_display_name
+            ): vol.In(list(available_profiles.keys())),
             vol.Required(
                 "scan_interval",
                 default=current_scan_interval
@@ -816,8 +923,24 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
             ): vol.All(vol.Coerce(int), vol.Range(min=1, max=60)),
             vol.Required(
                 "invert_grid_power",
-                default=current_invert
+                default=current_invert_grid
             ): bool,
+            vol.Required(
+                "invert_battery_power",
+                default=current_invert_battery
+            ): bool,
+            vol.Required(
+                "battery_voltage_range",
+                default=current_bvr
+            ): vol.In([
+                "Auto-detect",
+                "Standard battery (under 600V)",
+                "High-voltage battery (600-950V, e.g. ARK)",
+            ]),
+            vol.Required(
+                "modbus_delay",
+                default=current_modbus_delay
+            ): vol.All(vol.Coerce(int), vol.Range(min=50, max=1000)),
         })
 
         return self.async_show_form(

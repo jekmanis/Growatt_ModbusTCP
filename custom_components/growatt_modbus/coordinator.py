@@ -10,6 +10,7 @@ from homeassistant.const import CONF_HOST, CONF_PORT, CONF_NAME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.event import async_track_time_change
+from homeassistant.helpers.storage import Store
 
 from .const import (
     DOMAIN,
@@ -18,6 +19,7 @@ from .const import (
     CONF_CONNECTION_TYPE,
     CONF_DEVICE_PATH,
     CONF_BAUDRATE,
+    CONF_INVERT_BATTERY_POWER,
     CONF_DEVICE_STRUCTURE_VERSION,
     CURRENT_DEVICE_STRUCTURE_VERSION,
     get_sensor_type,
@@ -141,6 +143,10 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         self._current_date = datetime.now().date()
         self._inverter_online = False
         self._just_came_online_time = None  # Timestamp when inverter came online (for debouncing)
+        # True once the inverter has responded at least once in this HA session.
+        # Used to distinguish a cold-start recovery (preserve storage-loaded daily retention)
+        # from a normal overnight recovery (clear retention to trigger stale-value debounce).
+        self._ever_had_real_data = False
 
         # Adaptive polling for offline inverters
         self._consecutive_failures = 0
@@ -148,6 +154,15 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         scan_interval = entry.options.get("scan_interval", 60)  # Default 60 seconds
         self._normal_update_interval = timedelta(seconds=scan_interval)
         self._offline_update_interval = timedelta(seconds=entry.options.get("offline_scan_interval", 300))  # 5 min default
+
+        # WIT Direct Control tracking (set by set_wit_mode service, read by mode status sensor)
+        self.wit_direct_mode: str | None = None
+        self.wit_direct_mode_power: int = 0
+        self.wit_direct_mode_duration: int = 0
+        self.wit_direct_mode_timestamp = None  # datetime or None
+        self.wit_direct_mode_source: str = ""
+        self.wit_direct_export_rate: int | None = None
+        self.wit_direct_ac_charge_mode: str | None = None
 
         super().__init__(
             hass,
@@ -162,10 +177,131 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         
         # Set up midnight callback for daily total resets
         self._setup_midnight_callback()
+
+        # Energy total retention — prevents total_increasing spikes from dormant-inverter zeros
+        self._retained_lifetime_totals: dict[str, float] = {}
+        self._retained_daily_totals: dict[str, float] = {}
+        _store_key = f"{DOMAIN}.{entry.entry_id}_energy_totals"
+        self._energy_store: Store = Store(hass, version=1, key=_store_key)
+
+        # Midnight grace window: set by _handle_midnight_reset() and checked in
+        # _protect_energy_totals() to suppress stale pre-reset values that the inverter
+        # reports before it clears its own daily counters (~30–90 s after HA midnight).
+        self._midnight_grace_expires: datetime | None = None
+
+        # Cloud override detection: tracks recently written register values
+        # Format: {register_address: (expected_value, write_timestamp, control_name)}
+        self._pending_write_checks: dict[int, tuple[int, float, str]] = {}
+        self._cloud_override_notified: bool = False  # Only notify once per session
+
+        # WIT: saves register 122 (export_limit_mode) before disabling control authority (30100=0).
+        # Disabling 30100 transiently resets reg 122 to 0; on older firmware it may not auto-restore.
+        self._saved_export_limit_mode_wit: int = 0
+
+        # Clock drift check: populated by _check_inverter_clock() (runs in executor) and
+        # delivered as a persistent notification by _async_update_data() on the event loop.
+        self._pending_clock_notification: dict | None = None
+
+    @property
+    def has_real_data(self) -> bool:
+        """True once the inverter has responded with real data at least once this session.
+
+        Platforms use this in deferred-entity listeners to know when coordinator.data
+        contains live hardware values rather than the empty GrowattData() placeholder
+        that is seeded by async_config_entry_first_refresh. (Issue #262)
+        """
+        return self._ever_had_real_data
+
     @property
     def modbus_client(self):
         """Expose the modbus client for write operations."""
         return self._client
+
+    def track_write(self, register: int, expected_value: int, control_name: str) -> None:
+        """Track a recently written register value for deferred cloud override detection.
+
+        Called by entity write methods after a successful write. On the next poll cycle,
+        _check_for_cloud_overrides() compares the tracked value against the fresh data.
+        """
+        import time as _time
+        self._pending_write_checks[register] = (expected_value, _time.time(), control_name)
+
+    async def _check_for_cloud_overrides(self, data) -> None:
+        """Check if any recently written register values have been overridden by the cloud."""
+        if not self._pending_write_checks:
+            return
+
+        import time as _time
+        current_time = _time.time()
+        to_remove = []
+        overridden_controls = []
+
+        for register, (expected_value, write_time, control_name) in self._pending_write_checks.items():
+            age = current_time - write_time
+
+            # Expire entries older than 120 seconds (roughly 2 poll cycles)
+            if age > 120:
+                to_remove.append(register)
+                continue
+
+            # Get current value from the freshly polled data
+            current_value = getattr(data, control_name, None)
+            if current_value is None:
+                continue
+
+            if int(current_value) == expected_value:
+                # Write stuck — remove from tracking
+                to_remove.append(register)
+            else:
+                # Value reverted — cloud override detected
+                overridden_controls.append((control_name, expected_value, int(current_value), age))
+                to_remove.append(register)
+
+        # Clean up tracked entries
+        for reg in to_remove:
+            self._pending_write_checks.pop(reg, None)
+
+        # Report overrides
+        if overridden_controls:
+            for control_name, expected, actual, age in overridden_controls:
+                _LOGGER.warning(
+                    "Write reversion detected: '%s' was set to %d but reverted to %d "
+                    "after %.0f seconds. Possible causes: ShineWiFi/cloud dongle overriding "
+                    "local writes; inverter firmware rejecting the value; or a prerequisite "
+                    "setting not enabled (e.g. Allow Grid Charge for MOD TOU).",
+                    control_name, expected, actual, age,
+                )
+
+            # Send persistent notification (once per session to avoid spam)
+            if not self._cloud_override_notified:
+                self._cloud_override_notified = True
+                affected = ", ".join(
+                    c[0].replace('_', ' ').title() for c in overridden_controls
+                )
+                try:
+                    await self.hass.services.async_call(
+                        "persistent_notification",
+                        "create",
+                        {
+                            "title": "Growatt: Write Reversion Detected",
+                            "message": (
+                                f"Local Modbus writes to **{affected}** were reverted shortly after being set.\n\n"
+                                f"**Common causes:**\n"
+                                f"- **ShineWiFi / ShineLink dongle** connected: the Growatt cloud server "
+                                f"may be restoring its own settings. Disconnect the dongle or disable "
+                                f"remote control in the ShinePhone/Growatt app.\n"
+                                f"- **Inverter firmware rejecting the value**: check that any prerequisite "
+                                f"settings are enabled (e.g. *Allow Grid Charge* must be Enabled before "
+                                f"MOD TOU schedules will persist).\n"
+                                f"- **Register read-only on this firmware**: the register may not be "
+                                f"writable on your specific model or firmware version — check the logs "
+                                f"for details and open an issue if the register should be writable."
+                            ),
+                            "notification_id": "growatt_cloud_override",
+                        },
+                    )
+                except Exception as err:
+                    _LOGGER.debug("Could not create persistent notification: %s", err)
 
     def _get_register_map(self) -> str:
         """Get register map with migration support."""
@@ -208,6 +344,9 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             # Get timeout from options (default 10 seconds)
             timeout = self.entry.options.get("timeout", 10)
 
+            # Get invert battery power option (separate from grid power inversion)
+            invert_battery_power = self.entry.options.get(CONF_INVERT_BATTERY_POWER, False)
+
             # Get connection type (default to tcp for backward compatibility)
             connection_type = self.config.get(CONF_CONNECTION_TYPE, "tcp")
 
@@ -219,10 +358,11 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                     port=self.config[CONF_PORT],
                     slave_id=self.config[CONF_SLAVE_ID],
                     register_map=register_map,
-                    timeout=timeout
+                    timeout=timeout,
+                    invert_battery_power=invert_battery_power
                 )
-                _LOGGER.debug("Initialized TCP Growatt client at %s:%s",
-                             self.config[CONF_HOST], self.config[CONF_PORT])
+                _LOGGER.debug("Initialized TCP Growatt client at %s:%s (invert_battery_power=%s)",
+                             self.config[CONF_HOST], self.config[CONF_PORT], invert_battery_power)
             else:  # serial
                 self._client = GrowattModbus(
                     connection_type="serial",
@@ -230,12 +370,37 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                     baudrate=self.config[CONF_BAUDRATE],
                     slave_id=self.config[CONF_SLAVE_ID],
                     register_map=register_map,
-                    timeout=timeout
+                    timeout=timeout,
+                    invert_battery_power=invert_battery_power
                 )
-                _LOGGER.debug("Initialized Serial Growatt client at %s @ %s baud",
-                             self.config[CONF_DEVICE_PATH], self.config[CONF_BAUDRATE])
+                _LOGGER.debug("Initialized Serial Growatt client at %s @ %s baud (invert_battery_power=%s)",
+                             self.config[CONF_DEVICE_PATH], self.config[CONF_BAUDRATE], invert_battery_power)
 
             _LOGGER.debug("Using register map: %s", register_map)
+
+            # Startup summary — INFO so it appears without debug logging enabled.
+            # Answers the most common support question ("why is my sensor missing?")
+            # without needing the diagnostic scanner.
+            profile = REGISTER_MAPS.get(register_map, {})
+            input_addrs = sorted(profile.get('input_registers', {}).keys())
+            profile_name = profile.get('name', register_map)
+            range_summary = self._summarise_register_ranges(input_addrs)
+
+            if connection_type == "tcp":
+                conn_summary = f"TCP {self.config[CONF_HOST]}:{self.config[CONF_PORT]}"
+            else:
+                conn_summary = f"Serial {self.config[CONF_DEVICE_PATH]}@{self.config[CONF_BAUDRATE]}"
+
+            _LOGGER.info(
+                "Growatt Modbus starting — profile: %s (%s) | connection: %s | "
+                "scan interval: %ds | polling %d input registers across %s",
+                profile_name,
+                register_map,
+                conn_summary,
+                int(self._normal_update_interval.total_seconds()),
+                len(input_addrs),
+                range_summary,
+            )
 
         except Exception as err:
             _LOGGER.error("Failed to initialize Growatt client: %s", err)
@@ -270,9 +435,28 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         
         # Update current date
         self._current_date = datetime.now().date()
-        
+
+        # Reset cloud override notification flag so it can fire again tomorrow
+        self._cloud_override_notified = False
+
+        # Clear daily total retention so new day starts fresh
+        self._retained_daily_totals = {}
+
+        # Open a grace window so _protect_energy_totals() can suppress the stale
+        # pre-reset values the inverter reports before it clears its own daily counters
+        # (typically 30–90 s after HA midnight on this hardware; allow 3 minutes).
+        self._midnight_grace_expires = datetime.now() + timedelta(minutes=10)
+        _LOGGER.debug(
+            "[ENERGY_GUARD] Midnight grace window open until %s — "
+            "stale pre-reset daily totals will be suppressed",
+            self._midnight_grace_expires.strftime("%H:%M:%S"),
+        )
+
+        # Persist cleared daily totals (lifetime totals carry over)
+        await self._async_save_energy_totals()
+
         _LOGGER.debug("Previous day totals stored: %s", self._previous_day_totals)
-        
+
         # If inverter is offline, zero out the daily totals now
         if not self._inverter_online and self.data is not None:
             _LOGGER.debug("Inverter offline at midnight - resetting daily totals to 0")
@@ -281,7 +465,12 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             self.data.energy_to_grid_today = 0
             self.data.load_energy_today = 0
             self.data.energy_to_user_today = 0
-            
+            self.data.charge_energy_today = 0
+            self.data.discharge_energy_today = 0
+            self.data.ac_charge_energy_today = 0
+            self.data.ac_discharge_energy_today = 0
+            self.data.op_discharge_energy_today = 0
+
             # Trigger update to notify sensors
             self.async_set_updated_data(self.data)
 
@@ -309,25 +498,183 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         sensor_type = get_sensor_type(sensor_key)
         offline_behavior = SENSOR_OFFLINE_BEHAVIOR.get(sensor_type)
         
-        if offline_behavior == 0:
-            # Power sensors go to 0
-            return 0
-        elif offline_behavior == 'retain':
-            # Daily and lifetime totals retain last value
-            return raw_value
-        elif offline_behavior == None:
-            # Diagnostic sensors go unavailable
+        if offline_behavior is None:
+            # Sensor goes unavailable (power, diagnostic, energy totals)
             return None
+        elif offline_behavior == 'retain':
+            # Retain last value
+            return raw_value
         elif offline_behavior == 'offline':
             # Status sensors show offline
             return 'offline'
         
         return raw_value
 
+    def _compute_wit_mode_status(self, data) -> None:
+        """Compute effective WIT mode from control register states."""
+        remote_enable = getattr(data, 'remote_power_control_enable', 0)
+        power_raw = getattr(data, 'remote_charge_and_discharge_power', 0)
+        export_enable = getattr(data, 'vpp_export_limit_enable', 0)
+        export_rate = getattr(data, 'vpp_export_limit_power_rate', 0)
+        ac_charge = getattr(data, 'vpp_ac_charge_enable', 0)
+
+        # Decode signed power (two's complement)
+        if power_raw > 32767:
+            power_signed = power_raw - 65536
+        else:
+            power_signed = power_raw
+
+        data.wit_mode_override_active = bool(remote_enable)
+        data.wit_mode_ac_charge = ac_charge
+
+        # Determine export rate
+        if export_enable:
+            data.wit_mode_export_rate = export_rate
+        else:
+            data.wit_mode_export_rate = 100  # No limiter = full export
+
+        if not remote_enable:
+            # No remote override active — this is Passthrough
+            # (Preserve SOC now uses 30407=1 with 30409=1, so it won't hit this branch)
+            data.wit_mode_status = "Passthrough"
+            data.wit_mode_power_percent = 0
+        elif power_signed > 1:
+            data.wit_mode_status = "Grid Charge"
+            data.wit_mode_power_percent = power_signed
+        elif power_signed in (0, 1):
+            data.wit_mode_status = "Preserve SOC"
+            data.wit_mode_power_percent = 0
+        elif power_signed < 0:
+            export_allowed = (not export_enable) or (export_rate > 0)
+            if export_allowed and abs(power_signed) == 100:
+                data.wit_mode_status = "Max Export"
+            elif export_allowed:
+                data.wit_mode_status = "Discharge to Grid"
+            else:
+                data.wit_mode_status = "Discharge to Load"
+            data.wit_mode_power_percent = abs(power_signed)
+        else:
+            data.wit_mode_status = "Passthrough"
+            data.wit_mode_power_percent = 0
+
     @property
     def is_online(self) -> bool:
         """Return whether the inverter is currently online."""
         return self._inverter_online
+
+    def _protect_energy_totals(self, data) -> bool:
+        """Prevent total_increasing sensors from dropping to 0 on dormant inverters.
+
+        Some inverters respond to Modbus at night but return 0 for all registers.
+        A lifetime total dropping from e.g. 5000 kWh to 0 causes HA's
+        total_increasing to record a phantom counter reset, spiking the
+        energy dashboard.
+
+        Retention is internal — when the inverter is truly offline,
+        available=False on the sensor entity handles it instead.
+        """
+        from .const import LIFETIME_TOTAL_ATTRS, DAILY_TOTAL_ATTRS
+
+        _updated = False
+
+        # Lifetime totals: only block drops to exactly 0
+        for attr in LIFETIME_TOTAL_ATTRS:
+            value = getattr(data, attr, 0)
+            retained = self._retained_lifetime_totals.get(attr)
+
+            if value > 0:
+                # Real value — update retention if changed
+                if self._retained_lifetime_totals.get(attr) != value:
+                    self._retained_lifetime_totals[attr] = value
+                    _updated = True
+            elif retained is not None and retained > 0:
+                # Value dropped to 0 but we had a real value — dormant inverter
+                _LOGGER.debug(
+                    "Retaining %s=%.2f (hardware reported 0, likely dormant)",
+                    attr, retained
+                )
+                setattr(data, attr, retained)
+
+        # Daily totals: same logic, but retention clears at midnight.
+        # Spike guard: the inverter writes 32-bit register pairs (high word, then low
+        # word) separately.  During the midnight daily-counter reset, the two words
+        # can be read in an inconsistent state, producing a transient garbage value
+        # (e.g. 79 kWh when the real value should be near 0).  Any daily-counter jump
+        # larger than _SPIKE_THRESHOLD_KWH in a single poll is rejected as a glitch.
+        _SPIKE_THRESHOLD_KWH = 20.0  # safe upper bound for any poll interval / system size
+
+        # Expire the midnight grace window once the time has passed (self-cleaning).
+        if self._midnight_grace_expires and datetime.now() >= self._midnight_grace_expires:
+            self._midnight_grace_expires = None
+            _LOGGER.debug("[ENERGY_GUARD] Midnight grace window expired — normal operation resumed")
+
+        for attr in DAILY_TOTAL_ATTRS:
+            value = getattr(data, attr, 0)
+            retained = self._retained_daily_totals.get(attr)
+
+            if value > 0:
+                # Spike guard — reject implausible jumps
+                _spike = False
+                if retained is None:
+                    # First reading after midnight clear (or inverter just came online).
+                    if self._midnight_grace_expires:
+                        # Grace window is active: the inverter has not yet reset its own
+                        # daily counters (typically happens 30–90 s after HA midnight).
+                        # Any non-zero value here is yesterday's stale data — force it to
+                        # 0 in the output and leave retention unset so the first genuine
+                        # new-day reading is accepted cleanly once the window expires.
+                        _LOGGER.debug(
+                            "[ENERGY_GUARD] Midnight grace: suppressing stale %s=%.3f kWh "
+                            "(inverter has not yet reset its daily counters)",
+                            attr, value,
+                        )
+                        setattr(data, attr, 0)
+                        continue  # Do not update retention
+                    # Grace expired — normal spike guard: morning readings should be near 0.
+                    if value > _SPIKE_THRESHOLD_KWH:
+                        _spike = True
+                elif value - retained > _SPIKE_THRESHOLD_KWH:
+                    # Value jumped far more than any real system can accumulate in one poll.
+                    _spike = True
+
+                if _spike:
+                    _LOGGER.warning(
+                        "[ENERGY_GUARD] Daily total spike rejected for %s: %.3f kWh "
+                        "(retained=%.3f kWh, delta=%.3f kWh, threshold=%.1f kWh) — "
+                        "likely register glitch during startup or midnight reset",
+                        attr, value,
+                        retained if retained is not None else 0.0,
+                        value - (retained if retained is not None else 0.0),
+                        _SPIKE_THRESHOLD_KWH,
+                    )
+                    # Leave retention unchanged — do not persist the garbage value.
+                    # The next legitimate reading (near 0 after the inverter settles)
+                    # will be accepted normally.
+                else:
+                    if self._retained_daily_totals.get(attr) != value:
+                        _LOGGER.debug(
+                            "[ENERGY_GUARD] Accepted %s: %.3f kWh (was retained=%.3f kWh, delta=%.3f kWh)",
+                            attr, value,
+                            retained if retained is not None else 0.0,
+                            value - (retained if retained is not None else 0.0),
+                        )
+                        self._retained_daily_totals[attr] = value
+                        _updated = True
+            elif retained is not None and retained > 0:
+                _LOGGER.debug(
+                    "[ENERGY_GUARD] Retaining %s=%.3f kWh (hardware reported 0 — dormant or startup reset)",
+                    attr, retained,
+                )
+                setattr(data, attr, retained)
+            else:
+                # value=0, no retention — log only for the key grid import sensor to avoid noise
+                if attr == 'energy_to_user_today':
+                    _LOGGER.debug(
+                        "[ENERGY_GUARD] %s: hardware=0, no retention — sensor will read 0",
+                        attr,
+                    )
+
+        return _updated
 
     async def _async_update_data(self) -> GrowattData:
         """Fetch data from the Growatt inverter."""
@@ -340,8 +687,15 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
 
             if data is None:
                 # Inverter not responding (probably night time or powered off)
+                was_online = self._inverter_online
                 self._inverter_online = False
                 self._consecutive_failures += 1
+
+                # Log once on first transition (log-when-unavailable rule)
+                if was_online:
+                    _LOGGER.info(
+                        "Inverter unavailable — entities will show unavailable until the inverter responds"
+                    )
 
                 # Adaptive polling: slow down after repeated failures
                 if self._consecutive_failures == self._failure_threshold:
@@ -359,25 +713,45 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                             self._consecutive_failures
                         )
 
-                if self.data is not None:
-                    _LOGGER.debug("Inverter offline - applying smart offline behavior")
+                if self.data is None:
+                    # First startup with inverter offline — create empty placeholder so the
+                    # integration loads successfully. Regular polling will connect when the
+                    # inverter comes back online. Sensors will show unavailable until then.
+                    # (Issue #255: previously raised UpdateFailed → ConfigEntryNotReady which
+                    # could require manual reload if HA exhausted its retry budget.)
+                    _LOGGER.warning(
+                        "Inverter unreachable at startup — integration loading with empty state. "
+                        "Sensors will be unavailable until the inverter responds."
+                    )
+                    from .growatt_modbus import GrowattData
+                    self.data = GrowattData()
 
-                    # Check if we crossed midnight while offline
-                    current_date = datetime.now().date()
-                    if current_date > self._current_date:
-                        _LOGGER.debug("Date changed while inverter offline - resetting daily totals")
-                        # Reset daily totals to 0
-                        self.data.energy_today = 0
-                        self.data.energy_to_grid_today = 0
-                        self.data.load_energy_today = 0
-                        self.data.energy_to_user_today = 0
-                        self._current_date = current_date
+                _LOGGER.debug("Inverter offline - applying smart offline behavior")
 
-                    # Return existing data (sensors will apply offline behavior via get_sensor_value)
-                    return self.data
-                else:
-                    # First connection attempt failed
-                    raise UpdateFailed("Failed to read data from inverter")
+                # Check if we crossed midnight while offline
+                current_date = datetime.now().date()
+                if current_date > self._current_date:
+                    _LOGGER.debug(
+                        "[ENERGY_GUARD] Date changed while inverter offline (%s → %s) — "
+                        "resetting daily totals and clearing retention",
+                        self._current_date, current_date,
+                    )
+                    # Reset daily totals to 0
+                    self.data.energy_today = 0
+                    self.data.energy_to_grid_today = 0
+                    self.data.load_energy_today = 0
+                    self.data.energy_to_user_today = 0
+                    self.data.charge_energy_today = 0
+                    self.data.discharge_energy_today = 0
+                    self.data.ac_charge_energy_today = 0
+                    self.data.ac_discharge_energy_today = 0
+                    self.data.op_discharge_energy_today = 0
+                    self._current_date = current_date
+                    # Clear daily retention for new day
+                    self._retained_daily_totals = {}
+
+                # Return existing data (sensors will apply offline behavior via get_sensor_value)
+                return self.data
 
             # Inverter is responding!
             was_offline = not self._inverter_online
@@ -399,14 +773,69 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             self.last_update_success_time = datetime.now(tz.utc)
             self._last_successful_read = datetime.now()
 
-            # Check for date transition (inverter came back online on new day)
+            # Check for date transition and stale daily total debouncing (Issue #225)
             current_date = datetime.now().date()
             current_time = datetime.now()
 
-            if was_offline and current_date > self._current_date:
-                _LOGGER.info("Inverter woke up on new day - enabling daily total debouncing")
-                self._current_date = current_date
-                self._just_came_online_time = current_time
+            if was_offline:
+                # Inverter came back online after being offline.
+                if current_date > self._current_date:
+                    self._current_date = current_date
+
+                if self._ever_had_real_data:
+                    # Normal overnight/transient recovery: HA has been running continuously so
+                    # _previous_day_totals holds the actual yesterday total. For morning wakeups,
+                    # clear daily retention so the stale-value debounce can detect and reset values
+                    # that the inverter hasn't cleared yet. _protect_energy_totals would otherwise
+                    # preserve them and block the hardware's own midnight reset (Issue #225).
+                    # For mid-day wakeups (brief offline events), retention is kept intact so
+                    # ENERGY_GUARD continues protecting against transient 0-reads from the inverter
+                    # restarting its counters mid-poll (Issue #284). _handle_midnight_reset() already
+                    # clears retention at midnight, so the morning case is covered regardless.
+                    hours_since_midnight = (current_time.hour * 60 + current_time.minute) / 60
+                    is_morning_wakeup = hours_since_midnight < 10
+                    _LOGGER.info(
+                        "Inverter back online - %s",
+                        "enabling daily total debouncing (morning wakeup)" if is_morning_wakeup
+                        else "mid-day wakeup, retention preserved to protect against transient 0-reads"
+                    )
+                    if is_morning_wakeup:
+                        if self._retained_daily_totals:
+                            _LOGGER.debug(
+                                "[ENERGY_GUARD] Clearing daily retention on morning wake-up (%d values). "
+                                "energy_to_user_today was %.3f kWh, energy_today was %.3f kWh. "
+                                "Hardware will now determine new values; spike guard remains active.",
+                                len(self._retained_daily_totals),
+                                self._retained_daily_totals.get('energy_to_user_today', 0.0),
+                                self._retained_daily_totals.get('energy_today', 0.0),
+                            )
+                        self._retained_daily_totals = {}
+                    else:
+                        _LOGGER.debug(
+                            "[ENERGY_GUARD] Mid-day wakeup (%.1fh since midnight) — "
+                            "retention kept (%d values) to protect against transient 0-reads.",
+                            hours_since_midnight,
+                            len(self._retained_daily_totals),
+                        )
+                    self._just_came_online_time = current_time
+                else:
+                    # Cold-start recovery: integration just loaded (HA restart or config entry
+                    # reload). _previous_day_totals is always empty here because it is never
+                    # persisted — only populated at midnight during a live session. Stale
+                    # detection cannot work without a real yesterday reference and produces only
+                    # false-positives (e.g. small legitimate morning values < 0.1 kWh, or large
+                    # mid-day values on big systems exceeding the 2 kWh/h rate heuristic).
+                    # Storage-loaded retention in _retained_daily_totals already protects against
+                    # inverter glitches returning 0, so stale detection is both redundant and
+                    # harmful here.
+                    _LOGGER.debug(
+                        "Cold-start recovery — preserving storage-loaded daily retention (%d values), "
+                        "skipping stale-value debounce (no yesterday totals available)",
+                        len(self._retained_daily_totals)
+                    )
+                    # Do NOT set _just_came_online_time — leaves debounce window disabled.
+
+                self._ever_had_real_data = True
 
             # Debounce stale daily totals for a window after wake-up
             # Many inverters report yesterday's values from volatile memory before resetting
@@ -425,38 +854,83 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 is_stale = (abs(energy_today - yesterday_energy) < tolerance and energy_today > 0) or \
                           (energy_today > max_expected_early and energy_today > 1.0)
 
+                _mins_since_wake = (current_time - self._just_came_online_time).total_seconds() / 60
                 if is_stale:
                     _LOGGER.warning(
-                        "Detected stale daily total in debounce window (%.1f min since wake-up): "
-                        "energy_today=%.2f kWh (yesterday: %.2f kWh, max expected: %.2f kWh) - resetting to 0",
-                        (current_time - self._just_came_online_time).total_seconds() / 60,
-                        energy_today, yesterday_energy, max_expected_early
+                        "[ENERGY_GUARD] Stale daily totals detected in debounce window "
+                        "(%.1f min since wake-up): energy_today=%.3f kWh "
+                        "(yesterday=%.3f kWh, max_expected=%.3f kWh, hours_since_midnight=%.2f) — "
+                        "resetting all daily totals to 0",
+                        _mins_since_wake,
+                        energy_today, yesterday_energy, max_expected_early, hours_since_midnight,
                     )
                     # Reset stale daily totals to zero
                     data.energy_today = 0
                     data.energy_to_grid_today = 0
                     data.load_energy_today = 0
                     data.energy_to_user_today = 0
-                    data.battery_charge_today = 0
-                    data.battery_discharge_today = 0
+                    data.charge_energy_today = 0
+                    data.discharge_energy_today = 0
                     data.grid_energy_today = 0
                     data.grid_import_energy_today = 0
+                    # Clear retention so _protect_energy_totals doesn't undo this reset
+                    self._retained_daily_totals = {}
                 else:
                     _LOGGER.debug(
-                        "Daily totals look valid: energy_today=%.2f kWh (yesterday: %.2f kWh, hours since midnight: %.1f)",
-                        energy_today, yesterday_energy, hours_since_midnight
+                        "[ENERGY_GUARD] Debounce window active (%.1f min since wake-up): "
+                        "energy_today=%.3f kWh (yesterday=%.3f kWh, max_expected=%.3f kWh, "
+                        "hours_since_midnight=%.2f) — energy_to_user_today=%.3f kWh — "
+                        "values accepted as valid",
+                        _mins_since_wake,
+                        energy_today, yesterday_energy, max_expected_early, hours_since_midnight,
+                        getattr(data, 'energy_to_user_today', 0.0),
                     )
             elif self._just_came_online_time:
                 # Debounce window expired
                 _LOGGER.debug("Debounce window expired - normal operation resumed")
                 self._just_came_online_time = None
 
+            # Check for cloud overrides on recently written registers
+            await self._check_for_cloud_overrides(data)
+
+            # Deliver pending clock-drift notification (populated by _check_inverter_clock
+            # on the first successful poll; cleared immediately so it only fires once).
+            if self._pending_clock_notification:
+                notif = self._pending_clock_notification
+                self._pending_clock_notification = None
+                try:
+                    await self.hass.services.async_call(
+                        "persistent_notification", "create", notif
+                    )
+                except Exception as err:
+                    _LOGGER.debug("Could not create clock drift notification: %s", err)
+
+            # Protect energy totals from dormant-inverter zeros; persist immediately
+            # so a HA restart between polls doesn't cause a backward step (Issue #285).
+            if self._protect_energy_totals(data):
+                await self._async_save_energy_totals()
+
+            # Compute WIT mode status from control registers (WIT profiles only)
+            if "WIT" in self._register_map_key.upper():
+                self._compute_wit_mode_status(data)
+                # Clear optimistic preset so polled register state takes over
+                if hasattr(self, 'wit_mode_preset_last'):
+                    self.wit_mode_preset_last = None
+
             return data
 
         except Exception as err:
-            _LOGGER.error("Error fetching data from Growatt inverter: %s", err)
+            was_online = self._inverter_online
             self._inverter_online = False
             self._consecutive_failures += 1
+
+            # Log once on first transition (log-when-unavailable rule); subsequent failures at debug
+            if was_online:
+                _LOGGER.info(
+                    "Inverter unavailable (error: %s) — entities will show unavailable until the inverter responds", err
+                )
+            else:
+                _LOGGER.debug("Error fetching data from Growatt inverter: %s", err)
 
             # Adaptive polling: slow down after repeated failures
             if self._consecutive_failures == self._failure_threshold:
@@ -471,28 +945,62 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             if self.data is not None:
                 _LOGGER.debug("Error fetching data, keeping last known data with offline behavior")
                 return self.data
-            raise UpdateFailed(f"Error communicating with inverter: {err}")
+            # First startup with an exception — create placeholder instead of failing setup.
+            # Without this, CancelledError (bootstrap timeout) or ConfigEntryNotReady would
+            # prevent the integration loading until the inverter comes online. (Issue #255)
+            _LOGGER.info(
+                "Inverter unreachable at startup — integration loading with empty state. "
+                "Sensors will be unavailable until the inverter responds."
+            )
+            self.data = GrowattData()
+            return self.data
 
     def _fetch_data(self) -> GrowattData | None:
         """Fetch data from the inverter (runs in executor)."""
         max_retries = 3
         retry_delay = 3  # seconds - increased from 2
-        
+
         for attempt in range(max_retries):
             try:
+                # Ensure clean state before connecting - always disconnect first
+                # This prevents file descriptor leaks from failed connection attempts
+                try:
+                    self._client.disconnect()
+                except Exception as err:
+                    _LOGGER.debug("Disconnect before connect raised exception (safe to ignore): %s", err)
+
                 if not self._client.connect():
                     _LOGGER.warning(
-                        "Failed to connect to Growatt inverter (attempt %d/%d)", 
+                        "Failed to connect to Growatt inverter (attempt %d/%d)",
                         attempt + 1, max_retries
                     )
+                    # CRITICAL: Always disconnect after failed connect to release serial port/socket
+                    try:
+                        self._client.disconnect()
+                    except Exception as err:
+                        _LOGGER.debug("Disconnect after failed connect raised exception: %s", err)
+
                     if attempt < max_retries - 1:
                         time.sleep(retry_delay)  # constant delay, not exponential
                         continue
-                    _LOGGER.error("All connection attempts failed")
+                    _LOGGER.debug("All connection attempts failed")
                     return None
-                    
+
+                self._client._battery_voltage_range = self.config_entry.options.get(
+                    "battery_voltage_range", "Auto-detect"
+                )
+                delay_s = self.config_entry.options.get("modbus_delay", 250) / 1000.0
+                self._client._default_min_read_interval = delay_s
+                if not self._client._backed_off:
+                    self._client.min_read_interval = delay_s
                 data = self._client.read_all_data()
                 if data is not None:  # Success!
+                    # Lazily read device identification on the first successful connection.
+                    # Previously called during async_config_entry_first_refresh, but that
+                    # blocked the HA bootstrap executor and triggered a CancelledError on
+                    # slow/offline inverters. Called here while the connection is still open.
+                    if not self._serial_number:
+                        self._read_device_identification()
                     self._client.disconnect()
                     return data
 
@@ -500,47 +1008,103 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 _LOGGER.warning("Read returned None (attempt %d/%d)", attempt + 1, max_retries)
                 try:
                     self._client.disconnect()
-                except:
-                    pass
+                except Exception as err:
+                    _LOGGER.debug("Disconnect after failed read raised exception: %s", err)
+
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
                     continue
-                    
+
             except Exception as err:
                 _LOGGER.warning(
-                    "Error during data fetch (attempt %d/%d): %s", 
+                    "Error during data fetch (attempt %d/%d): %s",
                     attempt + 1, max_retries, err
                 )
                 if self._client:
                     try:
                         self._client.disconnect()
-                    except:
-                        pass
-                
+                    except Exception as disconnect_err:
+                        _LOGGER.debug("Disconnect after exception raised error: %s", disconnect_err)
+
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
                 else:
-                    _LOGGER.error("All fetch attempts failed after %d retries", max_retries)
+                    _LOGGER.debug("All fetch attempts failed after %d retries", max_retries)
                     return None
-        
+
         # Final disconnect if we get here
         try:
             self._client.disconnect()
-        except:
-            pass
+        except Exception as err:
+            _LOGGER.debug("Final disconnect raised exception: %s", err)
         return None
 
     async def async_config_entry_first_refresh(self) -> None:
-        """Perform first refresh and handle setup errors."""
-        try:
-            # Read device identification before first data refresh
-            await self.hass.async_add_executor_job(self._read_device_identification)
-            
-            await super().async_config_entry_first_refresh()
-        except UpdateFailed as err:
-            _LOGGER.error("Initial setup failed: %s", err)
-            raise
+        """Load integration immediately without blocking on inverter connectivity.
+
+        The default DataUpdateCoordinator implementation calls _async_update_data()
+        which runs _fetch_data() in an executor — up to 3 TCP retries, each waiting
+        for a connection timeout. During HA's bootstrap stage 2 this can exceed the
+        global task timeout (CancelledError) and cancel integration setup entirely.
+
+        Instead: restore persisted energy totals (fast, local storage only), set an
+        empty GrowattData placeholder, and let the regular poll schedule handle the
+        first real inverter read. All sensors show unavailable until then.
+
+        Device identification (serial, firmware, model) is read lazily on the first
+        successful poll inside _fetch_data when _serial_number is still empty.
+        """
+        # Restore persisted energy totals (local storage only — never blocks on network)
+        await self._async_load_energy_totals()
+
+        # Seed coordinator state so HA considers the entry loaded
+        self.data = GrowattData()
+        self.last_update_success = True
+
+        # Schedule an immediate background poll so sensors populate right away
+        # instead of waiting a full scan interval.  This runs after setup returns
+        # so it cannot block HA's bootstrap stage-2 task timeout (Issue #262).
+        self.hass.async_create_task(
+            self.async_refresh(),
+            name="growatt_modbus_initial_refresh",
+        )
+        _LOGGER.debug("Growatt Modbus: integration setup complete — immediate background poll scheduled.")
     
+    async def _async_load_energy_totals(self) -> None:
+        """Load persisted energy totals from HA storage."""
+        try:
+            stored = await self._energy_store.async_load()
+            if stored is None:
+                _LOGGER.debug("No persisted energy totals found (first run or storage cleared)")
+                return
+            # Lifetime totals: always restore (monotone increasing, never legitimately 0)
+            for attr, value in stored.get("lifetime_totals", {}).items():
+                if isinstance(value, (int, float)) and value > 0:
+                    self._retained_lifetime_totals[attr] = float(value)
+            # Daily totals: only restore if saved today
+            today_str = datetime.now().date().isoformat()
+            if stored.get("daily_totals_date") == today_str:
+                for attr, value in stored.get("daily_totals", {}).items():
+                    if isinstance(value, (int, float)) and value > 0:
+                        self._retained_daily_totals[attr] = float(value)
+            _LOGGER.debug(
+                "Restored %d lifetime totals, %d daily totals from storage",
+                len(self._retained_lifetime_totals), len(self._retained_daily_totals),
+            )
+        except Exception as err:
+            _LOGGER.warning("Failed to load persisted energy totals (non-fatal): %s", err)
+
+    async def _async_save_energy_totals(self) -> None:
+        """Save energy retention dicts to HA storage."""
+        try:
+            await self._energy_store.async_save({
+                "lifetime_totals": dict(self._retained_lifetime_totals),
+                "daily_totals": dict(self._retained_daily_totals),
+                "daily_totals_date": datetime.now().date().isoformat(),
+            })
+        except Exception as err:
+            _LOGGER.debug("Failed to save energy totals: %s", err)
+
     def _read_device_identification(self):
         """Read device identification info (serial, firmware, inverter type)."""
         try:
@@ -639,8 +1203,126 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                     _LOGGER.debug(f"Could not read protocol version (73): {e}")
                     self._protocol_version = "OffGrid Modbus"
 
+            # Consolidated identification summary — replaces scattered debug lines
+            # with one INFO-level line visible in the default HA log.
+            _LOGGER.info(
+                "Inverter identified — model: %s | serial: %s | firmware: %s | %s",
+                self._model_name or "unknown",
+                self._serial_number or "unknown",
+                self._firmware_version or "unknown",
+                self._protocol_version or "unknown",
+            )
+
+            # Check inverter clock drift (stores notification if drift > threshold)
+            self._check_inverter_clock(profile)
+
         except Exception as e:
             _LOGGER.error(f"Error reading device identification: {e}")
+
+    def _check_inverter_clock(self, profile: dict) -> None:
+        """Read inverter system time registers and compare to HA clock.
+
+        If the drift exceeds _CLOCK_DRIFT_THRESHOLD_S, stores a dict in
+        self._pending_clock_notification so that _async_update_data() can
+        deliver a persistent HA notification on the event loop.
+
+        Runs in the executor thread (called from _read_device_identification).
+        Notification delivery MUST happen back on the event loop — do not call
+        hass.services.async_call() directly from here.
+
+        Register layout:
+          VPP 2.01  — holding 30104–30109  [Year(2-digit), Month, Day, Hour, Min, Sec]
+          V1.39/SPF — holding 45–50        [Year(2-digit), Month, Day, Hour, Min, Sec]
+        """
+        _CLOCK_DRIFT_THRESHOLD_S = 300  # 5 minutes
+
+        is_vpp = (
+            self._protocol_version is not None
+            and self._protocol_version.startswith("Protocol ")
+            and self._protocol_version != "Protocol Legacy"
+        )
+
+        try:
+            if is_vpp:
+                result = self._client.client.read_holding_registers(
+                    address=30104, count=6, device_id=self._slave_id
+                )
+            else:
+                result = self._client.client.read_holding_registers(
+                    address=45, count=6, device_id=self._slave_id
+                )
+
+            if result.isError() or len(result.registers) < 6:
+                _LOGGER.debug(
+                    "Inverter clock registers not readable (protocol: %s)",
+                    self._protocol_version,
+                )
+                return
+
+            raw = result.registers  # [Year, Month, Day, Hour, Minute, Second]
+            year = raw[0] + 2000 if raw[0] < 100 else raw[0]
+            month, day, hour, minute, second = raw[1], raw[2], raw[3], raw[4], raw[5]
+
+            try:
+                inverter_dt = datetime(year, month, day, hour, minute, second)
+            except ValueError:
+                _LOGGER.debug("Inverter clock returned invalid values: %s", raw)
+                return
+
+            ha_dt = datetime.now()
+            drift_s = (inverter_dt - ha_dt).total_seconds()
+            drift_abs = abs(drift_s)
+
+            _LOGGER.info(
+                "Inverter clock: %s | HA clock: %s | drift: %+.0f s",
+                inverter_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                ha_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                drift_s,
+            )
+
+            if drift_abs > _CLOCK_DRIFT_THRESHOLD_S:
+                drift_min = drift_s / 60
+                direction = "ahead of" if drift_s > 0 else "behind"
+                self._pending_clock_notification = {
+                    "title": "Growatt: Inverter Clock Drift Detected",
+                    "message": (
+                        f"The inverter's internal clock is **{abs(drift_min):.1f} minutes {direction}** "
+                        f"Home Assistant time.\n\n"
+                        f"**Inverter time:** {inverter_dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"**HA time:** {ha_dt.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                        f"**Why this matters:** The inverter resets its daily energy counters "
+                        f"at its own midnight, not HA midnight. A large clock offset causes daily "
+                        f"energy sensors to reset at the wrong time, which can produce incorrect "
+                        f"daily totals and confuse the energy dashboard.\n\n"
+                        f"**To fix:** Set the correct time on the inverter via the ShinePhone app, "
+                        f"the inverter LCD menu, or the Growatt web portal."
+                    ),
+                    "notification_id": "growatt_clock_drift",
+                }
+
+        except Exception as err:
+            _LOGGER.debug("Could not check inverter clock: %s", err)
+
+    @staticmethod
+    def _summarise_register_ranges(addresses: list) -> str:
+        """Compact string of polled register ranges, e.g. '0–124, 1000–1124, 31000–31199'.
+
+        Addresses within 100 of each other are merged into one range.
+        Used in the startup log so support questions can be answered without
+        running the diagnostic scanner.
+        """
+        if not addresses:
+            return "none"
+        sorted_addrs = sorted(addresses)
+        ranges = []
+        start = prev = sorted_addrs[0]
+        for addr in sorted_addrs[1:]:
+            if addr - prev > 100:
+                ranges.append(f"{start}–{prev}" if start != prev else str(start))
+                start = addr
+            prev = addr
+        ranges.append(f"{start}–{prev}" if start != prev else str(start))
+        return ", ".join(ranges)
 
     def _registers_to_ascii(self, registers):
         """Convert list of 16-bit registers to ASCII string."""
@@ -790,8 +1472,3 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
 
         # Default to inverter for unknown device types
         return self.get_device_info(DEVICE_TYPE_INVERTER)
-
-    @property
-    def modbus_client(self):
-        """Expose the modbus client for write operations."""
-        return self._client

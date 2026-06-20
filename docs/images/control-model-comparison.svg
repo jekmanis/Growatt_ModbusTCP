@@ -1,0 +1,122 @@
+<svg viewBox="0 0 900 380" xmlns="http://www.w3.org/2000/svg" font-family="'Segoe UI', Arial, sans-serif" font-size="12">
+  <defs>
+    <style>
+      .head   { font-size:14px; font-weight:bold; fill:#1a1a1a; }
+      .col    { font-size:13px; font-weight:bold; }
+      .row    { font-size:11px; fill:#333; }
+      .yes    { fill:#388e3c; font-size:11px; font-weight:bold; }
+      .no     { fill:#c62828; font-size:11px; font-weight:bold; }
+      .part   { fill:#e65100; font-size:11px; font-weight:bold; }
+      .hdr    { fill:#37474f; }
+      .shade  { fill:#f5f5f5; }
+    </style>
+  </defs>
+
+  <text x="450" y="24" text-anchor="middle" class="head">Control Model Comparison by Inverter Family</text>
+
+  <!-- Column headers -->
+  <rect x="20"  y="36" width="220" height="32" rx="0" fill="#37474f"/>
+  <rect x="244" y="36" width="150" height="32" rx="0" fill="#1976d2"/>
+  <rect x="398" y="36" width="150" height="32" rx="0" fill="#388e3c"/>
+  <rect x="552" y="36" width="150" height="32" rx="0" fill="#7b1fa2"/>
+  <rect x="706" y="36" width="174" height="32" rx="0" fill="#e65100"/>
+
+  <text x="130" y="57" text-anchor="middle" class="col" fill="#fff">Feature</text>
+  <text x="319" y="57" text-anchor="middle" class="col" fill="#fff">MOD GEN4</text>
+  <text x="473" y="57" text-anchor="middle" class="col" fill="#fff">SPH GEN3</text>
+  <text x="627" y="57" text-anchor="middle" class="col" fill="#fff">WIT TL3</text>
+  <text x="793" y="57" text-anchor="middle" class="col" fill="#fff">SPF Off-Grid</text>
+
+  <!-- Row definitions: [y, shade, feature, MOD, SPH, WIT, SPF] -->
+  <!-- Row 1 -->
+  <rect x="20"  y="68" width="860" height="26" fill="#fafafa"/>
+  <text x="30"  y="85" class="row">TOU schedule control</text>
+  <text x="319" y="85" text-anchor="middle" class="yes">9 slots</text>
+  <text x="473" y="85" text-anchor="middle" class="part">3 slots (AC charge)</text>
+  <text x="627" y="85" text-anchor="middle" class="no">Read-only</text>
+  <text x="793" y="85" text-anchor="middle" class="no">No TOU</text>
+
+  <!-- Row 2 -->
+  <rect x="20"  y="94" width="860" height="26" class="shade"/>
+  <text x="30"  y="111" class="row">Persistent mode changes</text>
+  <text x="319" y="111" text-anchor="middle" class="yes">Yes</text>
+  <text x="473" y="111" text-anchor="middle" class="yes">Yes</text>
+  <text x="627" y="111" text-anchor="middle" class="no">No (timed only)</text>
+  <text x="793" y="111" text-anchor="middle" class="yes">Yes</text>
+
+  <!-- Row 3 -->
+  <rect x="20"  y="120" width="860" height="26" fill="#fafafa"/>
+  <text x="30"  y="137" class="row">Per-slot priority (Load/Battery/Grid)</text>
+  <text x="319" y="137" text-anchor="middle" class="yes">Yes (9 slots)</text>
+  <text x="473" y="137" text-anchor="middle" class="no">Global only</text>
+  <text x="627" y="137" text-anchor="middle" class="no">N/A</text>
+  <text x="793" y="137" text-anchor="middle" class="no">N/A</text>
+
+  <!-- Row 4 -->
+  <rect x="20"  y="146" width="860" height="26" class="shade"/>
+  <text x="30"  y="163" class="row">Prerequisite gate required</text>
+  <text x="319" y="163" text-anchor="middle" fill="#b71c1c" font-weight="bold" font-size="11">3049 = Enabled</text>
+  <text x="473" y="163" text-anchor="middle" class="yes">None</text>
+  <text x="627" y="163" text-anchor="middle" class="part">30100 = Enabled</text>
+  <text x="793" y="163" text-anchor="middle" class="yes">None</text>
+
+  <!-- Row 5 -->
+  <rect x="20"  y="172" width="860" height="26" fill="#fafafa"/>
+  <text x="30"  y="189" class="row">Atomic multi-reg write (FC16)</text>
+  <text x="319" y="189" text-anchor="middle" class="yes">Yes (start+end)</text>
+  <text x="473" y="189" text-anchor="middle" class="no">No (single reg)</text>
+  <text x="627" y="189" text-anchor="middle" class="yes">Yes (VPP slot)</text>
+  <text x="793" y="189" text-anchor="middle" class="no">No (single reg)</text>
+
+  <!-- Row 6 -->
+  <rect x="20"  y="198" width="860" height="26" class="shade"/>
+  <text x="30"  y="215" class="row">Battery First ext. time slots</text>
+  <text x="319" y="215" text-anchor="middle" class="no">N/A (bit-packed)</text>
+  <text x="473" y="215" text-anchor="middle" class="yes">6 extra slots (new)</text>
+  <text x="627" y="215" text-anchor="middle" class="no">N/A</text>
+  <text x="793" y="215" text-anchor="middle" class="no">N/A</text>
+
+  <!-- Row 7 -->
+  <rect x="20"  y="224" width="860" height="26" fill="#fafafa"/>
+  <text x="30"  y="241" class="row">Grid First ext. time slots</text>
+  <text x="319" y="241" text-anchor="middle" class="no">N/A (bit-packed)</text>
+  <text x="473" y="241" text-anchor="middle" class="yes">9 extra slots (new)</text>
+  <text x="627" y="241" text-anchor="middle" class="no">N/A</text>
+  <text x="793" y="241" text-anchor="middle" class="no">N/A</text>
+
+  <!-- Row 8 -->
+  <rect x="20"  y="250" width="860" height="26" class="shade"/>
+  <text x="30"  y="267" class="row">Temporary override (timed)</text>
+  <text x="319" y="267" text-anchor="middle" class="no">No</text>
+  <text x="473" y="267" text-anchor="middle" class="no">No</text>
+  <text x="627" y="267" text-anchor="middle" class="yes">Yes — 30407-30409</text>
+  <text x="793" y="267" text-anchor="middle" class="no">No</text>
+
+  <!-- Row 9 -->
+  <rect x="20"  y="276" width="860" height="26" fill="#fafafa"/>
+  <text x="30"  y="293" class="row">Register protocol</text>
+  <text x="319" y="293" text-anchor="middle" class="row">3000-range holding</text>
+  <text x="473" y="293" text-anchor="middle" class="row">1000-range holding</text>
+  <text x="627" y="293" text-anchor="middle" class="row">VPP 30000-range</text>
+  <text x="793" y="293" text-anchor="middle" class="row">0-range holding</text>
+
+  <!-- Row 10 -->
+  <rect x="20"  y="302" width="860" height="26" class="shade"/>
+  <text x="30"  y="319" class="row">Reversion risk without 3049</text>
+  <text x="319" y="319" text-anchor="middle" fill="#b71c1c" font-weight="bold" font-size="11">HIGH — firmware gate</text>
+  <text x="473" y="319" text-anchor="middle" fill="#e65100" font-size="11">LOW — cloud only</text>
+  <text x="627" y="319" text-anchor="middle" class="yes">N/A (by design)</text>
+  <text x="793" y="319" text-anchor="middle" class="yes">Low</text>
+
+  <!-- Border -->
+  <rect x="20" y="36" width="860" height="292" fill="none" stroke="#bbb" stroke-width="1"/>
+  <!-- Vertical dividers -->
+  <line x1="244" y1="36" x2="244" y2="328" stroke="#bbb" stroke-width="1"/>
+  <line x1="398" y1="36" x2="398" y2="328" stroke="#bbb" stroke-width="1"/>
+  <line x1="552" y1="36" x2="552" y2="328" stroke="#bbb" stroke-width="1"/>
+  <line x1="706" y1="36" x2="706" y2="328" stroke="#bbb" stroke-width="1"/>
+
+  <text x="450" y="355" text-anchor="middle" font-size="10" fill="#999">
+    v0.6.8b1 — new capabilities shown in green · red = limitation or prerequisite required
+  </text>
+</svg>

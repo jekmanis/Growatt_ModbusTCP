@@ -197,6 +197,14 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# Claude Code
+#  .claude/ contains local settings, permissions, and memory files personal to each developer.
+#  CLAUDE.md (project instructions) is intentionally tracked separately at the repo root.
+.claude/
+
+# Local register scans / CSV data — not for version control
+scans/
+
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data

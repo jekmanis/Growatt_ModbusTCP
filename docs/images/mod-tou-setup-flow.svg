@@ -1,0 +1,102 @@
+<svg viewBox="0 0 760 540" xmlns="http://www.w3.org/2000/svg" font-family="'Segoe UI', Arial, sans-serif" font-size="13">
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#555"/>
+    </marker>
+    <style>
+      .box  { fill:#fff; stroke:#555; stroke-width:1.5; rx:6; }
+      .step { fill:#e3f2fd; stroke:#1976d2; stroke-width:1.5; }
+      .gate { fill:#fff8e1; stroke:#f57c00; stroke-width:2; }
+      .ok   { fill:#e8f5e9; stroke:#388e3c; stroke-width:1.5; }
+      .warn { fill:#ffebee; stroke:#c62828; stroke-width:2; }
+      .dia  { fill:#fce4ec; stroke:#ad1457; stroke-width:1.5; }
+      .lbl  { font-size:12px; fill:#333; }
+      .head { font-size:14px; font-weight:bold; fill:#1a1a1a; }
+      .sub  { font-size:11px; fill:#555; }
+      .edge { stroke:#555; stroke-width:1.5; fill:none; marker-end:url(#arr); }
+      .yes  { fill:#388e3c; font-size:11px; }
+      .no   { fill:#c62828; font-size:11px; }
+    </style>
+  </defs>
+
+  <!-- Title -->
+  <text x="380" y="26" text-anchor="middle" class="head">MOD GEN4 TOU Setup — Step-by-Step</text>
+
+  <!-- Step 1: Check Allow Grid Charge -->
+  <rect x="240" y="46" width="280" height="52" rx="6" class="step"/>
+  <text x="380" y="67" text-anchor="middle" class="lbl" font-weight="bold">Step 1 — Check Allow Grid Charge</text>
+  <text x="380" y="84" text-anchor="middle" class="sub">Open Battery device → "Allow Grid Charge" select entity</text>
+
+  <!-- Arrow down -->
+  <line x1="380" y1="98" x2="380" y2="124" class="edge"/>
+
+  <!-- Diamond: Is it Enabled? -->
+  <polygon points="380,124 480,154 380,184 280,154" class="dia"/>
+  <text x="380" y="150" text-anchor="middle" class="lbl">Is it</text>
+  <text x="380" y="166" text-anchor="middle" class="lbl">Enabled?</text>
+
+  <!-- No branch: left -->
+  <line x1="280" y1="154" x2="200" y2="154" class="edge"/>
+  <text x="235" y="148" text-anchor="middle" class="no">No</text>
+  <rect x="60" y="128" width="136" height="52" rx="6" class="warn"/>
+  <text x="128" y="149" text-anchor="middle" class="lbl" font-weight="bold" fill="#b71c1c">Set to Enabled</text>
+  <text x="128" y="165" text-anchor="middle" class="sub">(register 3049 = 1)</text>
+
+  <!-- Yes branch: down -->
+  <line x1="380" y1="184" x2="380" y2="210" class="edge"/>
+  <text x="394" y="200" class="yes">Yes</text>
+
+  <!-- Step 2: Configure TOU Period -->
+  <rect x="240" y="210" width="280" height="66" rx="6" class="step"/>
+  <text x="380" y="231" text-anchor="middle" class="lbl" font-weight="bold">Step 2 — Set TOU Period Times</text>
+  <text x="380" y="248" text-anchor="middle" class="sub">Time pickers: "TOU Period N Start / End"</text>
+  <text x="380" y="263" text-anchor="middle" class="sub">Slots 1–9 available (skip gap at 3046–3049)</text>
+
+  <!-- Arrow from warn to Step 2 bottom-left -->
+  <line x1="128" y1="180" x2="128" y2="243" class="edge" stroke="#c62828"/>
+  <line x1="128" y1="243" x2="240" y2="243" class="edge" stroke="#c62828"/>
+
+  <!-- Arrow down -->
+  <line x1="380" y1="276" x2="380" y2="302" class="edge"/>
+
+  <!-- Step 3: Set Priority & Enable -->
+  <rect x="240" y="302" width="280" height="66" rx="6" class="step"/>
+  <text x="380" y="323" text-anchor="middle" class="lbl" font-weight="bold">Step 3 — Set Priority &amp; Enable Each Slot</text>
+  <text x="380" y="340" text-anchor="middle" class="sub">"TOU Period N Priority" → Load / Battery / Grid</text>
+  <text x="380" y="355" text-anchor="middle" class="sub">"TOU Period N Enable" → Enabled</text>
+
+  <!-- Arrow down -->
+  <line x1="380" y1="368" x2="380" y2="394" class="edge"/>
+
+  <!-- Step 4: Verify Persistence -->
+  <rect x="240" y="394" width="280" height="52" rx="6" class="gate"/>
+  <text x="380" y="415" text-anchor="middle" class="lbl" font-weight="bold">Step 4 — Verify Persistence</text>
+  <text x="380" y="431" text-anchor="middle" class="sub">Wait 60 s, re-read registers — values must hold</text>
+
+  <!-- Arrow down -->
+  <line x1="380" y1="446" x2="380" y2="472" class="edge"/>
+
+  <!-- Diamond: Values held? -->
+  <polygon points="380,472 480,502 380,532 280,502" class="dia"/>
+  <text x="380" y="498" text-anchor="middle" class="lbl">Values</text>
+  <text x="380" y="514" text-anchor="middle" class="lbl">persisted?</text>
+
+  <!-- Yes: right -->
+  <line x1="480" y1="502" x2="580" y2="502" class="edge"/>
+  <text x="527" y="496" class="yes">Yes</text>
+  <rect x="584" y="476" width="120" height="52" rx="6" class="ok"/>
+  <text x="644" y="497" text-anchor="middle" class="lbl" font-weight="bold" fill="#1b5e20">TOU Active</text>
+  <text x="644" y="513" text-anchor="middle" class="sub">Setup complete</text>
+
+  <!-- No: left -->
+  <line x1="280" y1="502" x2="200" y2="502" class="edge"/>
+  <text x="235" y="496" class="no">No</text>
+  <rect x="28" y="476" width="168" height="52" rx="6" class="warn"/>
+  <text x="112" y="496" text-anchor="middle" class="lbl" font-weight="bold" fill="#b71c1c">Re-check 3049</text>
+  <text x="112" y="512" text-anchor="middle" class="sub">Cloud may be overriding</text>
+
+  <!-- Note at bottom -->
+  <text x="380" y="548" text-anchor="middle" font-size="10" fill="#888">
+    All writes use atomic FC16 (write_registers) — start + end in a single Modbus transaction
+  </text>
+</svg>

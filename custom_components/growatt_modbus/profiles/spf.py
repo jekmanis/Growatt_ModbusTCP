@@ -23,13 +23,18 @@ SPF uses INVERTED sign convention compared to VPP 2.01 standard:
 - VPP 2.01:     Positive = Charge,    Negative = Discharge
 This profile uses negative scale (-0.1) on registers 77-78 to convert SPF's
 inverted convention to the standard convention used by Home Assistant and other models.
+
+Battery Sensor Limitations:
+- Battery Temperature: NOT AVAILABLE (SPF hardware does not provide battery temp sensor)
+- Battery Current: Only measured during AC charging (shows 0 during PV charging or discharging)
+- Battery Charge Energy: Only tracks AC charging (from grid/gen), NOT PV charging to battery
 """
 
 # SPF 3000-6000 ES PLUS (Off-grid inverter with battery)
 SPF_3000_6000_ES_PLUS = {
     'name': 'SPF 3000-6000 ES PLUS',
     'description': 'Off-grid solar inverter with battery storage and AC charging (3-6kW)',
-    'notes': 'Uses 0-82 register range. Off-grid system with AC input, battery, and load output. No grid export.',
+    'notes': 'Uses 0-97 register range. Off-grid system with AC input, battery, and load output. No grid export.',
     'offgrid_protocol': True,
     'input_registers': {
         # System Status
@@ -111,11 +116,13 @@ SPF_3000_6000_ES_PLUS = {
         50: {'name': 'energy_total_high', 'scale': 1, 'unit': '', 'pair': 51, 'desc': 'Solar energy total (HIGH word)'},
         51: {'name': 'energy_total_low', 'scale': 1, 'unit': '', 'pair': 50, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'Solar energy total (LOW word)'},
 
-        # AC Charge Energy (from grid/generator)
-        56: {'name': 'ac_charge_energy_today_high', 'scale': 1, 'unit': '', 'pair': 57, 'desc': 'AC charge energy today (HIGH word)'},
-        57: {'name': 'ac_charge_energy_today_low', 'scale': 1, 'unit': '', 'pair': 56, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'AC charge energy today (LOW word)'},
-        58: {'name': 'ac_charge_energy_total_high', 'scale': 1, 'unit': '', 'pair': 59, 'desc': 'AC charge energy total (HIGH word)'},
-        59: {'name': 'ac_charge_energy_total_low', 'scale': 1, 'unit': '', 'pair': 58, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'AC charge energy total (LOW word)'},
+        # Battery Charge Energy (from grid/generator via AC charging)
+        # Note: SPF only measures AC charging energy (from grid/gen), not PV charging to battery
+        # Named charge_energy_* (not ac_charge_energy_*) for battery_charge sensor compatibility
+        56: {'name': 'charge_energy_today_high', 'scale': 1, 'unit': '', 'pair': 57, 'desc': 'Battery charge energy today (HIGH word) - AC charge only on SPF'},
+        57: {'name': 'charge_energy_today_low', 'scale': 1, 'unit': '', 'pair': 56, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'Battery charge energy today (LOW word) - AC charge only on SPF'},
+        58: {'name': 'charge_energy_total_high', 'scale': 1, 'unit': '', 'pair': 59, 'desc': 'Battery charge energy total (HIGH word) - AC charge only on SPF'},
+        59: {'name': 'charge_energy_total_low', 'scale': 1, 'unit': '', 'pair': 58, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'Battery charge energy total (LOW word) - AC charge only on SPF'},
 
         # Battery Discharge Energy
         60: {'name': 'discharge_energy_today_high', 'scale': 1, 'unit': '', 'pair': 61, 'desc': 'Battery discharge energy today (HIGH word)'},
@@ -129,14 +136,33 @@ SPF_3000_6000_ES_PLUS = {
         66: {'name': 'ac_discharge_energy_total_high', 'scale': 1, 'unit': '', 'pair': 67, 'desc': 'AC discharge energy total (HIGH word)'},
         67: {'name': 'ac_discharge_energy_total_low', 'scale': 1, 'unit': '', 'pair': 66, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'AC discharge energy total (LOW word)'},
 
-        # AC Charge Current & AC Discharge Power
-        68: {'name': 'ac_charge_battery_current', 'scale': 0.1, 'unit': 'A', 'desc': 'AC charging battery current'},
+        # Battery Current (only measured during AC charging on SPF)
+        # Note: SPF hardware limitation - no general battery current sensor
+        # Named battery_current (not ac_charge_battery_current) for battery_current sensor compatibility
+        68: {'name': 'battery_current', 'scale': 0.1, 'unit': 'A', 'desc': 'Battery current (SPF: only shows current during AC charging, 0 otherwise)'},
         69: {'name': 'ac_discharge_power_high', 'scale': 1, 'unit': '', 'pair': 70, 'desc': 'AC discharge power (HIGH word)'},
         70: {'name': 'ac_discharge_power_low', 'scale': 1, 'unit': '', 'pair': 69, 'combined_scale': 0.1, 'combined_unit': 'W', 'desc': 'AC discharge power (LOW word)'},
 
         # Fan Speeds
         81: {'name': 'mppt_fan_speed', 'scale': 1, 'unit': '%', 'desc': 'MPPT fan speed percentage'},
         82: {'name': 'inverter_fan_speed', 'scale': 1, 'unit': '%', 'desc': 'Inverter fan speed percentage'},
+
+        # Operational Discharge Energy (Equipment Operation Discharge)
+        85: {'name': 'op_discharge_energy_today_high', 'scale': 1, 'unit': '', 'pair': 86, 'desc': 'Operational discharge energy today (HIGH word)'},
+        86: {'name': 'op_discharge_energy_today_low', 'scale': 1, 'unit': '', 'pair': 85, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'Operational discharge energy today (LOW word)'},
+        87: {'name': 'op_discharge_energy_total_high', 'scale': 1, 'unit': '', 'pair': 88, 'desc': 'Operational discharge energy total (HIGH word)'},
+        88: {'name': 'op_discharge_energy_total_low', 'scale': 1, 'unit': '', 'pair': 87, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'Operational discharge energy total (LOW word)'},
+
+        # Generator Energy (from grid/generator input) - Issue #145
+        # For SPF 6000 ES Plus and similar models with generator input
+        92: {'name': 'generator_discharge_today_high', 'scale': 1, 'unit': '', 'pair': 93, 'desc': 'Generator discharge energy today (HIGH word)'},
+        93: {'name': 'generator_discharge_today_low', 'scale': 1, 'unit': '', 'pair': 92, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'Generator discharge energy today (LOW word)'},
+        94: {'name': 'generator_discharge_total_high', 'scale': 1, 'unit': '', 'pair': 95, 'desc': 'Generator discharge energy total (HIGH word)'},
+        95: {'name': 'generator_discharge_total_low', 'scale': 1, 'unit': '', 'pair': 94, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'Generator discharge energy total (LOW word)'},
+
+        # Generator Power and Voltage (16-bit single registers)
+        96: {'name': 'generator_power', 'scale': 1, 'unit': 'W', 'desc': 'Current generator power output'},
+        97: {'name': 'generator_voltage', 'scale': 0.1, 'unit': 'V', 'desc': 'Current generator voltage'},
     },
     'holding_registers': {
         # System Control
@@ -191,19 +217,19 @@ SPF_3000_6000_ES_PLUS = {
         26: {'name': 'serial_number_2', 'scale': 1, 'unit': '', 'access': 'RO', 'desc': 'Serial number chars 7-8 (ASCII)'},
         27: {'name': 'serial_number_1', 'scale': 1, 'unit': '', 'access': 'RO', 'desc': 'Serial number chars 9-10 (ASCII)'},
 
-        # Battery Low Voltage/SOC Switch to Utility
+        # Battery Low Voltage/SOC Switch to Utility (Battery to Grid)
         # BATTERY TYPE DEPENDENT (see register 39)
         # Non-Lithium (AGM/FLD/USE/USE2): 200-640 = 20.0V - 64.0V (scale 0.1V)
-        # Lithium: 5-100 = 0.5% - 10.0% (scale 0.1%)
+        # Lithium: 0-1000 = 0% - 100% (scale 0.1%)
         37: {'name': 'bat_low_to_uti', 'scale': 0.1, 'unit': 'V/%', 'access': 'RW',
-             'valid_range': (5, 640),
-             'desc': 'Battery low voltage/SOC to switch to utility. Non-Lithium: 20.0-64.0V, Lithium: 0.5-10.0%',
+             'valid_range': (0, 1000),
+             'desc': 'Battery to Grid: SOC level to switch from battery to utility. Non-Lithium: 20.0-64.0V, Lithium: 0-100%',
              'battery_dependent': True},
 
         # AC Charge Current
         38: {'name': 'ac_charge_current', 'scale': 1, 'unit': 'A', 'access': 'RW',
              'valid_range': (0, 80),
-             'desc': 'AC charging current limit (SPF 6000 hardware max: 80A)'},
+             'desc': 'AC charging current limit (SPF 6000 hardware max: 80A, stored directly)'},
 
         # Battery Type
         39: {'name': 'battery_type', 'scale': 1, 'unit': '', 'access': 'RW',
@@ -223,15 +249,15 @@ SPF_3000_6000_ES_PLUS = {
         # Generator Charge Current
         83: {'name': 'gen_charge_current', 'scale': 1, 'unit': 'A', 'access': 'RW',
              'valid_range': (0, 80),
-             'desc': 'Generator charging current limit (SPF 6000 hardware max: 80A)'},
+             'desc': 'Generator charging current limit (SPF 6000 hardware max: 80A, stored directly)'},
 
-        # AC to Battery Voltage/SOC Switch Point
+        # AC to Battery Voltage/SOC Switch Point (Grid to Battery)
         # BATTERY TYPE DEPENDENT (see register 39)
         # Non-Lithium (AGM/FLD/USE/USE2): 200-640 = 20.0V - 64.0V (scale 0.1V)
-        # Lithium: 5-100 = 0.5% - 10.0% (scale 0.1%)
+        # Lithium: 0-1000 = 0% - 100% (scale 0.1%)
         95: {'name': 'ac_to_bat_volt', 'scale': 0.1, 'unit': 'V/%', 'access': 'RW',
-             'valid_range': (5, 640),
-             'desc': 'AC to battery voltage/SOC switch point. Non-Lithium: 20.0-64.0V, Lithium: 0.5-10.0%',
+             'valid_range': (0, 1000),
+             'desc': 'Grid to Battery: SOC level to switch back from utility to battery mode. Non-Lithium: 20.0-64.0V, Lithium: 0-100%',
              'battery_dependent': True},
     }
 }
