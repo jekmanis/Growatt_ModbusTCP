@@ -2,11 +2,12 @@
 WIT Series - Three-Phase Hybrid Inverters with Advanced Storage
 Based on VPP (Virtual Power Plant) Modbus Protocol
 
-IMPORTANT CONTROL MODEL DIFFERENCES:
+IMPORTANT CONTROL MODEL:
 - WIT uses VPP protocol with time-limited overrides (NOT persistent mode control like SPH/SPF)
-- Register 30476 (priority_mode) is READ-ONLY - shows TOU default, cannot be changed via Modbus
-- For temporary control, use VPP remote control registers (30407-30409)
-- See docs/WIT_CONTROL_GUIDE.md for detailed control patterns and best practices
+- Register 30476 (priority_mode) IS writable — set_wit_mode sets it explicitly for every mode
+- 30476=1 (Battery First) is REQUIRED for grid charging; 30476=0 for hold/passthrough
+- For control, use set_wit_mode service which coordinates 30407-30409 + 30476 + 30410 + 30200
+- See docs/WIT_MODE_PRESETS.md for mode presets and docs/DIRECT_CONTROL_OVERVIEW.md for architecture
 """
 
 # WIT 4000-15000TL3 (Three-phase hybrid with battery, 4-15kW residential)
@@ -542,13 +543,12 @@ WIT_4000_15000TL3 = {
         30475: {'name': 'vpp_offgrid_discharge_soc', 'scale': 1, 'unit': '%', 'access': 'RW',
                 'valid_range': (10, 100), 'desc': 'Stop off-grid discharge when SOC drops to this %'},
 
-        # Operating Mode Selection (READ-ONLY - shows default mode when no TOU period is active)
-        # NOTE: WIT inverters do NOT support external mode control via Modbus.
-        # This register shows the current TOU default mode but cannot be changed via Modbus.
-        # For temporary overrides, use VPP remote control registers (30407-30409) instead.
-        # See docs/WIT_CONTROL_GUIDE.md for details.
-        30476: {'name': 'priority_mode', 'scale': 1, 'unit': '', 'access': 'R',
-                'desc': 'System operating mode (READ-ONLY: TOU default / outside configured periods)',
+        # Priority Mode — writable despite VPP V2.01 listing it as "Reserved".
+        # Confirmed writable on WIT 8000TL3-HU V1.39 via FC 0x06.
+        # CRITICAL: 30476=1 (Battery First) is required for grid charging to work.
+        # set_wit_mode sets this explicitly for every mode. See docs/DIRECT_CONTROL_OVERVIEW.md.
+        30476: {'name': 'priority_mode', 'scale': 1, 'unit': '', 'access': 'RW',
+                'desc': 'Priority mode (0=Load First, 1=Battery First, 2=Grid First)',
                 'valid_range': (0, 2),
                 'values': {
                     0: 'Load First',

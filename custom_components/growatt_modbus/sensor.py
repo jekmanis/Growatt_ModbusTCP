@@ -1020,6 +1020,17 @@ SENSOR_DEFINITIONS = {
         "attr": "inverter_fan_speed",
         "condition": lambda data: hasattr(data, 'inverter_fan_speed'),
     },
+
+    # WIT Direct Control Mode Status
+    "wit_mode_status": {
+        "name": "Inverter Mode",
+        "icon": "mdi:state-machine",
+        "device_class": None,
+        "state_class": None,
+        "unit": None,
+        "attr": "wit_mode_status",
+        "condition": lambda data: hasattr(data, 'wit_mode_status') and data.wit_mode_status != "",
+    },
 }
 
 
@@ -1048,8 +1059,16 @@ async def async_setup_entry(
     
     entities = []
     
+    # WIT-specific sensors handled by custom classes below
+    is_wit = "wit" in inverter_series.lower()
+    wit_custom_sensors = {"wit_mode_status"} if is_wit else set()
+
     # Create sensors based on available data and conditions
     for sensor_key, sensor_def in SENSOR_DEFINITIONS.items():
+        # Skip sensors that have custom class implementations
+        if sensor_key in wit_custom_sensors:
+            continue
+
         # Check if sensor is supported by this inverter profile
         if sensor_key not in available_sensors:
             _LOGGER.debug("Skipping sensor %s - not in profile %s", sensor_key, inverter_series)
@@ -1074,6 +1093,10 @@ async def async_setup_entry(
             )
         )
     
+    # Add WIT-specific custom sensor with extra attributes
+    if is_wit:
+        entities.append(GrowattWitModeStatusSensor(coordinator, config_entry))
+
     _LOGGER.info("Created %d sensors for %s", len(entities), inverter_series)
     async_add_entities(entities)
 
@@ -1566,3 +1589,63 @@ class GrowattModbusSensor(CoordinatorEntity, SensorEntity):
         if desc:
             return {"description": desc}
         return None
+
+
+class GrowattWitModeStatusSensor(CoordinatorEntity, SensorEntity):
+    """WIT inverter mode status sensor with detailed attributes."""
+
+    _attr_icon = "mdi:state-machine"
+
+    def __init__(self, coordinator, config_entry):
+        super().__init__(coordinator)
+        entry_name = config_entry.data.get("name", config_entry.title)
+        self._attr_name = f"{entry_name} Inverter Mode"
+        self._attr_unique_id = f"{config_entry.entry_id}_wit_mode_status"
+
+    @property
+    def device_info(self):
+        from .const import DEVICE_TYPE_INVERTER
+        return self.coordinator.get_device_info(DEVICE_TYPE_INVERTER)
+
+    @property
+    def native_value(self) -> str:
+        data = self.coordinator.data
+        if data is None:
+            return "Unknown"
+        return getattr(data, 'wit_mode_status', "Unknown")
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        data = self.coordinator.data
+        if data is None:
+            return {}
+
+        attrs = {
+            "mode": getattr(data, 'wit_mode_status', "Unknown"),
+            "power_percent": getattr(data, 'wit_mode_power_percent', 0),
+            "export_rate": getattr(data, 'wit_mode_export_rate', -1),
+            "ac_charge_mode": {0: "disabled", 1: "pv_priority", 2: "ac_priority"}.get(
+                getattr(data, 'wit_mode_ac_charge', 0), "unknown"
+            ),
+            "override_active": getattr(data, 'wit_mode_override_active', False),
+        }
+
+        # Duration remaining from coordinator-tracked timestamp.
+        # Only available while this HA instance has been running since the last
+        # set_wit_mode call — lost on restart (the inverter still tracks its own timer).
+        coord = self.coordinator
+        if hasattr(coord, 'wit_direct_mode_timestamp') and coord.wit_direct_mode_timestamp:
+            from datetime import timedelta
+            elapsed = (datetime.now() - coord.wit_direct_mode_timestamp).total_seconds() / 60
+            duration = getattr(coord, 'wit_direct_mode_duration', 0)
+            remaining = max(0, int(duration - elapsed))
+            attrs["duration_remaining_minutes"] = remaining
+            attrs["override_expires"] = (
+                coord.wit_direct_mode_timestamp + timedelta(minutes=duration)
+            ).isoformat()
+
+        # SOC limits
+        attrs["charge_cutoff_soc"] = getattr(data, 'vpp_charge_cutoff_soc', None)
+        attrs["discharge_cutoff_soc"] = getattr(data, 'vpp_discharge_cutoff_soc', None)
+
+        return attrs

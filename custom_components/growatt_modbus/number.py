@@ -63,7 +63,6 @@ async def async_setup_entry(
                     _LOGGER.info("%s control enabled (register %d found)", control_name, register_num)
 
         # VPP Battery Control number entities (30xxx registers)
-        entities.append(GrowattWitVppPowerPercentNumber(coordinator, config_entry))
         if 30404 in holding_registers:
             entities.append(GrowattWitVppChargeCutoffSocNumber(coordinator, config_entry))
         if 30405 in holding_registers:
@@ -562,48 +561,6 @@ class GrowattWitActivePowerRateNumber(CoordinatorEntity, NumberEntity):
 # =============================================================================
 # WIT VPP-specific Number Entities (30xxx registers)
 # =============================================================================
-
-class GrowattWitVppPowerPercentNumber(CoordinatorEntity, NumberEntity):
-    """WIT VPP: Power percentage for charge/discharge operations.
-
-    This value is applied when Battery Mode is set to Charge or Discharge.
-    It's stored locally and used by the Battery Mode select entity.
-    """
-
-    _attr_mode = NumberMode.SLIDER
-    _attr_native_min_value = 1.0
-    _attr_native_max_value = 100.0
-    _attr_native_step = 1.0
-    _attr_native_unit_of_measurement = "%"
-    _attr_entity_category = EntityCategory.CONFIG
-    _attr_icon = "mdi:gauge"
-
-    def __init__(
-        self,
-        coordinator: GrowattModbusCoordinator,
-        config_entry: ConfigEntry,
-    ) -> None:
-        super().__init__(coordinator)
-        self._config_entry = config_entry
-        entry_name = config_entry.data.get("name", config_entry.title)
-        self._attr_name = f"{entry_name} VPP Power Rate"
-        self._attr_unique_id = f"{config_entry.entry_id}_vpp_power_percent"
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        device_type = get_device_type_for_control("active_power_rate")
-        return self.coordinator.get_device_info(device_type)
-
-    @property
-    def native_value(self) -> float | None:
-        return float(getattr(self.coordinator, "wit_vpp_power_percent", 100))
-
-    async def async_set_native_value(self, value: float) -> None:
-        """Store the power percentage for use by Battery Mode entity."""
-        power_percent = int(value)
-        setattr(self.coordinator, "wit_vpp_power_percent", power_percent)
-        _LOGGER.info("[WIT-VPP] Set power rate to %d%% (will apply on next mode change)", power_percent)
-
 
 class GrowattWitVppChargeCutoffSocNumber(CoordinatorEntity, NumberEntity):
     """WIT VPP: Charge cutoff SOC (30404) - stop charging when SOC reaches this %."""

@@ -53,6 +53,7 @@ SERVICE_READ_REGISTER = "read_register"
 SERVICE_SET_BATTERY_MODE = "set_battery_mode"
 SERVICE_SYNC_TOU_SCHEDULE = "sync_tou_schedule"
 SERVICE_GET_REGISTER_DATA = "get_register_data"
+SERVICE_SET_WIT_MODE = "set_wit_mode"
 
 # Universal scan ranges - covers all Grid-Tied Growatt series
 # Split into chunks of max 125 registers to respect Modbus limits
@@ -193,6 +194,58 @@ SERVICE_GET_REGISTER_DATA_SCHEMA = vol.Schema(
         vol.Required("count"): vol.All(vol.Coerce(int), vol.Range(min=1, max=50)),
     }
 )
+
+WIT_MODE_CHOICES = [
+    "grid_charge",
+    "discharge_to_load",
+    "discharge_to_grid",
+    "max_export",
+    "preserve_soc",
+    "hold",
+    "passthrough",
+]
+
+AC_CHARGE_MODE_MAP = {
+    "disabled": 0,
+    "pv_priority": 1,
+    "ac_priority": 2,
+}
+
+SERVICE_SET_WIT_MODE_SCHEMA = vol.Schema({
+    vol.Required("device_id"): cv.string,
+    vol.Required("mode"): vol.In(WIT_MODE_CHOICES),
+    vol.Optional("power_percent", default=100): vol.All(
+        vol.Coerce(int), vol.Range(min=1, max=100)
+    ),
+    vol.Optional("duration_minutes", default=60): vol.All(
+        vol.Coerce(int), vol.Range(min=1, max=1440)
+    ),
+    vol.Optional("export_rate"): vol.All(
+        vol.Coerce(int), vol.Range(min=0, max=100)
+    ),
+    vol.Optional("ac_charge_mode"): vol.In(["disabled", "pv_priority", "ac_priority"]),
+    vol.Optional("charge_cutoff_soc"): vol.All(
+        vol.Coerce(int), vol.Range(min=70, max=100)
+    ),
+    vol.Optional("discharge_cutoff_soc"): vol.All(
+        vol.Coerce(int), vol.Range(min=10, max=30)
+    ),
+})
+
+
+def _get_coordinator_by_device_id(hass, device_id):
+    """Resolve a coordinator from a device_id."""
+    device_reg = dr.async_get(hass)
+    device_entry = device_reg.async_get(device_id)
+
+    if not device_entry:
+        return None
+
+    for entry_id in device_entry.config_entries:
+        if entry_id in hass.data.get(DOMAIN, {}):
+            return hass.data[DOMAIN][entry_id]
+
+    return None
 
 
 def _read_single_register(client, register: int, register_type: str = 'input') -> dict:
@@ -1251,6 +1304,283 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             _LOGGER.error("Failed to sync TOU schedule: %s", e)
             raise ValueError(f"Failed to sync TOU schedule: {e}")
 
+    async def set_wit_mode(call: ServiceCall) -> dict:
+        """Set WIT inverter mode via atomic multi-register VPP write."""
+        from datetime import timedelta
+        data = call.data
+        device_id = data["device_id"]
+        mode = data["mode"]
+        power_percent = data.get("power_percent", 100)
+        duration_minutes = data.get("duration_minutes", 60)
+        export_rate = data.get("export_rate")          # None = unchanged
+        ac_charge_mode = data.get("ac_charge_mode")    # None = unchanged
+        charge_cutoff_soc = data.get("charge_cutoff_soc")
+        discharge_cutoff_soc = data.get("discharge_cutoff_soc")
+
+        # Resolve coordinator from device_id
+        coordinator = _get_coordinator_by_device_id(hass, device_id)
+        if coordinator is None:
+            raise ValueError(f"Device {device_id} not found")
+
+        client = coordinator.modbus_client
+
+        # VPP Register Addresses
+        VPP_CONTROL_AUTHORITY = 30100
+        VPP_EXPORT_LIMIT_ENABLE = 30200
+        VPP_EXPORT_LIMIT_RATE = 30201
+        VPP_CHARGE_CUTOFF_SOC = 30404
+        VPP_DISCHARGE_CUTOFF_SOC = 30405
+        VPP_REMOTE_POWER_ENABLE = 30407
+        VPP_REMOTE_POWER_DURATION = 30408
+        VPP_REMOTE_POWER_PERCENT = 30409
+        VPP_AC_CHARGE_ENABLE = 30410
+        VPP_TOU_NUM_PERIODS = 30411
+        VPP_TOU_PERIOD1_BASE = 30412  # 3 regs: start_min, end_min, power%
+        VPP_PRIORITY_MODE = 30476     # 0=Load First, 1=Battery First, 2=Grid First
+
+        registers_written = {}
+
+        # Atomic composite write — bypass the per-register 30s rate limiter
+        # that exists to prevent dashboard users from toggling individual controls.
+        # set_wit_mode is a coordinated multi-register operation, not rapid toggling.
+        if hasattr(client, '_wit_control_last_write'):
+            client._wit_control_last_write.clear()
+
+        # 30410 rejects FC 0x06 on some WIT firmware — use FC 0x10 instead
+        FC10_REGISTERS = {VPP_AC_CHARGE_ENABLE}
+
+        async def _write(reg, val, retries=2):
+            """Write a single register via executor. Returns False on failure (never raises)."""
+            import asyncio
+            for attempt in range(retries):
+                try:
+                    if reg in FC10_REGISTERS:
+                        result = await hass.async_add_executor_job(client.write_registers, reg, [val])
+                    else:
+                        result = await hass.async_add_executor_job(client.write_register, reg, val)
+                    if result is not None:
+                        if hasattr(result, 'isError'):
+                            if not result.isError():
+                                return True
+                        elif result is not False:
+                            return True
+                except Exception as err:
+                    if attempt < retries - 1:
+                        _LOGGER.debug("[WIT] Register %d write attempt %d failed: %s", reg, attempt + 1, err)
+                        await asyncio.sleep(0.5)
+                        continue
+                    _LOGGER.warning("[WIT] Register %d write failed after %d attempts: %s", reg, retries, err)
+                    return False
+            _LOGGER.warning("[WIT] Register %d write returned False (rate limited?)", reg)
+            return False
+
+        try:
+            # ---- Step 1: Ensure VPP control authority + safe base mode ----
+            success = await _write(VPP_CONTROL_AUTHORITY, 1)
+            if not success:
+                _LOGGER.warning("[WIT] Failed to enable VPP control authority, continuing anyway...")
+            registers_written[VPP_CONTROL_AUTHORITY] = 1
+
+            # Set priority mode based on operating mode.
+            # 30476 affects behavior BOTH with and without remote control:
+            #   30476=1 (Battery First): required for grid charging, preserve_soc (30409=1),
+            #     and PV surplus routing during discharge modes
+            #   30476=0 (Load First): safe fallback for passthrough only
+            if mode == "passthrough":
+                priority_val = 0
+            else:
+                priority_val = 1
+            success = await _write(VPP_PRIORITY_MODE, priority_val)
+            if not success:
+                raise ValueError(f"Failed to set priority mode (30476={priority_val})")
+            registers_written[VPP_PRIORITY_MODE] = priority_val
+
+            # ---- Step 2: AC charge mode (before enabling remote control) ----
+            if ac_charge_mode is not None:
+                ac_val = AC_CHARGE_MODE_MAP[ac_charge_mode]
+                success = await _write(VPP_AC_CHARGE_ENABLE, ac_val)
+                if not success and ac_val == 2:
+                    _LOGGER.warning("[WIT] AC priority (30410=2) not supported, falling back to PV priority (1)")
+                    ac_val = 1
+                    success = await _write(VPP_AC_CHARGE_ENABLE, 1)
+                if not success:
+                    raise ValueError(f"Failed to write AC charge mode (30410={ac_val})")
+                registers_written[VPP_AC_CHARGE_ENABLE] = ac_val
+            elif mode == "grid_charge":
+                success = await _write(VPP_AC_CHARGE_ENABLE, 1)
+                if not success:
+                    raise ValueError("Failed to write AC charge mode (30410=1)")
+                registers_written[VPP_AC_CHARGE_ENABLE] = 1
+            elif mode in ("discharge_to_load", "discharge_to_grid", "max_export",
+                          "hold", "preserve_soc", "passthrough"):
+                success = await _write(VPP_AC_CHARGE_ENABLE, 0)
+                if not success:
+                    raise ValueError("Failed to write AC charge mode (30410=0)")
+                registers_written[VPP_AC_CHARGE_ENABLE] = 0
+
+            # ---- Step 3: SOC limits (before charge/discharge starts) ----
+            if charge_cutoff_soc is not None:
+                success = await _write(VPP_CHARGE_CUTOFF_SOC, charge_cutoff_soc)
+                if not success:
+                    raise ValueError(f"Failed to write charge cutoff SOC (30404={charge_cutoff_soc})")
+                registers_written[VPP_CHARGE_CUTOFF_SOC] = charge_cutoff_soc
+
+            if discharge_cutoff_soc is not None:
+                success = await _write(VPP_DISCHARGE_CUTOFF_SOC, discharge_cutoff_soc)
+                if not success:
+                    raise ValueError(f"Failed to write discharge cutoff SOC (30405={discharge_cutoff_soc})")
+                registers_written[VPP_DISCHARGE_CUTOFF_SOC] = discharge_cutoff_soc
+
+            # ---- Step 4: Export rate ----
+            if export_rate is not None:
+                if export_rate >= 100:
+                    success = await _write(VPP_EXPORT_LIMIT_ENABLE, 0)
+                    if not success:
+                        raise ValueError("Failed to disable export limit (30200=0)")
+                    registers_written[VPP_EXPORT_LIMIT_ENABLE] = 0
+                else:
+                    success = await _write(VPP_EXPORT_LIMIT_ENABLE, 1)
+                    if not success:
+                        raise ValueError("Failed to enable export limit (30200=1)")
+                    success = await _write(VPP_EXPORT_LIMIT_RATE, export_rate)
+                    if not success:
+                        raise ValueError(f"Failed to write export limit rate (30201={export_rate})")
+                    registers_written[VPP_EXPORT_LIMIT_ENABLE] = 1
+                    registers_written[VPP_EXPORT_LIMIT_RATE] = export_rate
+            elif mode == "discharge_to_load":
+                # Zero export is CRITICAL for discharge_to_load — without it,
+                # mode appears as "Max Export" (battery dumps to grid).
+                success = await _write(VPP_EXPORT_LIMIT_ENABLE, 1)
+                if not success:
+                    raise ValueError("Failed to enable export limit (30200=1) — discharge would export to grid!")
+                success = await _write(VPP_EXPORT_LIMIT_RATE, 0)
+                if not success:
+                    raise ValueError("Failed to set zero export rate (30201=0)")
+                registers_written[VPP_EXPORT_LIMIT_ENABLE] = 1
+                registers_written[VPP_EXPORT_LIMIT_RATE] = 0
+            elif mode in ("max_export", "discharge_to_grid", "hold", "preserve_soc",
+                          "grid_charge", "passthrough"):
+                # Export enabled: clear stale zero-export from previous modes
+                # (grid_charge needs this — stale 30200=1 from discharge_to_load blocks charging)
+                success = await _write(VPP_EXPORT_LIMIT_ENABLE, 0)
+                if not success:
+                    raise ValueError("Failed to clear export limit (30200=0)")
+                registers_written[VPP_EXPORT_LIMIT_ENABLE] = 0
+
+            # ---- Step 5: Battery power command ----
+            # Clear any leftover TOU periods from previous modes
+            success = await _write(VPP_TOU_NUM_PERIODS, 0)
+            if not success:
+                raise ValueError("Failed to clear TOU periods (30411=0)")
+            registers_written[VPP_TOU_NUM_PERIODS] = 0
+
+            if mode == "passthrough":
+                # Release all overrides. Zero out power/duration defensively so no
+                # stale command remains if 30407 is re-enabled externally.
+                success = await _write(VPP_REMOTE_POWER_DURATION, 0)
+                if not success:
+                    raise ValueError("Failed to clear duration (30408=0)")
+                success = await _write(VPP_REMOTE_POWER_PERCENT, 0)
+                if not success:
+                    raise ValueError("Failed to clear power (30409=0)")
+                success = await _write(VPP_REMOTE_POWER_ENABLE, 0)
+                if not success:
+                    raise ValueError("Failed to disable remote power control (30407)")
+                registers_written[VPP_REMOTE_POWER_DURATION] = 0
+                registers_written[VPP_REMOTE_POWER_PERCENT] = 0
+                registers_written[VPP_REMOTE_POWER_ENABLE] = 0
+
+            elif mode in ("hold", "preserve_soc"):
+                # Preserve SOC: battery idle, PV charges battery, surplus exports.
+                # Uses 30407=1 with 30409=1 (charge at 1%) to block discharge at any
+                # SOC level. 30405=30 (max hardware allows) as safety net.
+                # 30407=0 does NOT work: Load First (30476=0) still discharges battery
+                # to serve load. 30407=1 + 30409=0 clips PV export.
+                # 30409=1 (tiny charge) effectively holds battery without PV clipping.
+                # Confirmed 2026-03-30: Bat goes from -700W to -36W (standby only).
+                success = await _write(VPP_REMOTE_POWER_DURATION, duration_minutes)
+                if not success:
+                    raise ValueError("Failed to write duration (30408)")
+                success = await _write(VPP_REMOTE_POWER_PERCENT, 1)
+                if not success:
+                    raise ValueError("Failed to write power (30409=1)")
+                success = await _write(VPP_REMOTE_POWER_ENABLE, 1)
+                if not success:
+                    raise ValueError("Failed to enable remote power control (30407)")
+                registers_written[VPP_REMOTE_POWER_DURATION] = duration_minutes
+                registers_written[VPP_REMOTE_POWER_PERCENT] = 1
+                registers_written[VPP_REMOTE_POWER_ENABLE] = 1
+
+            elif mode == "grid_charge":
+                # Grid charge uses remote control (30407=1, 30409=+power%).
+                # Requires 30476=1 (Battery First) — with 30476=0 or 2, charging = 0W.
+                # Confirmed 2026-03-30: 30476=1 + 30407=1 + 30409=100 → 3kW+ charge.
+                success = await _write(VPP_REMOTE_POWER_DURATION, duration_minutes)
+                if not success:
+                    raise ValueError("Failed to write duration (30408)")
+                success = await _write(VPP_REMOTE_POWER_PERCENT, power_percent)
+                if not success:
+                    raise ValueError("Failed to write power (30409)")
+                success = await _write(VPP_REMOTE_POWER_ENABLE, 1)
+                if not success:
+                    raise ValueError("Failed to enable remote power control (30407)")
+                registers_written[VPP_REMOTE_POWER_DURATION] = duration_minutes
+                registers_written[VPP_REMOTE_POWER_PERCENT] = power_percent
+                registers_written[VPP_REMOTE_POWER_ENABLE] = 1
+
+            elif mode in ("discharge_to_load", "discharge_to_grid", "max_export"):
+                p = power_percent if mode != "max_export" else 100
+                power_unsigned = 65536 - p
+                success = await _write(VPP_REMOTE_POWER_DURATION, duration_minutes)
+                if not success:
+                    raise ValueError("Failed to write duration (30408)")
+                success = await _write(VPP_REMOTE_POWER_PERCENT, power_unsigned)
+                if not success:
+                    raise ValueError("Failed to write power (30409)")
+                success = await _write(VPP_REMOTE_POWER_ENABLE, 1)
+                if not success:
+                    raise ValueError("Failed to enable remote power control (30407)")
+                registers_written[VPP_REMOTE_POWER_DURATION] = duration_minutes
+                registers_written[VPP_REMOTE_POWER_PERCENT] = power_unsigned
+                registers_written[VPP_REMOTE_POWER_ENABLE] = 1
+
+            # ---- Step 6: Update coordinator state ----
+            now = datetime.now()
+            coordinator.wit_direct_mode = mode
+            coordinator.wit_direct_mode_power = power_percent
+            coordinator.wit_direct_mode_duration = duration_minutes
+            coordinator.wit_direct_mode_timestamp = now
+            coordinator.wit_direct_mode_source = "service"
+
+            if export_rate is not None:
+                coordinator.wit_direct_export_rate = export_rate
+            if ac_charge_mode is not None:
+                coordinator.wit_direct_ac_charge_mode = ac_charge_mode
+
+            await coordinator.async_request_refresh()
+
+            _LOGGER.info(
+                "[WIT] set_wit_mode: mode=%s power=%d%% duration=%d min export=%s ac=%s soc=[%s-%s]",
+                mode, power_percent, duration_minutes,
+                export_rate, ac_charge_mode,
+                discharge_cutoff_soc, charge_cutoff_soc,
+            )
+
+            return {
+                "success": True,
+                "mode_applied": mode,
+                "registers_written": {str(k): v for k, v in registers_written.items()},
+                "timestamp": now.isoformat(),
+                "override_expires": (
+                    (now + timedelta(minutes=duration_minutes)).isoformat()
+                    if mode not in ("passthrough", "hold", "preserve_soc") else None
+                ),
+            }
+
+        except Exception as err:
+            _LOGGER.exception("[WIT] set_wit_mode failed: %s", err)
+            raise ValueError(f"set_wit_mode failed: {err}") from err
+
     # Register services
     hass.services.async_register(
         DOMAIN,
@@ -1306,6 +1636,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         SERVICE_GET_REGISTER_DATA,
         get_register_data,
         schema=SERVICE_GET_REGISTER_DATA_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_WIT_MODE,
+        set_wit_mode,
+        schema=SERVICE_SET_WIT_MODE_SCHEMA,
         supports_response=SupportsResponse.OPTIONAL,
     )
 

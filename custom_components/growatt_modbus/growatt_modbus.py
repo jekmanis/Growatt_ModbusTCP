@@ -169,6 +169,7 @@ class GrowattData:
     power_to_user: float = 0.0        # W
     power_to_grid: float = 0.0        # W (export)
     power_to_load: float = 0.0        # W
+    self_consumption_power: float = 0.0  # W (power consumed by house, from meter)
     system_output_power: float = 0.0  # W (total system output per inverter)
     
     # Energy & Status
@@ -359,6 +360,19 @@ class GrowattData:
     gen_charge_current: int = 0       # 0-800 (0-80A with scale 0.1)
     bat_low_to_uti: int = 0           # Battery-dependent: Non-Lithium 200-640 (20-64V), Lithium 5-100 (0.5-10%)
     ac_to_bat_volt: int = 0           # Battery-dependent: Non-Lithium 200-640 (20-64V), Lithium 5-100 (0.5-10%)
+
+    # WIT VPP SOC and AC Charge control registers (read from holding registers)
+    vpp_charge_cutoff_soc: int = 100      # 10-100% (stop charging at this SOC; 100=charge to full)
+    vpp_discharge_cutoff_soc: int = 10    # 10-100% (stop discharging at this SOC; 10=discharge to 10%)
+    vpp_ac_charge_enable: int = 0         # 0=Disabled, 1=PV Priority, 2=AC Priority
+
+    # WIT Direct Control Mode Status (computed from VPP control registers)
+    wit_mode_status: str = ""
+    wit_mode_power_percent: int = 0
+    wit_mode_duration_remaining: int = 0
+    wit_mode_export_rate: int = -1
+    wit_mode_ac_charge: int = 0
+    wit_mode_override_active: bool = False
 
     # Device Info
     firmware_version: str = ""
@@ -1507,7 +1521,12 @@ class GrowattModbus:
                 data.power_to_user = ptu_val if ptu_val is not None else 0.0
             if power_to_load_addr:
                 data.power_to_load = self._get_register_value(power_to_load_addr) or 0.0
-            
+
+            # Self consumption power (house consumption from meter)
+            self_consumption_addr = self._find_register_by_name('self_consumption_power_low')
+            if self_consumption_addr:
+                data.self_consumption_power = self._get_register_value(self_consumption_addr) or 0.0
+
             # Energy Today
             # For hybrid inverters (WIT/SPH-TL3 etc.), the AC energy_today register (e.g. reg 53/54)
             # reflects total system output including battery discharge — not solar-only production.
@@ -1686,7 +1705,7 @@ class GrowattModbus:
                     logger.warning(
                         f"[WIT CTRL] Rate limit: Register {register} write blocked. "
                         f"Must wait {remaining:.1f}s more (30s cooldown between WIT control writes). "
-                        f"See docs/WIT_CONTROL_GUIDE.md for details."
+                        f"See docs/WIT_MODE_PRESETS.md for details."
                     )
                     return False
 
@@ -1918,7 +1937,7 @@ class GrowattModbus:
             if len(active_controls) > 1:
                 logger.warning(
                     f"[WIT CTRL] Multiple control mechanisms active simultaneously: {', '.join(active_controls)}. "
-                    f"This may cause conflicts. See docs/WIT_CONTROL_GUIDE.md for recommended patterns."
+                    f"This may cause conflicts. See docs/WIT_MODE_PRESETS.md for recommended patterns."
                 )
 
             # Detect potential TOU conflicts when enabling remote control
@@ -3028,6 +3047,16 @@ class GrowattModbus:
                     logger.debug("[VPP] Registers 30407-30410 not supported by this firmware — skipping in future polls")
             except Exception as e:
                 logger.debug(f"Could not read VPP remote power control registers 30407-30410: {e}")
+
+        # VPP AC Charge Mode (30410)
+        if 30410 in holding_map:
+            try:
+                vpp_ac_regs = self.read_holding_registers(30410, 1)
+                if vpp_ac_regs is not None and len(vpp_ac_regs) >= 1:
+                    data.vpp_ac_charge_enable = int(vpp_ac_regs[0])
+                    logger.debug("[WIT VPP] vpp_ac_charge_enable=%s", data.vpp_ac_charge_enable)
+            except Exception as e:
+                logger.debug(f"Could not read VPP AC charge register 30410: {e}")
 
     def get_status_text(self, status_code: int) -> str:
         """Convert status code to human readable text"""

@@ -82,6 +82,7 @@ TEMPERATURE_SENSORS: Set[str] = {
 
 STATUS_SENSORS: Set[str] = {
     "status", "grid_connection_status", "last_update", "derating_mode", "fault_code", "warning_code",
+    "wit_mode_status",
     # WIT debug/safety registers (read-only, disabled by default)
     "ntognd_detect", "nonstd_vac_enable", "enable_spec_set", "fast_mppt_enable",
 }
