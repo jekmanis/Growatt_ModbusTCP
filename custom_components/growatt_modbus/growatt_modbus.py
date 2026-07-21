@@ -18,6 +18,7 @@ Hardware Setup:
 
 import time
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple, Union
 from homeassistant.config_entries import ConfigEntry
@@ -140,6 +141,11 @@ class GrowattData:
     pv3_power: float = 0.0            # W
     pv3_energy_today: float = 0.0     # kWh (3-string models like SPH TL3 10000 - Issue #211)
     pv3_energy_total: float = 0.0     # kWh (MIN 7-10kW per-MPPT lifetime total - Issue #265)
+    pv4_voltage: float = 0.0          # V (WIT 29.9-50K-XHU 4th MPPT - Issue #338)
+    pv4_current: float = 0.0          # A
+    pv4_power: float = 0.0            # W
+    pv4_energy_today: float = 0.0     # kWh
+    pv4_energy_total: float = 0.0     # kWh
     pv_total_power: float = 0.0       # W
     pv_energy_total: float = 0.0      # kWh (WIT total PV lifetime energy - Issue #146)
     
@@ -210,6 +216,18 @@ class GrowattData:
     extra_energy_today: float = 0.0   # kWh
     extra_energy_total: float = 0.0   # kWh
 
+    # Backup Box (Growatt ARK transfer switch, RS485 via TL-X/TL-XH inverter, input regs 3281-3342)
+    box_connect_flag: int = 0          # 0=Abnormal/absent, 1=Normal/connected (reg 3320)
+    box_bypass_status: int = 0         # 0=Off, 1=On (reg 3281)
+    box_work_mode: int = 0             # 0=Offgrid, 1=Ongrid, 2=Generator (reg 3282)
+    box_error_code: int = 0            # Error code 700-800 range (reg 3284)
+    box_warning_code: int = 0          # Warning code 700-800 range (reg 3285)
+    box_temperature: float = 0.0       # °C, scale 1, signed Int8 (reg 3286)
+    box_grid_voltage: float = 0.0      # V, scale 0.1 (reg 3287)
+    box_grid_power: float = 0.0        # W, scale 0.1, signed Int32 (regs 3289-3290)
+    box_load_power: float = 0.0        # W, scale 0.1, Uint32 (regs 3297-3298)
+    box_relay_status: int = 0          # 0=Not supported/comm error, 1=Open, 2=Close (reg 3342)
+
     # Temperatures
     inverter_temp: float = 0.0        # °C
     ipm_temp: float = 0.0             # °C
@@ -260,6 +278,7 @@ class GrowattData:
     export_limit_power: int = 0       # 0-1000 (0-100.0%)
     export_limit_failed_power_rate: int = 0       # 0-1000 raw (×0.1 = 0-100%); fallback output power cap when export limit fails
     active_power_rate: int = 100      # 0-100 (max output power %)
+    export_limit_w: int = 0           # WIT holding reg 203: export limit in watts (0=zero export)
 
     # SPH/SPM Battery Control registers (1000+ range)
     priority_mode: int = 0            # 0=Load First, 1=Battery First, 2=Grid First
@@ -308,8 +327,15 @@ class GrowattData:
     # MOD GEN4 power rate limits per priority mode
     grid_first_discharge_power_rate: int = 0  # 0-100% discharge rate when Grid First (register 3036)
     batt_first_charge_power_rate: int = 0      # 0-100% charge rate when Battery First (register 3047)
+    tl_xh_priority_mode: int = 3               # MIN TL-XH priority mode: 0=Load First, 2=Battery First, 3=Grid First (register 3018)
     batt_first_charge_stopped_soc: int = 0     # SOC % to stop charging in Battery First mode (register 3048)
     grid_first_discharge_stopped_soc: int = 0  # SOC % to stop discharging in Grid First mode (register 3067)
+
+    # Dry Contact (SPH/MIN TL-X/TL-XH — V1.39 registers 3016/3017/3019/3119)
+    dry_contact_state: int = 0       # input reg 3119: current relay state (0=Off, 1=On)
+    dry_contact_enable: int = 0      # holding reg 3016: function enable (0=Disabled, 1=Enabled)
+    dry_contact_on_rate: int = 0     # holding reg 3017: close relay power threshold (raw ×0.1%)
+    dry_contact_off_rate: int = 0    # holding reg 3019: open relay power threshold (raw ×0.1%)
 
     time_period_1_enable: int = 0     # 0=Disabled, 1=Enabled
     time_period_1_start: int = 0      # hex-packed (hours*256+minutes, e.g. 06:00 = 0x0600 = 1536)
@@ -362,9 +388,9 @@ class GrowattData:
     ac_to_bat_volt: int = 0           # Battery-dependent: Non-Lithium 200-640 (20-64V), Lithium 5-100 (0.5-10%)
 
     # WIT VPP SOC and AC Charge control registers (read from holding registers)
+    # (vpp_ac_charge_enable is declared above in the WIT VPP Remote Control block)
     vpp_charge_cutoff_soc: int = 100      # 10-100% (stop charging at this SOC; 100=charge to full)
     vpp_discharge_cutoff_soc: int = 10    # 10-100% (stop discharging at this SOC; 10=discharge to 10%)
-    vpp_ac_charge_enable: int = 0         # 0=Disabled, 1=PV Priority, 2=AC Priority
 
     # WIT Direct Control Mode Status (computed from VPP control registers)
     wit_mode_status: str = ""
@@ -378,12 +404,193 @@ class GrowattData:
     firmware_version: str = ""
     serial_number: str = ""
 
+class SharedModbusConnection:
+    """Single ModbusTcpClient shared across multiple GrowattModbus instances on the same host:port.
+
+    Serializes all Modbus transactions with a threading.Lock (because _fetch_data runs in
+    executor threads, not on the asyncio event loop).  Reference-counted so the TCP socket
+    stays open as long as at least one coordinator needs it.
+    """
+
+    def __init__(self, host: str, port: int, timeout: int = 10) -> None:
+        self.host = host
+        self.port = port
+        self._timeout = timeout
+        self._client: Optional['ModbusTcpClient'] = None
+        self._lock = threading.Lock()
+        self._refcount = 0
+        self._connected = False
+
+    # ------------------------------------------------------------------
+    # Reference counting
+    # ------------------------------------------------------------------
+
+    def acquire_ref(self) -> None:
+        self._refcount += 1
+
+    def release_ref(self) -> None:
+        self._refcount -= 1
+        if self._refcount <= 0:
+            self.disconnect()
+            self._client = None
+
+    # ------------------------------------------------------------------
+    # Connection lifecycle (call only while lock is held)
+    # ------------------------------------------------------------------
+
+    def ensure_connected(self) -> bool:
+        """Connect if not already open; flush stale bytes on a new connection."""
+        if self._client is None:
+            try:
+                self._client = ModbusTcpClient(host=self.host, port=self.port, timeout=self._timeout)
+            except TypeError:
+                self._client = ModbusTcpClient(self.host, self.port)
+                if hasattr(self._client, 'timeout'):
+                    self._client.timeout = self._timeout
+
+        try:
+            if hasattr(self._client, 'is_socket_open') and self._client.is_socket_open():
+                return True
+        except Exception:
+            pass
+
+        result = self._client.connect()
+        if result:
+            self._connected = True
+            self._flush_receive_buffer()
+        return result
+
+    def disconnect(self) -> None:
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            self._connected = False
+
+    def _flush_receive_buffer(self) -> None:
+        """Drain stale Modbus responses left in the adapter's TCP buffer after reconnect."""
+        sock = getattr(self._client, 'socket', None)
+        if sock is None:
+            transport = getattr(self._client, 'transport', None)
+            if transport is not None:
+                sock = getattr(transport, 'socket', None) or getattr(transport, '_sock', None)
+        if sock is None:
+            return
+        try:
+            original_timeout = sock.gettimeout()
+            sock.settimeout(0)
+            discarded = 0
+            try:
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    discarded += len(chunk)
+            except (BlockingIOError, OSError):
+                pass
+            finally:
+                sock.settimeout(original_timeout)
+            if discarded:
+                logger.debug(
+                    "[SharedConn %s:%s] Flushed %d stale bytes from receive buffer after reconnect",
+                    self.host, self.port, discarded,
+                )
+        except Exception as exc:
+            logger.debug("[SharedConn %s:%s] Buffer flush failed (non-critical): %s", self.host, self.port, exc)
+
+    # ------------------------------------------------------------------
+    # Register access (slave_id passed per call, not stored on hub)
+    # ------------------------------------------------------------------
+
+    def read_input_registers(self, start: int, count: int, slave_id: int) -> Optional[list]:
+        if self._client is None:
+            return None
+        try:
+            try:
+                resp = self._client.read_input_registers(address=start, count=count, device_id=slave_id)
+            except TypeError:
+                try:
+                    resp = self._client.read_input_registers(address=start, count=count, slave=slave_id)
+                except TypeError:
+                    try:
+                        resp = self._client.read_input_registers(address=start, count=count, unit=slave_id)
+                    except TypeError:
+                        resp = self._client.read_input_registers(start, count)
+            if hasattr(resp, 'isError') and callable(resp.isError) and resp.isError():
+                return None
+            return resp.registers if hasattr(resp, 'registers') else None
+        except Exception as exc:
+            logger.debug("[SharedConn %s:%s] read_input_registers(%d, %d, slave=%d) error: %s",
+                         self.host, self.port, start, count, slave_id, exc)
+            return None
+
+    def read_holding_registers(self, start: int, count: int, slave_id: int) -> Optional[list]:
+        if self._client is None:
+            return None
+        try:
+            try:
+                resp = self._client.read_holding_registers(address=start, count=count, slave=slave_id)
+            except TypeError:
+                try:
+                    resp = self._client.read_holding_registers(address=start, count=count, unit=slave_id)
+                except TypeError:
+                    resp = self._client.read_holding_registers(address=start, count=count)
+            if hasattr(resp, 'isError') and callable(resp.isError) and resp.isError():
+                return None
+            return resp.registers if hasattr(resp, 'registers') else None
+        except Exception as exc:
+            logger.debug("[SharedConn %s:%s] read_holding_registers(%d, %d, slave=%d) error: %s",
+                         self.host, self.port, start, count, slave_id, exc)
+            return None
+
+    def write_register(self, register: int, value: int, slave_id: int) -> bool:
+        if self._client is None:
+            return False
+        try:
+            if value < 0:
+                value = value & 0xFFFF
+            try:
+                result = self._client.write_register(address=register, value=value, unit=slave_id)
+            except TypeError:
+                try:
+                    result = self._client.write_register(address=register, value=value, slave=slave_id)
+                except TypeError:
+                    try:
+                        result = self._client.write_register(address=register, value=value, device_id=slave_id)
+                    except TypeError:
+                        result = self._client.write_register(register, value)
+            return not (hasattr(result, 'isError') and callable(result.isError) and result.isError())
+        except Exception as exc:
+            logger.debug("[SharedConn %s:%s] write_register(%d, %d, slave=%d) error: %s",
+                         self.host, self.port, register, value, slave_id, exc)
+            return False
+
+    def write_registers(self, register: int, values: list, slave_id: int) -> bool:
+        if self._client is None:
+            return False
+        try:
+            try:
+                result = self._client.write_registers(address=register, values=values, slave=slave_id)
+            except TypeError:
+                try:
+                    result = self._client.write_registers(address=register, values=values, unit=slave_id)
+                except TypeError:
+                    result = self._client.write_registers(register, values)
+            return not (hasattr(result, 'isError') and callable(result.isError) and result.isError())
+        except Exception as exc:
+            logger.debug("[SharedConn %s:%s] write_registers(%d, slave=%d) error: %s",
+                         self.host, self.port, register, slave_id, exc)
+            return False
+
+
 class GrowattModbus:
     """Growatt MIN series Modbus client"""
     
     def __init__(self, connection_type='tcp', host='192.168.1.100', port=502,
              device='/dev/ttyUSB0', baudrate=9600, slave_id=1,
-             register_map='MIN_7000_10000TL_X', timeout=10, invert_battery_power=False):
+             register_map='MIN_7000_10000TL_X', timeout=10, invert_battery_power=False,
+             shared_conn: Optional['SharedModbusConnection'] = None):
         """
         Initialize Modbus connection
 
@@ -397,7 +604,10 @@ class GrowattModbus:
             register_map: Which register mapping to use (see const.py)
             timeout: Connection timeout in seconds (default: 10)
             invert_battery_power: Invert battery power sign for inverters with opposite convention (default: False)
+            shared_conn: Optional shared connection hub (TCP only). When set, all socket
+                operations are delegated to the hub and connect/disconnect become no-ops.
         """
+        self._shared_conn = shared_conn
         self.connection_type = connection_type
         self.slave_id = slave_id
         self.client: Optional[Union['ModbusTcpClient', 'ModbusSerialClient']] = None
@@ -430,15 +640,20 @@ class GrowattModbus:
         # Cache for raw register data
         self._register_cache = {}
 
-        # Track failed optional register ranges to avoid repeated warnings
-        # Format: set of (start_addr, count) tuples
-        self._failed_optional_ranges = set()
+        # Track failed optional register ranges with timestamps for retry.
+        # Format: dict mapping (start_addr, count) → (first_fail_time, fail_count)
+        # Entries expire after _OPTIONAL_RANGE_RETRY_SECONDS and are retried.
+        self._failed_optional_ranges: dict = {}
 
         # Track VPP holding register addresses that failed once this session.
         # These are optional VPP-range registers (30000+) that some firmware variants
         # don't implement.  After the first failure we skip them rather than retrying
         # every poll and accumulating transaction-ID mismatches.
         self._failed_optional_holding_addrs: set = set()
+
+        # Last successfully read battery SOC — used to hold value if VPP range is
+        # temporarily unavailable rather than reporting a misleading 0%.
+        self._cached_battery_soc: Optional[float] = None
 
         # WIT control rate limiting (v0.4.6) - track last write time per register
         # Prevents oscillation and unstable control behavior
@@ -522,6 +737,9 @@ class GrowattModbus:
     
     def connect(self) -> bool:
         """Establish connection to inverter"""
+        if self._shared_conn is not None:
+            # Connection is managed by the hub; _fetch_data calls hub.ensure_connected() directly.
+            return True
         try:
             # Check if already connected (prevents double-open and file descriptor leaks)
             if hasattr(self.client, 'is_socket_open'):
@@ -602,6 +820,9 @@ class GrowattModbus:
 
     def disconnect(self):
         """Close connection and release resources (critical for preventing file descriptor leaks)"""
+        if self._shared_conn is not None:
+            # Connection lifetime is managed by the hub.
+            return
         if self.client:
             try:
                 self.client.close()
@@ -663,14 +884,17 @@ class GrowattModbus:
             log_errors: If False, downgrade Modbus errors to DEBUG (for optional ranges expected to fail on some models)
         """
         self._enforce_read_interval()
-        
+
+        if self._shared_conn is not None:
+            return self._shared_conn.read_input_registers(start_address, count, self.slave_id)
+
         try:
             # Try keyword arguments with different parameter names for pymodbus versions
             try:
                 # Newer pymodbus uses device_id
                 response = self.client.read_input_registers(
-                    address=start_address, 
-                    count=count, 
+                    address=start_address,
+                    count=count,
                     device_id=self.slave_id
                 )
             except TypeError:
@@ -743,6 +967,10 @@ class GrowattModbus:
     def read_holding_registers(self, start_address: int, count: int) -> Optional[list]:
         """Read holding registers with error handling and slave_id compatibility fallback."""
         self._enforce_read_interval()
+
+        if self._shared_conn is not None:
+            return self._shared_conn.read_holding_registers(start_address, count, self.slave_id)
+
         try:
             try:
                 response = self.client.read_holding_registers(address=start_address, count=count, slave=self.slave_id)
@@ -798,7 +1026,6 @@ class GrowattModbus:
         CHARGING_STATES = {5, 6, 7, 8, 9, 10}
         # Discharging state: battery is supplying power — sign must be negative
         DISCHARGING_STATES = {2}
-        # Status 12 (PV Charge+Discharge) is ambiguous — skip correction
         # Status 0,1,3,4,11 are standby/fault/bypass — skip correction
 
         if status in CHARGING_STATES and battery_power < 0:
@@ -817,6 +1044,29 @@ class GrowattModbus:
                 f"{-battery_power:.1f}W [issue #174]"
             )
             return -battery_power
+
+        # Status 12 (PV Charge+Discharge): hardware sign is unreliable in this settled
+        # off-grid state. Resolve direction from power balance: PV >> load means the
+        # battery must be net charging; load >> PV means the battery must be net discharging.
+        # A 200 W margin avoids flip-flopping when PV ≈ load.  Issue #345.
+        if status == 12:
+            pv_power = getattr(data, 'pv1_power', 0.0) + getattr(data, 'pv2_power', 0.0)
+            load_power = getattr(data, 'ac_power', 0.0)
+            BALANCE_MARGIN = 200.0
+            if pv_power > load_power + BALANCE_MARGIN and battery_power < 0:
+                logger.warning(
+                    "[SPF sign correction] Status 12 (PV Charge+Discharge): PV=%.0fW >> "
+                    "Load=%.0fW — battery is net charging, correcting %.1fW to %.1fW [issue #345]",
+                    pv_power, load_power, battery_power, -battery_power,
+                )
+                return -battery_power
+            if load_power > pv_power + BALANCE_MARGIN and battery_power > 0:
+                logger.warning(
+                    "[SPF sign correction] Status 12 (PV Charge+Discharge): Load=%.0fW >> "
+                    "PV=%.0fW — battery is net discharging, correcting %.1fW to %.1fW [issue #345]",
+                    load_power, pv_power, battery_power, -battery_power,
+                )
+                return -battery_power
 
         return battery_power
 
@@ -1081,63 +1331,98 @@ class GrowattModbus:
             addrs_3000 = sorted([addr for addr in addresses if 3000 <= addr < 4000])
             max_3000_addr = max(addrs_3000)
             count_3000 = (max_3000_addr - 3000) + 1
+            _3000_key = ('3000_block', count_3000)
+            _3000_RETRY_S = 300
 
-            # Check if we need to split the read (max 125 registers per read)
-            if count_3000 > 125:
-                # Split into contiguous blocks
-                logger.debug(f"Splitting 3000 range into blocks (total range: 3000-{max_3000_addr}, {count_3000} registers)")
-
-                blocks = []
-                current_block = [addrs_3000[0]]
-                for addr in addrs_3000[1:]:
-                    if addr - current_block[-1] <= 10:  # Group if gap is small
-                        current_block.append(addr)
-                    else:
-                        blocks.append(current_block)
-                        current_block = [addr]
-                blocks.append(current_block)
-
-                # Read each block separately
-                for block in blocks:
-                    min_addr_block = min(block)
-                    max_addr_block = max(block)
-                    count_block = (max_addr_block - min_addr_block) + 1
-
-                    # Further split if block still exceeds 125 registers
-                    if count_block > 125:
-                        # Read in 125-register chunks
-                        for chunk_start in range(min_addr_block, max_addr_block + 1, 125):
-                            chunk_count = min(125, max_addr_block - chunk_start + 1)
-                            logger.debug(f"Reading 3000 sub-chunk ({chunk_start}-{chunk_start+chunk_count-1}, {chunk_count} registers)")
-                            registers = self.read_input_registers(chunk_start, chunk_count)
-                            if registers is None:
-                                logger.warning(f"Failed to read 3000 chunk ({chunk_start}-{chunk_start+chunk_count-1})")
-                            else:
-                                for i, value in enumerate(registers):
-                                    self._register_cache[chunk_start + i] = value
-                    else:
-                        logger.debug(f"Reading 3000 sub-range ({min_addr_block}-{max_addr_block}, {count_block} registers)")
-                        registers = self.read_input_registers(min_addr_block, count_block)
-                        if registers is None:
-                            logger.warning(f"Failed to read 3000 block ({min_addr_block}-{max_addr_block})")
-                        else:
-                            for i, value in enumerate(registers):
-                                addr = min_addr_block + i
-                                self._register_cache[addr] = value
-                                # Log load_energy registers specifically
-                                if addr in [3075, 3076, 3077, 3078]:
-                                    logger.debug(f"[{self.register_map['name']}@{self.connection_id}] Cached 3000 range: reg {addr} = {value}")
-            else:
-                # Single read is sufficient
-                logger.debug(f"Reading 3000 range (3000-{max_3000_addr}, {count_3000} registers)")
-                registers = self.read_input_registers(3000, count_3000)
-                if registers is None:
-                    logger.warning("Failed to read 3000 register block (extended data may be unavailable)")
-                    # Don't return None - continue with what we have
+            # Skip-on-failure: after the first failure, suppress retries for 5 minutes.
+            # This prevents log flooding when an inverter simply doesn't support this range
+            # (e.g. one model in a two-inverter setup where only one uses 3000-range registers).
+            _3000_prev = self._failed_optional_ranges.get(_3000_key)
+            _3000_skip = False
+            if _3000_prev:
+                _3000_fail_time, _3000_fail_count = _3000_prev
+                if time.time() - _3000_fail_time < _3000_RETRY_S:
+                    _3000_skip = True
                 else:
-                    # Populate cache
-                    for i, value in enumerate(registers):
-                        self._register_cache[3000 + i] = value
+                    logger.debug(f"Retrying previously failed 3000-range block (3000-{max_3000_addr})")
+
+            if not _3000_skip:
+                _3000_any_fail = False
+                _3000_any_ok = False
+
+                # Check if we need to split the read (max 125 registers per read)
+                if count_3000 > 125:
+                    # Split into contiguous blocks
+                    logger.debug(f"Splitting 3000 range into blocks (total range: 3000-{max_3000_addr}, {count_3000} registers)")
+
+                    blocks = []
+                    current_block = [addrs_3000[0]]
+                    for addr in addrs_3000[1:]:
+                        if addr - current_block[-1] <= 10:  # Group if gap is small
+                            current_block.append(addr)
+                        else:
+                            blocks.append(current_block)
+                            current_block = [addr]
+                    blocks.append(current_block)
+
+                    # Read each block separately
+                    for block in blocks:
+                        min_addr_block = min(block)
+                        max_addr_block = max(block)
+                        count_block = (max_addr_block - min_addr_block) + 1
+
+                        # Further split if block still exceeds 125 registers
+                        if count_block > 125:
+                            # Read in 125-register chunks
+                            for chunk_start in range(min_addr_block, max_addr_block + 1, 125):
+                                chunk_count = min(125, max_addr_block - chunk_start + 1)
+                                logger.debug(f"Reading 3000 sub-chunk ({chunk_start}-{chunk_start+chunk_count-1}, {chunk_count} registers)")
+                                registers = self.read_input_registers(chunk_start, chunk_count)
+                                if registers is None:
+                                    _3000_any_fail = True
+                                    logger.debug(f"3000 sub-chunk failed ({chunk_start}-{chunk_start+chunk_count-1})")
+                                else:
+                                    _3000_any_ok = True
+                                    for i, value in enumerate(registers):
+                                        self._register_cache[chunk_start + i] = value
+                        else:
+                            logger.debug(f"Reading 3000 sub-range ({min_addr_block}-{max_addr_block}, {count_block} registers)")
+                            registers = self.read_input_registers(min_addr_block, count_block)
+                            if registers is None:
+                                _3000_any_fail = True
+                                logger.debug(f"3000 sub-range failed ({min_addr_block}-{max_addr_block})")
+                            else:
+                                _3000_any_ok = True
+                                for i, value in enumerate(registers):
+                                    addr = min_addr_block + i
+                                    self._register_cache[addr] = value
+                                    if addr in [3075, 3076, 3077, 3078]:
+                                        logger.debug(f"[{self.register_map['name']}@{self.connection_id}] Cached 3000 range: reg {addr} = {value}")
+                else:
+                    # Single read is sufficient
+                    logger.debug(f"Reading 3000 range (3000-{max_3000_addr}, {count_3000} registers)")
+                    registers = self.read_input_registers(3000, count_3000)
+                    if registers is None:
+                        _3000_any_fail = True
+                    else:
+                        _3000_any_ok = True
+                        for i, value in enumerate(registers):
+                            self._register_cache[3000 + i] = value
+
+                # Update failure tracking based on outcome
+                if _3000_any_fail and not _3000_any_ok:
+                    _prev = self._failed_optional_ranges.get(_3000_key)
+                    _count = (_prev[1] + 1) if _prev else 1
+                    self._failed_optional_ranges[_3000_key] = (time.time(), _count)
+                    if _count == 1:
+                        logger.warning(
+                            f"Failed to read 3000 register block (extended data may be unavailable). "
+                            f"Will suppress and retry in {_3000_RETRY_S}s."
+                        )
+                    else:
+                        logger.debug(f"3000 register block still failing (attempt {_count})")
+                elif _3000_any_ok:
+                    self._failed_optional_ranges.pop(_3000_key, None)
 
         # Read 8000 range if needed - WIT/WIS battery/storage data
         if has_8000_range:
@@ -1216,32 +1501,56 @@ class GrowattModbus:
                     31200 <= min_addr_block <= 31224
                 )
 
-                # Check if this range already failed - skip silently if optional
+                # Check if this range recently failed — skip if within retry window
+                _OPTIONAL_RANGE_RETRY_SECONDS = 300
                 range_key = (min_addr_block, count_block)
                 if not is_wit_critical_range and range_key in self._failed_optional_ranges:
-                    logger.debug(f"Skipping known-failed optional VPP range ({min_addr_block}-{max_addr_block})")
-                    continue
+                    _fail_time, _fail_count = self._failed_optional_ranges[range_key]
+                    if time.time() - _fail_time < _OPTIONAL_RANGE_RETRY_SECONDS:
+                        continue
+                    # Retry window expired — fall through to re-read.
+                    # Do NOT delete the entry here: the fail_count must survive so that
+                    # "warn once, then DEBUG" works correctly. If the re-read fails below,
+                    # _prev will find the existing entry and increment the count past 1,
+                    # suppressing the WARNING. The entry is cleared only on a successful read.
+                    logger.debug(f"Retrying previously failed optional VPP range ({min_addr_block}-{max_addr_block})")
 
                 logger.debug(f"Reading 31000 sub-range ({min_addr_block}-{max_addr_block}, {count_block} registers)")
                 registers = self.read_input_registers(min_addr_block, count_block, log_errors=is_wit_critical_range)
                 if registers is None:
-                    # Only mark as permanently failed if it's truly optional
+                    # Only track as failed if it's truly optional
                     if not is_wit_critical_range:
-                        self._failed_optional_ranges.add(range_key)
-                        logger.debug(f"Optional VPP range not supported ({min_addr_block}-{max_addr_block}) - will use 3000-range data instead")
+                        _prev = self._failed_optional_ranges.get(range_key)
+                        _fail_count = (_prev[1] + 1) if _prev else 1
+                        self._failed_optional_ranges[range_key] = (time.time(), _fail_count)
+                        if _fail_count == 1:
+                            logger.warning(
+                                f"Optional VPP range ({min_addr_block}-{max_addr_block}) failed — "
+                                f"battery sensors may be temporarily unavailable. "
+                                f"Will retry in {_OPTIONAL_RANGE_RETRY_SECONDS}s."
+                            )
+                        else:
+                            logger.debug(f"Optional VPP range ({min_addr_block}-{max_addr_block}) still failing (attempt {_fail_count}) - using 3000-range data")
                     else:
                         # Critical WIT battery range - keep trying, log warning
                         logger.warning(f"Failed to read critical WIT battery range ({min_addr_block}-{max_addr_block}) - will retry next poll")
                     # Don't return None - continue with what we have
                 else:
+                    # Range succeeded — clear any previous failure record so the
+                    # next failure is treated as fresh (warn again on first failure).
+                    self._failed_optional_ranges.pop(range_key, None)
                     # Populate cache
                     for i, value in enumerate(registers):
                         self._register_cache[min_addr_block + i] = value
 
         # Now extract values using the register map
         try:
-            # Status
-            data.status = int(self._get_register_value(min_addr) or 0)
+            # Status — look up by name rather than assuming it's at min_addr
+            status_addr = self._find_register_by_name('inverter_status') or self._find_register_by_name('status')
+            if status_addr:
+                data.status = int(self._get_register_value(status_addr) or 0)
+            else:
+                data.status = int(self._get_register_value(min_addr) or 0)
             equipment_status_addr = self._find_register_by_name('equipment_status')
             if equipment_status_addr:
                 data.equipment_status = int(self._get_register_value(equipment_status_addr) or 0)
@@ -1282,14 +1591,26 @@ class GrowattModbus:
                 data.pv3_current = self._get_register_value(pv3_current_addr) or 0.0
             if pv3_power_low_addr:
                 data.pv3_power = self._get_register_value(pv3_power_low_addr) or 0.0
-            
+
+            # PV String 4 (if available — 4-MPPT models like WIT 29.9-50K-XHU)
+            pv4_voltage_addr = self._find_register_by_name('pv4_voltage')
+            pv4_current_addr = self._find_register_by_name('pv4_current')
+            pv4_power_low_addr = self._find_register_by_name('pv4_power_low')
+
+            if pv4_voltage_addr:
+                data.pv4_voltage = self._get_register_value(pv4_voltage_addr) or 0.0
+            if pv4_current_addr:
+                data.pv4_current = self._get_register_value(pv4_current_addr) or 0.0
+            if pv4_power_low_addr:
+                data.pv4_power = self._get_register_value(pv4_power_low_addr) or 0.0
+
             # Total PV Power
             pv_total_addr = self._find_register_by_name('pv_total_power_low')
             if pv_total_addr:
                 data.pv_total_power = self._get_register_value(pv_total_addr) or 0.0
             else:
                 # Calculate from strings if not available
-                data.pv_total_power = data.pv1_power + data.pv2_power + data.pv3_power
+                data.pv_total_power = data.pv1_power + data.pv2_power + data.pv3_power + data.pv4_power
 
             # PV Energy (WIT per-MPPT tracking - Issue #146)
             # These registers track DC input from solar panels only (not total system output)
@@ -1308,6 +1629,11 @@ class GrowattModbus:
                 data.pv3_energy_today = self._get_register_value(pv3_energy_today_addr) or 0.0
                 logger.debug(f"[{self.register_map['name']}] PV3 energy today from reg {pv3_energy_today_addr}: {data.pv3_energy_today} kWh")
 
+            pv4_energy_today_addr = self._find_register_by_name('pv4_energy_today_low')
+            if pv4_energy_today_addr:
+                data.pv4_energy_today = self._get_register_value(pv4_energy_today_addr) or 0.0
+                logger.debug(f"[{self.register_map['name']}] PV4 energy today from reg {pv4_energy_today_addr}: {data.pv4_energy_today} kWh")
+
             pv1_energy_total_addr = self._find_register_by_name('pv1_energy_total_low')
             if pv1_energy_total_addr:
                 data.pv1_energy_total = self._get_register_value(pv1_energy_total_addr) or 0.0
@@ -1322,6 +1648,11 @@ class GrowattModbus:
             if pv3_energy_total_addr:
                 data.pv3_energy_total = self._get_register_value(pv3_energy_total_addr) or 0.0
                 logger.debug(f"[{self.register_map['name']}] PV3 energy total from reg {pv3_energy_total_addr}: {data.pv3_energy_total} kWh")
+
+            pv4_energy_total_addr = self._find_register_by_name('pv4_energy_total_low')
+            if pv4_energy_total_addr:
+                data.pv4_energy_total = self._get_register_value(pv4_energy_total_addr) or 0.0
+                logger.debug(f"[{self.register_map['name']}] PV4 energy total from reg {pv4_energy_total_addr}: {data.pv4_energy_total} kWh")
 
             pv_energy_total_addr = self._find_register_by_name('pv_energy_total_low')
             if pv_energy_total_addr:
@@ -1545,12 +1876,13 @@ class GrowattModbus:
                 # track solar input only — 0 at night or on a cloudy day is the correct value.
                 # Gate on register *existence* not *value > 0* to avoid falling back to the
                 # battery-inflated register at night when the daily total resets to zero.
-                pv_energy_sum = data.pv1_energy_today + data.pv2_energy_today + data.pv3_energy_today
+                pv_energy_sum = data.pv1_energy_today + data.pv2_energy_today + data.pv3_energy_today + data.pv4_energy_today
 
-                # Sanity check: per-MPPT energy should be reasonable (< 100 kWh per day)
-                if pv_energy_sum < 100:
+                # Sanity check: guard against corrupt/unresponsive register reads (e.g. 65535 values).
+                # 1000 kWh threshold accommodates large 4-MPPT commercial systems (50 kW × 8 hrs × 2.5× = ~1000).
+                if pv_energy_sum < 1000:
                     data.energy_today = pv_energy_sum
-                    logger.debug(f"[{self.register_map['name']}@{self.connection_id}] Energy today from per-MPPT registers: PV1={data.pv1_energy_today} + PV2={data.pv2_energy_today} + PV3={data.pv3_energy_today} = {data.energy_today} kWh")
+                    logger.debug(f"[{self.register_map['name']}@{self.connection_id}] Energy today from per-MPPT registers: PV1={data.pv1_energy_today} + PV2={data.pv2_energy_today} + PV3={data.pv3_energy_today} + PV4={data.pv4_energy_today} = {data.energy_today} kWh")
                 else:
                     # Garbage data — fall back to direct register
                     logger.warning(f"[{self.register_map['name']}@{self.connection_id}] Per-MPPT energy {pv_energy_sum} kWh unrealistic - using fallback register instead")
@@ -1579,7 +1911,10 @@ class GrowattModbus:
             
             # Battery Data (if available - storage/hybrid models)
             self._read_battery_data(data)
-            
+
+            # Backup Box Data (Growatt ARK transfer switch, regs 3281-3342)
+            self._read_backup_box_data(data)
+
             # Temperatures
             inverter_temp_addr = self._find_register_by_name('inverter_temp')
             ipm_temp_addr = self._find_register_by_name('ipm_temp')
@@ -1624,7 +1959,12 @@ class GrowattModbus:
                 data.fault_code = int(self._get_register_value(fault_addr) or 0)
             if warning_addr:
                 data.warning_code = int(self._get_register_value(warning_addr) or 0)
-            
+
+            # Dry Contact State (input reg 3119 — SPH/MIN TL-X/TL-XH)
+            dry_contact_state_addr = self._find_register_by_name('dry_contact_state')
+            if dry_contact_state_addr:
+                data.dry_contact_state = int(self._get_register_value(dry_contact_state_addr) or 0)
+
             logger.debug(f"Read data: PV={data.pv_total_power}W, AC={data.ac_power}W, Battery={getattr(data, 'battery_soc', 'N/A')}%, Temp={data.inverter_temp}°C")
             
         except Exception as e:
@@ -1657,7 +1997,7 @@ class GrowattModbus:
                 logger.debug(f"{tag} is_socket_open() returned: {socket_is_open}")
 
                 if not socket_is_open:
-                    logger.warning(f"{tag} Socket not open, attempting reconnect...")
+                    logger.debug(f"{tag} Socket not open, attempting reconnect...")
                     if not self.connect():
                         raise ModbusWriteError(0, [], "Reconnect failed - not connected")
                     logger.info(f"{tag} Reconnect successful, proceeding with write")
@@ -1710,6 +2050,26 @@ class GrowattModbus:
                     return False
 
                 logger.debug(f"[WIT CTRL] Rate limit check passed for register {register}")
+
+            # Shared connection path — acquire hub lock, delegate to hub
+            if self._shared_conn is not None:
+                from .const import SHARED_LOCK_TIMEOUT
+                acquired = self._shared_conn._lock.acquire(timeout=SHARED_LOCK_TIMEOUT)
+                if not acquired:
+                    raise ModbusWriteError(register, [value], "Shared connection busy (lock timeout on write)")
+                try:
+                    if not self._shared_conn.ensure_connected():
+                        raise ModbusWriteError(register, [value], "Could not connect to shared Modbus gateway")
+                    success = self._shared_conn.write_register(register, value, self.slave_id)
+                finally:
+                    self._shared_conn._lock.release()
+                if not success:
+                    raise ModbusWriteError(register, [value], "Shared connection write_register returned error")
+                logger.info(f"[WRITE] Successfully wrote value {value} → register {register} (shared conn)")
+                if register in self._wit_control_registers:
+                    self._wit_control_last_write[register] = time.time()
+                    self._check_wit_control_conflicts(register, value)
+                return True
 
             self._ensure_connection("[WRITE]")
 
@@ -1862,6 +2222,23 @@ class GrowattModbus:
 
             if not values:
                 raise ModbusWriteError(register, values, "Cannot write empty values list")
+
+            # Shared connection path — acquire hub lock, delegate to hub
+            if self._shared_conn is not None:
+                from .const import SHARED_LOCK_TIMEOUT
+                acquired = self._shared_conn._lock.acquire(timeout=SHARED_LOCK_TIMEOUT)
+                if not acquired:
+                    raise ModbusWriteError(register, values, "Shared connection busy (lock timeout on write_registers)")
+                try:
+                    if not self._shared_conn.ensure_connected():
+                        raise ModbusWriteError(register, values, "Could not connect to shared Modbus gateway")
+                    success = self._shared_conn.write_registers(register, values, self.slave_id)
+                finally:
+                    self._shared_conn._lock.release()
+                if not success:
+                    raise ModbusWriteError(register, values, "Shared connection write_registers returned error")
+                logger.info(f"[WRITE_MULTI] Successfully wrote {len(values)} registers starting at {register} (shared conn)")
+                return True
 
             self._ensure_connection("[WRITE_MULTI]")
 
@@ -2038,12 +2415,16 @@ class GrowattModbus:
             return 'legacy'
 
         # Key sensors to check for valid data (non-zero indicates active range)
+        # Include both naming conventions: battery_*_today_low (most profiles) and
+        # discharge_energy_today_low / charge_energy_today_low (SPH TL3 profile)
         test_sensors = [
             'battery_voltage',
             'battery_soc',
             'battery_power_low',
             'battery_discharge_today_low',
             'battery_charge_today_low',
+            'discharge_energy_today_low',
+            'charge_energy_today_low',
         ]
 
         vpp_score = 0
@@ -2173,10 +2554,13 @@ class GrowattModbus:
                 data.energy_to_user_total = self._get_register_value(addr) or 0.0
             
             # Energy to grid
-            addr = self._find_register_by_name('energy_to_grid_today_low')
+            # Prefer 32-bit pair (_low suffix); fall back to standalone single register.
+            # SPE uses a single 16-bit register for today (Protocol V0.26 reg 45).
+            addr = self._find_register_by_name('energy_to_grid_today_low') or \
+                   self._find_register_by_name('energy_to_grid_today')
             if addr:
                 data.energy_to_grid_today = self._get_register_value(addr) or 0.0
-            
+
             addr = self._find_register_by_name('energy_to_grid_total_low')
             if addr:
                 data.energy_to_grid_total = self._get_register_value(addr) or 0.0
@@ -2318,8 +2702,31 @@ class GrowattModbus:
 
             # Battery SOC (use smart fallback if multiple ranges available)
             value = self._get_register_value_with_fallback('battery_soc')
+            # If preferred-range returns None (e.g. MIN TL-XH: VPP detected for other sensors
+            # but 'battery_soc' only exists at 3171 in the 3000-range), fall through to any
+            # address named 'battery_soc' so we never cache-freeze when VPP range is latched.
+            if value is None:
+                for _soc_addr in self._find_all_registers_by_name('battery_soc'):
+                    _soc_v = self._get_register_value(_soc_addr)
+                    if _soc_v is not None:
+                        value = _soc_v
+                        logger.debug(
+                            "battery_soc preferred-range miss — using fallback reg %d: %.1f%%",
+                            _soc_addr, value,
+                        )
+                        break
             if value is not None:
                 data.battery_soc = value
+                self._cached_battery_soc = value
+            elif self._cached_battery_soc is not None:
+                # All register ranges unavailable — use last known value to avoid reporting
+                # 0% to battery control consumers. Recovers on next successful range read.
+                data.battery_soc = self._cached_battery_soc
+                logger.warning(
+                    "battery_soc unavailable across all register ranges — "
+                    "serving last cached value %.1f%%",
+                    self._cached_battery_soc,
+                )
             else:
                 data.battery_soc = 0.0
 
@@ -2343,8 +2750,16 @@ class GrowattModbus:
             if addr:
                 value = self._get_register_value(addr)
                 if value is not None:
+                    # Some BMS firmware (e.g. JK BMS DIY) report in whole volts (raw ~54 for 54V)
+                    # while the profile scale of 0.1 assumes tenths (raw ~527 for 52.7V).
+                    # If the result is ~1/10th of battery_voltage (reg 8034, same 0.1 scale),
+                    # multiply by 10 to correct for whole-volt BMS firmware.
+                    if data.battery_voltage > 0 and value > 0 and value < data.battery_voltage * 0.2:
+                        value = round(value * 10, 1)
+                        logger.debug(f"Battery voltage BMS from reg {addr}: whole-volt BMS detected, corrected to {value}V")
+                    else:
+                        logger.debug(f"Battery voltage BMS from reg {addr}: {value}V")
                     setattr(data, 'battery_voltage_bms', value)
-                    logger.debug(f"Battery voltage BMS from reg {addr}: {value}V")
 
             # Battery power (signed: positive=charging, negative=discharging)
             # Use range-aware lookup to respect VPP vs fallback detection
@@ -2532,6 +2947,37 @@ class GrowattModbus:
             if data.battery_voltage > 0:
                 logger.debug(f"Battery summary: {data.battery_voltage}V, {data.battery_current}A, {data.battery_soc}%, {data.battery_temp}°C, Charge={data.charge_power}W, Discharge={data.discharge_power}W")
 
+            # Battery clusters 2/3/4 (VPP 31300/31400/31500 — multi-battery models e.g. WIT-XHU, MOD)
+            # Only populated when voltage > 0 so hasattr(data, 'batteryN_voltage') is a reliable gate.
+            for _bn in (2, 3, 4):
+                _pfx = f"battery{_bn}"
+                _volt_addr = self._find_register_by_name(f"{_pfx}_voltage")
+                if _volt_addr is None:
+                    continue
+                _volt = self._get_register_value(_volt_addr) or 0.0
+                if _volt <= 0:
+                    continue
+                setattr(data, f"{_pfx}_voltage", _volt)
+                for _reg in (
+                    f"{_pfx}_power",
+                    f"{_pfx}_current_low",
+                    f"{_pfx}_soc",
+                    f"{_pfx}_soh",
+                    f"{_pfx}_temp",
+                    f"{_pfx}_charge_energy_today",
+                    f"{_pfx}_charge_energy_total",
+                    f"{_pfx}_discharge_energy_today",
+                    f"{_pfx}_discharge_energy_total",
+                ):
+                    _addr = self._find_register_by_name(_reg)
+                    if _addr is not None:
+                        setattr(data, _reg, self._get_register_value(_addr) or 0.0)
+                logger.debug(
+                    f"Battery {_bn}: {_volt}V "
+                    f"SOC={getattr(data, f'{_pfx}_soc', 'N/A')}% "
+                    f"P={getattr(data, f'{_pfx}_power', 0):.0f}W"
+                )
+
             # BMS Information (SPH HU and other models with BMS monitoring)
             # Registers 1082-1120 contain detailed battery management system data
             bms_attrs = [
@@ -2571,6 +3017,63 @@ class GrowattModbus:
 
         except Exception as e:
             logger.debug(f"Battery data not available: {e}")
+
+    def _read_backup_box_data(self, data: GrowattData) -> None:
+        """Populate backup box (Growatt ARK) fields from cached 3000-range registers."""
+        try:
+            # Connection flag — must be read first so sensors.py deferred mechanism
+            # can gate the remaining 8 conditional sensors on box_connect_flag == 1.
+            addr = self._find_register_by_name('box_connect_flag')
+            if addr is None:
+                return  # Profile has no backup box registers — skip entirely
+            value = self._get_register_value(addr)
+            if value is not None:
+                data.box_connect_flag = int(value)
+
+            for attr, reg_name in (
+                ('box_bypass_status', 'box_bypass_status'),
+                ('box_work_mode',     'box_work_mode'),
+                ('box_error_code',    'box_error_code'),
+                ('box_warning_code',  'box_warning_code'),
+                ('box_relay_status',  'box_relay_status'),
+            ):
+                a = self._find_register_by_name(reg_name)
+                if a is not None:
+                    v = self._get_register_value(a)
+                    if v is not None:
+                        setattr(data, attr, int(v))
+
+            for attr, reg_name in (
+                ('box_temperature',   'box_temperature'),
+                ('box_grid_voltage',  'box_grid_voltage'),
+            ):
+                a = self._find_register_by_name(reg_name)
+                if a is not None:
+                    v = self._get_register_value(a)
+                    if v is not None:
+                        setattr(data, attr, float(v))
+
+            # 32-bit paired: call _get_register_value on the _low address
+            for attr, low_name in (
+                ('box_grid_power', 'box_grid_power_low'),
+                ('box_load_power', 'box_load_power_low'),
+            ):
+                a = self._find_register_by_name(low_name)
+                if a is not None:
+                    v = self._get_register_value(a)
+                    if v is not None:
+                        setattr(data, attr, float(v))
+
+            if data.box_connect_flag:
+                logger.debug(
+                    "Backup box: connect=%d bypass=%d mode=%d temp=%.0f°C "
+                    "grid=%.0fW load=%.0fW relay=%d",
+                    data.box_connect_flag, data.box_bypass_status, data.box_work_mode,
+                    data.box_temperature, data.box_grid_power, data.box_load_power,
+                    data.box_relay_status,
+                )
+        except Exception as e:
+            logger.debug(f"Backup box data not available: {e}")
 
     def _read_device_info(self, data: GrowattData) -> None:
         """Read device info from holding registers"""
@@ -2659,6 +3162,16 @@ class GrowattModbus:
             except Exception as e:
                 logger.debug(f"Could not read active_power_rate register: {e}")
 
+        # --- WIT Export Limit W (holding 203) ---
+        if 203 in holding_map:
+            try:
+                export_w_regs = self.read_holding_registers(203, 1)
+                if export_w_regs is not None and len(export_w_regs) >= 1:
+                    data.export_limit_w = int(export_w_regs[0])
+                    logger.debug("[WIT CTRL] Read export_limit_w: %dW", data.export_limit_w)
+            except Exception as e:
+                logger.debug(f"Could not read export_limit_w register 203: {e}")
+
         # --- Export Limit Fallback Power Rate (holding 3000, TL-X / TL-XH) ---
         if 3000 in holding_map:
             try:
@@ -2670,6 +3183,23 @@ class GrowattModbus:
                                  data.export_limit_failed_power_rate * 0.1)
             except Exception as e:
                 logger.debug(f"Could not read export_limit_failed_power_rate register 3000: {e}")
+
+        # --- Dry Contact Controls (holding 3016/3017/3019, SPH/MIN TL-X/TL-XH) ---
+        # Read as a 4-register block (3016–3019); index 2 (reg 3018 = tl_xh_priority_mode) is skipped.
+        if any(reg in holding_map for reg in [3016, 3017, 3019]):
+            try:
+                dc_regs = self.read_holding_registers(3016, 4)
+                if dc_regs is not None and len(dc_regs) >= 4:
+                    if 3016 in holding_map:
+                        data.dry_contact_enable = int(dc_regs[0])
+                    if 3017 in holding_map:
+                        data.dry_contact_on_rate = int(dc_regs[1])
+                    if 3019 in holding_map:
+                        data.dry_contact_off_rate = int(dc_regs[3])
+                    logger.debug("[DRY CONTACT CTRL] enable=%d on_rate=%d off_rate=%d",
+                                 data.dry_contact_enable, data.dry_contact_on_rate, data.dry_contact_off_rate)
+            except Exception as e:
+                logger.debug(f"Could not read dry contact control registers 3016-3019: {e}")
 
         # --- SPF Off-Grid Controls --- Read if present in profile
         # Read registers 1, 2, 8 (output config, charge config, AC input mode)
@@ -2917,6 +3447,16 @@ class GrowattModbus:
                     logger.debug("[MOD CTRL] batt_first_charge_power_rate=%s%%", data.batt_first_charge_power_rate)
             except Exception as e:
                 logger.debug(f"Could not read batt_first_charge_power_rate register 3047: {e}")
+
+        # MIN TL-XH Priority Mode (register 3018: 0=Load First, 2=Battery First, 3=Grid First)
+        if 3018 in holding_map:
+            try:
+                pm_regs = self.read_holding_registers(3018, 1)
+                if pm_regs is not None and len(pm_regs) >= 1:
+                    data.tl_xh_priority_mode = int(pm_regs[0])
+                    logger.debug("[TL-XH CTRL] tl_xh_priority_mode=%s", data.tl_xh_priority_mode)
+            except Exception as e:
+                logger.debug(f"Could not read tl_xh_priority_mode register 3018: {e}")
 
         # TL-XH / MOD Battery First charge stopped SOC (register 3048)
         if 3048 in holding_map:

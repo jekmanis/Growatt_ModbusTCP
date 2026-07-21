@@ -10,6 +10,8 @@ IMPORTANT CONTROL MODEL:
 - See docs/WIT_MODE_PRESETS.md for mode presets and docs/DIRECT_CONTROL_OVERVIEW.md for architecture
 """
 
+from .vpp_v201 import VPP_V201_PV3_AND_TOTAL, VPP_V201_BATTERY2, VPP_V201_BATTERY3
+
 # WIT 4000-15000TL3 (Three-phase hybrid with battery, 4-15kW residential)
 WIT_4000_15000TL3 = {
     'name': 'WIT 4-15kW Hybrid',
@@ -26,7 +28,7 @@ WIT_4000_15000TL3 = {
 
         # PV Total Power (32-bit)
         1: {'name': 'pv_total_power_high', 'scale': 1, 'unit': '', 'pair': 2},
-        2: {'name': 'pv_total_power_low', 'scale': 1, 'unit': '', 'pair': 1, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        2: {'name': 'pv_total_power_low', 'scale': 1, 'unit': '', 'pair': 1, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
 
         # PV String 1
         3: {'name': 'pv1_voltage', 'scale': 0.1, 'unit': 'V'},
@@ -156,7 +158,7 @@ WIT_4000_15000TL3 = {
 
         8093: {'name': 'battery_soc', 'scale': 1, 'unit': '%'},
         8094: {'name': 'battery_soh', 'scale': 1, 'unit': '%'},
-        8095: {'name': 'battery_voltage_bms', 'scale': 0.1, 'unit': 'V', 'desc': 'BMS reported voltage (more accurate than 8034)'},
+        8095: {'name': 'battery_voltage_bms', 'scale': 0.1, 'unit': 'V', 'desc': 'BMS reported voltage (auto-corrected for whole-volt BMS firmware)'},
 
         # Extra/Parallel inverter output (for multi-inverter systems) - 32-bit pairs
         # These will be 0 for single inverter installations
@@ -263,6 +265,9 @@ WIT_4000_15000TL3 = {
 
         8085: {'name': 'system_output_power_high', 'scale': 1, 'unit': '', 'pair': 8086},
         8086: {'name': 'system_output_power_low', 'scale': 1, 'unit': '', 'pair': 8085, 'combined_scale': 0.1, 'combined_unit': 'W'},
+
+        # Battery cluster 2 (31300–31323) — commercial WIT installs can have dual stacks
+        **VPP_V201_BATTERY2,
     },
     'holding_registers': {
         # ============================================================================
@@ -445,7 +450,7 @@ WIT_4000_15000TL3 = {
         # VPP Export Limitation Control
         # NOTE: Register 30208 (Export Limitation Protection Mode) is NOT used by:
         #   SPA 4000-10000TL3 BH-UP (DTC 3725), SPH 4000-10000TL3 BH-UP (DTC 3601),
-        #   WIT 100KTL3-H (DTC 5601), WIS 215KTL3 (DTC 5800)
+        #   WIT 29.9-50K-XHU (DTC 5601), WIS 210K (DTC 5800)
         # Mode descriptions for reference (VPP 2.01/2.03 documentation):
         #   0: Default mode — meter disconnect limits output to Export Limitation Failure Power;
         #      output > Export Limitation Power → inverter reports error and goes off-grid
@@ -533,7 +538,22 @@ WIT_4000_15000TL3 = {
         30424: {'name': 'vpp_tou_period5_start', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 5 start'},
         30425: {'name': 'vpp_tou_period5_end', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 5 end'},
         30426: {'name': 'vpp_tou_period5_power', 'scale': 1, 'unit': '%', 'access': 'RW', 'signed': True, 'desc': 'Period 5 power'},
-        # Periods 6-20 follow same pattern: 30427-30471
+        30427: {'name': 'vpp_tou_period6_start', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 6 start'},
+        30428: {'name': 'vpp_tou_period6_end', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 6 end'},
+        30429: {'name': 'vpp_tou_period6_power', 'scale': 1, 'unit': '%', 'access': 'RW', 'signed': True, 'desc': 'Period 6 power'},
+        30430: {'name': 'vpp_tou_period7_start', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 7 start'},
+        30431: {'name': 'vpp_tou_period7_end', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 7 end'},
+        30432: {'name': 'vpp_tou_period7_power', 'scale': 1, 'unit': '%', 'access': 'RW', 'signed': True, 'desc': 'Period 7 power'},
+        30433: {'name': 'vpp_tou_period8_start', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 8 start'},
+        30434: {'name': 'vpp_tou_period8_end', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 8 end'},
+        30435: {'name': 'vpp_tou_period8_power', 'scale': 1, 'unit': '%', 'access': 'RW', 'signed': True, 'desc': 'Period 8 power'},
+        30436: {'name': 'vpp_tou_period9_start', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 9 start'},
+        30437: {'name': 'vpp_tou_period9_end', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 9 end'},
+        30438: {'name': 'vpp_tou_period9_power', 'scale': 1, 'unit': '%', 'access': 'RW', 'signed': True, 'desc': 'Period 9 power'},
+        30439: {'name': 'vpp_tou_period10_start', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 10 start'},
+        30440: {'name': 'vpp_tou_period10_end', 'scale': 1, 'unit': 'min', 'access': 'RW', 'desc': 'Period 10 end'},
+        30441: {'name': 'vpp_tou_period10_power', 'scale': 1, 'unit': '%', 'access': 'RW', 'signed': True, 'desc': 'Period 10 power'},
+        # Periods 11-20 follow same pattern: 30442-30471
 
         # Actual Control Value (Read-only feedback)
         30474: {'name': 'vpp_actual_control_value', 'scale': 1, 'unit': '%', 'access': 'RO',
@@ -614,7 +634,61 @@ WIT_4000_15000TL3 = {
     }
 }
 
+# WIT 29900-50000TL3-XHU (Commercial, 4 MPPT, 3 battery channels, DTC 5601)
+# Hardware confirmed from manual (Issue #338): 4 MPPT trackers (50A×4 / 40A×4 per nameplate),
+# 3 battery channels at 55A each, 200-900V battery range, off-grid capable.
+# Register addresses based on the universal Growatt sequential pattern (PV1@3-6, PV2@7-10,
+# PV3@11-14). PV4 at 15-18 follows the same pattern — pending hardware register scan to confirm.
+WIT_29900_50000TL3_XHU = {
+    'name': 'WIT 29.9-50K-XHU',
+    'description': 'Commercial three-phase hybrid inverter with battery, 4 MPPT, 3 battery channels (29.9-50kW)',
+    'notes': 'DTC 5601. 5 variants: 29.9K/30K/36K/40K/50K-XHU. 4 MPPT × 2 strings max. 3 battery channels (55A×3). Off-grid capable. No Modbus register documentation available — PV4 addresses (15-18) are inferred from the universal sequential pattern and require confirmation via diagnostic register scan.',
+    'use_mppt_energy_today': True,
+    'input_registers': {
+        **WIT_4000_15000TL3['input_registers'],
+
+        # PV String 3 (registers 11-14, universal Growatt pattern — confirmed in mid, mod, sph, min)
+        11: {'name': 'pv3_voltage', 'scale': 0.1, 'unit': 'V', 'desc': 'PV3 DC voltage'},
+        12: {'name': 'pv3_current', 'scale': 0.1, 'unit': 'A', 'desc': 'PV3 DC current'},
+        13: {'name': 'pv3_power_high', 'scale': 1, 'unit': '', 'pair': 14, 'desc': 'PV3 power HIGH word'},
+        14: {'name': 'pv3_power_low', 'scale': 1, 'unit': '', 'pair': 13, 'combined_scale': 0.1, 'combined_unit': 'W'},
+
+        # PV String 4 (registers 15-18, follows sequential pattern — pending register scan verification)
+        15: {'name': 'pv4_voltage', 'scale': 0.1, 'unit': 'V', 'desc': 'PV4 DC voltage'},
+        16: {'name': 'pv4_current', 'scale': 0.1, 'unit': 'A', 'desc': 'PV4 DC current'},
+        17: {'name': 'pv4_power_high', 'scale': 1, 'unit': '', 'pair': 18, 'desc': 'PV4 power HIGH word'},
+        18: {'name': 'pv4_power_low', 'scale': 1, 'unit': '', 'pair': 17, 'combined_scale': 0.1, 'combined_unit': 'W'},
+
+        # PV3 energy today/total (67-70, following PV1@59-62 / PV2@63-66 pattern in WIT base profile)
+        67: {'name': 'pv3_energy_today_high', 'scale': 1, 'unit': '', 'pair': 68},
+        68: {'name': 'pv3_energy_today_low', 'scale': 1, 'unit': '', 'pair': 67, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        69: {'name': 'pv3_energy_total_high', 'scale': 1, 'unit': '', 'pair': 70},
+        70: {'name': 'pv3_energy_total_low', 'scale': 1, 'unit': '', 'pair': 69, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+
+        # PV4 energy today/total (71-74, following PV3 pattern above — pending verification)
+        71: {'name': 'pv4_energy_today_high', 'scale': 1, 'unit': '', 'pair': 72},
+        72: {'name': 'pv4_energy_today_low', 'scale': 1, 'unit': '', 'pair': 71, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        73: {'name': 'pv4_energy_total_high', 'scale': 1, 'unit': '', 'pair': 74},
+        74: {'name': 'pv4_energy_total_low', 'scale': 1, 'unit': '', 'pair': 73, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+
+        # VPP PV3 block (31018-31023): pv3_voltage/current/power via VPP range as fallback
+        **VPP_V201_PV3_AND_TOTAL,
+
+        # Battery clusters 2 and 3 (31300–31323, 31400–31423)
+        # 3-channel battery: 55A×3. Gate: batteryN_voltage > 0 in reading code.
+        **VPP_V201_BATTERY2,
+        **VPP_V201_BATTERY3,
+    },
+    'holding_registers': {
+        **WIT_4000_15000TL3['holding_registers'],
+        # Override DTC code for this series (5601 vs base profile's 5603)
+        30000: {'name': 'dtc_code', 'scale': 1, 'unit': '', 'access': 'RO', 'desc': 'Device Type Code: 5601 for WIT 29.9-50K-XHU', 'default': 5601},
+    },
+}
+
+
 # Export all WIT profiles
 WIT_REGISTER_MAPS = {
     'WIT_4000_15000TL3': WIT_4000_15000TL3,
+    'WIT_29900_50000TL3_XHU': WIT_29900_50000TL3_XHU,
 }

@@ -1,3 +1,5 @@
+from .vpp_v201 import VPP_V201_BATTERY3, VPP_V201_BATTERY4
+
 # MOD-6000-15000TL3-XH (Three-phase hybrid with battery, 6-15kW)
 MOD_6000_15000TL3_XH = {
     'name': 'MOD TL3-XH Series',
@@ -115,6 +117,8 @@ MOD_6000_15000TL3_XH = {
         # Energy Breakdown
         3067: {'name': 'energy_to_user_today_high', 'scale': 1, 'unit': '', 'pair': 3068},
         3068: {'name': 'energy_to_user_today_low', 'scale': 1, 'unit': '', 'pair': 3067, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        3069: {'name': 'energy_to_user_total_high', 'scale': 1, 'unit': '', 'pair': 3070, 'desc': 'Grid import energy total (HIGH word)'},
+        3070: {'name': 'energy_to_user_total_low', 'scale': 1, 'unit': '', 'pair': 3069, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'Grid import energy total (LOW word)'},
         3071: {'name': 'energy_to_grid_today_high', 'scale': 1, 'unit': '', 'pair': 3072},
         3072: {'name': 'energy_to_grid_today_low', 'scale': 1, 'unit': '', 'pair': 3071, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
         3073: {'name': 'energy_to_grid_total_high', 'scale': 1, 'unit': '', 'pair': 3074},
@@ -160,6 +164,23 @@ MOD_6000_15000TL3_XH = {
         3179: {'name': 'discharge_power_low', 'scale': 1, 'unit': '', 'pair': 3178, 'combined_scale': 0.1, 'combined_unit': 'W', 'desc': 'Battery discharge power (unsigned, positive=discharging)'},
         3180: {'name': 'charge_power_high', 'scale': 1, 'unit': '', 'pair': 3181, 'desc': 'Battery charge power HIGH (unsigned)'},
         3181: {'name': 'charge_power_low', 'scale': 1, 'unit': '', 'pair': 3180, 'combined_scale': 0.1, 'combined_unit': 'W', 'desc': 'Battery charge power (unsigned, positive=charging)'},
+
+        # === BACKUP BOX (Growatt ARK transfer switch, RS485 at regs 3281-3342) ===
+        # Confirmed active on MOD 10KTL3-XH-BP via ledermueller scan (Issue #336):
+        # reg 3282=1 (On-Grid), 3286=33°C, 3287=2340 (234.0V), 3297/3298=10898 (1089.8W), 3320=1 (connected)
+        # Same register layout as TL-XH profile.
+        3281: {'name': 'box_bypass_status', 'scale': 1,   'unit': '',   'desc': '0=Off, 1=On'},
+        3282: {'name': 'box_work_mode',     'scale': 1,   'unit': '',   'desc': '0=Offgrid, 1=Ongrid, 2=Generator'},
+        3284: {'name': 'box_error_code',    'scale': 1,   'unit': '',   'desc': 'Error code (700-800 range)'},
+        3285: {'name': 'box_warning_code',  'scale': 1,   'unit': '',   'desc': 'Warning code (700-800 range)'},
+        3286: {'name': 'box_temperature',   'scale': 1,   'unit': '°C', 'signed': True, 'desc': 'NTC temperature, Int8, -40 to 100°C'},
+        3287: {'name': 'box_grid_voltage',  'scale': 0.1, 'unit': 'V',  'desc': 'Grid voltage'},
+        3289: {'name': 'box_grid_power_high', 'scale': 1, 'unit': '', 'pair': 3290, 'signed': True, 'desc': 'Grid power HIGH (Int32, positive=import)'},
+        3290: {'name': 'box_grid_power_low',  'scale': 1, 'unit': '', 'pair': 3289, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True, 'desc': 'Grid power LOW'},
+        3297: {'name': 'box_load_power_high', 'scale': 1, 'unit': '', 'pair': 3298, 'desc': 'Load power HIGH (Uint32)'},
+        3298: {'name': 'box_load_power_low',  'scale': 1, 'unit': '', 'pair': 3297, 'combined_scale': 0.1, 'combined_unit': 'W', 'desc': 'Load power LOW'},
+        3320: {'name': 'box_connect_flag',  'scale': 1,   'unit': '',   'desc': '0=Abnormal/absent, 1=Normal/connected'},
+        3342: {'name': 'box_relay_status',  'scale': 1,   'unit': '',   'desc': '0=Not supported/comm error, 1=Open, 2=Close'},
 
         # === BATTERY INFORMATION 1 (31200-31299) - Official VPP Protocol V2.01 ===
         # This is the official battery data range for MOD series per Growatt VPP Protocol
@@ -226,12 +247,17 @@ MOD_6000_15000TL3_XH = {
         31309: {'name': 'battery2_discharge_energy_total_low', 'scale': 1, 'unit': '', 'pair': 31308, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
         # Battery 2 State
-        31314: {'name': 'battery2_voltage', 'scale': 0.1, 'unit': 'V', 'signed': True},
+        31314: {'name': 'battery2_voltage', 'scale': 0.1, 'unit': 'V', 'signed': True,
+                'desc': 'Battery 2 voltage (0 = not connected)'},
         31315: {'name': 'battery2_current_high', 'scale': 1, 'unit': '', 'pair': 31316},
         31316: {'name': 'battery2_current_low', 'scale': 1, 'unit': '', 'pair': 31315, 'combined_scale': 0.1, 'combined_unit': 'A', 'signed': True},
         31317: {'name': 'battery2_soc', 'scale': 1, 'unit': '%'},
         31318: {'name': 'battery2_soh', 'scale': 1, 'unit': '%'},
         31323: {'name': 'battery2_temp', 'scale': 0.1, 'unit': '°C', 'signed': True},
+
+        # Battery clusters 3 and 4 (VPP V2.03 spec, gate: batteryN_voltage > 0)
+        **VPP_V201_BATTERY3,
+        **VPP_V201_BATTERY4,
 
         # === V2.01 VPP ADDITIONAL REGISTERS (31100+ range) ===
         # Per VPP 2.01 protocol spec (same layout as MID — confirmed on MID via #245 scan):

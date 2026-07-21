@@ -4,6 +4,649 @@
 
 ---
 
+## v1.0.13
+
+Issues: #352
+
+- **Fix: backup box sensors now appear on MIN/TL-XH inverters (#352):**
+  All 9 backup box sensors (`box_bypass_status`, `box_work_mode`, `box_error_code`,
+  `box_warning_code`, `box_temperature`, `box_grid_voltage`, `box_grid_power`,
+  `box_load_power`, `box_relay_status`) were missing from Home Assistant despite the
+  hardware reporting live data. Root cause: `read_all_data()` cached the 3000-range
+  registers correctly but had no code to map them into the `GrowattData` dataclass fields —
+  all 10 `box_*` fields remained permanently at their default value of 0. Adds a new
+  `_read_backup_box_data()` method that populates all backup box fields from the register
+  cache using the existing `_find_register_by_name` / `_get_register_value` pattern.
+  Only `box_connect_flag` must be non-zero for the other 8 conditional sensors to appear;
+  `box_connect_flag` itself is always created so its value is always visible.
+
+- **Fix: diagnostic scanner correctly identifies MIN/TL-XH when DTC confidence is downgraded (#352):**
+  The DTC-based detection correctly identifies a MIN 4200TL-XH as `tl_xh_3000_10000_v201`
+  (DTC 5100 → "Very High" confidence). However, when register 30099 reads 0 (legacy
+  protocol), confidence is downgraded to "High" to indicate the legacy profile variant should
+  be used. The early-return guard checked `confidence == "Very High"` and therefore missed
+  the downgraded case, allowing register heuristics to overwrite the correct DTC result with
+  "MOD 6000-15000TL3-XH (Hybrid)". Fixed by checking `detection.get("dtc_code") and
+  detection.get("profile_key")` instead — any matched DTC always wins over heuristics.
+
+---
+
+## v1.0.12
+
+Issues: #351
+
+- **Fix: eliminate repeated "Skipping..." debug log messages during suppression windows (#351):**
+  After the first failure of the 3000-range block (or a VPP optional range), the integration
+  suppresses retries for 5 minutes. During this window it previously logged a debug message on
+  every single poll ("Skipping 3000-range block... retry in Xs"), producing hundreds of
+  identical log lines over a session. The skip is now silent — the initial failure warning and
+  the "Retrying..." message at the end of each suppression window provide all necessary context.
+
+---
+
+## v1.0.11
+
+Issues: #336
+
+- **Fix: backup box sensors now appear on MOD/MID hybrid inverters (#336):**
+  The MOD 10KTL3-XH-BP and related -XH variants support the Growatt ARK backup box
+  (transfer switch) via registers 3281-3342. These registers were present in the TL-XH
+  profile but missing from the MOD profile, so no backup box sensors appeared in HA even
+  when the box was physically connected (reg 3320=1). Field scan from ledermueller confirmed
+  live data on a MOD 10KTL3-XH-BP (box_temperature=33°C, box_grid_voltage=234.0V,
+  box_load_power=1089.8W). The fix adds the full 3281-3342 block to MOD_6000_15000TL3_XH
+  and enables BACKUP_BOX_SENSORS for the `mod_6000_15000tl3_xh`,
+  `mod_6000_15000tl3_xh_v201`, and `mid_11000_30000tl3_xh_v201` profiles.
+
+---
+
+## v1.0.10
+
+Issues: #351
+
+- **Fix: Remaining transaction ID mismatches in shared connection mode (#351):**
+  A single buffer flush after acquiring the lock cleared bytes already in the TCP buffer,
+  but RS485 bytes still in transit through the gateway arrived milliseconds later — after
+  the flush but before the first request, causing the occasional TID mismatch that survived
+  v1.0.9. Fix: double-flush with a 30ms pause between flushes, giving in-flight RS485
+  bytes time to arrive so the second flush catches them.
+
+- **Fix: 3000-range register block warning flood in multi-inverter setups (#351):**
+  In a setup with two different inverter models (e.g. SPH + MOD), the 3000-range register
+  block may be defined for one profile but consistently rejected by the other inverter.
+  Every failed read logged a WARNING every ~70 seconds. Fix: the 3000-range block now uses
+  the same skip-on-failure caching as the VPP 31000+ blocks — the first failure logs a
+  WARNING once, then the block is skipped silently for 5 minutes before retrying.
+
+---
+
+## v1.1.0
+
+Issues: #322
+
+- **New: SPE 8000-12000 ES grid-tie export sensors (#322):**
+  Added grid export energy sensors for the SPE 8000-12000 ES single-phase hybrid inverter:
+  - **Energy to Grid Today** — input reg 45, single 16-bit register, 0.1 kWh resolution
+    (confirmed per Off-Grid Protocol V0.26; prior implementation incorrectly used a 32-bit pair)
+  - **Energy to Grid Total** — input regs 46/47, 32-bit pair, 0.1 kWh resolution
+
+- **New: SPE 8000-12000 ES grid-tie controls (#322):**
+  Added ten writable holding registers for SPE grid-tied export configuration:
+  | Register | Name | Description |
+  |----------|------|-------------|
+  | 115 | Grid Export Enable | Enable/disable grid feed |
+  | 116 | Output Priority | Charge First / Load First / Feed First |
+  | 117 | Feed Range | Grid compliance region (Asia/Europe/S.America/S.Africa) |
+  | 118 | Battery Export Enable | Enable battery-to-grid export |
+  | 119 | Export Power Limit | Max export power (0–12 kW) |
+  | 120 | Battery Export Max Current | Max battery current for export (0–400 A) |
+  | 121 | Battery Feed Voltage Loss | Voltage at which export stops (42–54V) |
+  | 122 | Battery Feed Voltage Back | Voltage to resume export (44–56V) |
+  | 123 | Export Min SOC | Minimum SOC to allow export (5–90%) |
+  | 124 | Export Back SOC | SOC to resume export after stopping (15–100%) |
+
+  All controls are SPE-specific and will not appear on other profiles.
+  Valid ranges are taken from Off-Grid Protocol V0.26; some differ from nicauswu's original
+  implementation (regs 120, 123, 124) and are pending field validation.
+
+- **Fix: profile-specific writable register filtering (#322):**
+  Register 123 is `export_limit_power` on SPH/XH but `export_min_soc` on SPE. A new
+  `only_profiles` / `not_profiles` filter on `WRITABLE_REGISTERS` entries prevents
+  cross-profile contamination. The filter is applied in both `number.py` and `select.py`.
+
+---
+
+## v1.0.9
+
+Issues: #351
+
+- **Fix: Remaining transaction ID mismatches in shared connection mode (#351):**
+  With a persistent shared TCP connection, late RS485 responses from a previous slave's poll
+  could arrive in the adapter's buffer after the lock was released. When the next slave acquired
+  the lock and started reading, those stale bytes produced transaction ID mismatches
+  ("request ask for id=X but got id=Y"). Fix: the receive buffer is now flushed at the start
+  of every locked poll cycle, not just on reconnect.
+
+- **Fix: Shared connection lock timeout with slow/failing register blocks (#351):**
+  The 3000-range register block does not have the same skip-on-failure caching as the VPP 31000
+  range. A failing 3000-range chunk costs a full TCP timeout (10s) per chunk, and multiple
+  failing chunks could push the total poll time past the 30s lock timeout, causing the other
+  coordinator to log "Shared Modbus connection busy (lock timeout 30s)" and skip its poll.
+  `SHARED_LOCK_TIMEOUT` increased from 30s to 60s to accommodate realistic worst-case poll times.
+
+---
+
+## v1.0.8
+
+Issues: #351
+
+- **New: Shared Modbus connection mode for multi-inverter RS485-to-TCP gateways (Issue #351):**
+  When two integration entries point at the same RS485-to-TCP gateway (identical host:port, different
+  slave IDs), the integration now automatically shares a single `ModbusTcpClient` TCP socket between
+  them instead of opening two independent connections.
+
+  **Why this matters:** Consumer gateways like the USR-DR164 accept both TCP connections but cannot
+  correctly demultiplex RS485 responses back to the right session under simultaneous load. The result
+  is transaction ID mismatches ("request ask for id=2 but got id=3") and corrupted readings as each
+  slave's response is delivered to the wrong TCP session.
+
+  **How it works:** Detection is automatic — no configuration required. At setup, if a second entry
+  shares the same host:port as an existing one, both coordinators use the same `SharedModbusConnection`
+  hub. All reads and writes are serialized through a `threading.Lock`, ensuring one slave's complete
+  request/response cycle finishes before the next begins. A 50ms inter-slave pause is added after
+  each poll to let the RS485 bus settle (configurable via `inter_slave_delay` option).
+
+  Recovery: if the connection drops mid-read, the lock is always released (via `finally` block) and
+  the hub reconnects + flushes stale buffer bytes on the next poll. Lock acquisitions time out after
+  30s to prevent a hung coordinator from blocking others indefinitely.
+
+  Serial connections are not affected (each serial device opens its own file handle; same-device
+  multi-slave serial setups are unusual and typically handled by the OS serial stack).
+
+---
+
+## v1.0.7
+
+- **New: Backup Box support (Growatt ARK transfer switch, TL-XH/MIN TL-XH):**
+  The Growatt ARK backup box connects via RS485 to TL-X/TL-XH inverters and reports its status
+  through the inverter's Modbus interface at input registers 3281-3342.
+
+  Auto-detected via register 3320 (`bBoxConnectFlag`): when the backup box is present and
+  communicating, its sensors appear automatically — no config flow option required. If no backup
+  box is connected, the register reads 0 and no sensors are created.
+
+  Sensors added to TL-XH, TL-XH US, and MIN TL-XH profiles:
+  - **Backup Box Status** — Normal / Abnormal (diagnostic, disabled by default)
+  - **Backup Box Work Mode** — Off-Grid / On-Grid / Generator
+  - **Backup Box Bypass** — On / Off (bypass switch state)
+  - **Backup Box Temperature** — NTC sensor temperature (°C)
+  - **Backup Box Grid Voltage** — Grid voltage seen by the backup box (V)
+  - **Backup Box Grid Power** — Signed grid power (W, positive = import)
+  - **Backup Box Load Power** — Total load power behind the backup box (W)
+  - **Backup Box Error / Warning Code** — diagnostic, disabled by default
+  - **Backup Box Relay** — Open / Closed (diagnostic, disabled by default)
+
+  All sensors (except Status) are gated on `bBoxConnectFlag == 1` and appear only when the
+  backup box is connected. Sensors are assigned to a dedicated "Backup Box" HA device linked
+  to the parent inverter.
+
+---
+
+## v1.0.6
+
+Issues: #349
+
+- **Fix: WIT 50-100K-H/HE/HU/A/AE/AU (DTC 5600) auto-detected as MID profile instead of WIT (Issue #349):**
+  DTC 5600 covers the large commercial WIT range but was incorrectly routed to
+  `mid_15000_25000tl3_x_v201` in the DTC map. The result was a completely wrong sensor set,
+  -2738.6°C battery temperature, and broken controls for WIT 100K-HU hardware.
+
+  Fix: DTC 5600 now routes to `wit_29900_50000tl3_xhu` (the WIT 29.9-50K-XHU profile) as an
+  interim. This immediately restores correct PV string sensors (4 strings, registers 3-18), all
+  8000-range battery sensors (SOC, SOH, voltage, current), and grid/load energy registers.
+
+  Note: VPP battery cluster registers 31200-31399 return "Illegal Function" on WIT 100K-HU
+  hardware (confirmed via register scan). `battery_power` and `battery_temp` will show as
+  unavailable rather than garbage values. A dedicated WIT 100K-HU profile addressing those
+  sensors is planned once additional register data is confirmed (tracked in issue #349).
+
+---
+
+## v1.0.5
+
+Issues: #345
+
+- **Fix: SPF battery power stays wrong sign indefinitely after grid-to-battery transition (Issue #345):**
+  The SPF sign correction (issue #174) covers `CHARGING_STATES = {5,6,7,8,9,10}`, but the
+  inverter transitions through status **8** (Combine Charge+Bypass) only during the mode switch
+  itself. Once the transition completes, the inverter settles to status **12** (PV
+  Charge+Discharge), which was explicitly excluded as "ambiguous". With PV >> load in status 12,
+  the battery is unambiguously net-charging, but `battery_power` retains its incorrect negative
+  sign and no correction fires — leaving the sensor stuck at the wrong value until the
+  integration is reloaded.
+
+  Fix: status 12 is now resolved using a power-balance check rather than being skipped outright.
+  If PV power exceeds AC load by more than 200 W and `battery_power` is negative, the sign is
+  corrected (battery is net-charging). If load exceeds PV by more than 200 W and
+  `battery_power` is positive, it is also corrected (battery is net-discharging). Values within
+  the 200 W balance margin are left unchanged to avoid flip-flopping when PV ≈ load.
+
+---
+
+## v1.0.4
+
+Issues: #346, #348, #350
+
+- **Fix: WIT Grid Import Energy jitters due to formula calculation instead of hardware registers (Issue #346):**
+  The grid import energy sensors (`grid_import_energy_today` / `_total`) use hardware registers
+  on SPH and XH-hybrid profiles, but for WIT inverters they fell through to the calculated
+  formula `max(0, load − solar + export)`. WIT profiles have dedicated `energy_to_user_today/total`
+  registers (8067-8078) that report hardware-measured grid import directly. The result was
+  artificial jitter as the formula's three inputs moved independently.
+
+  Fix: `"wit_" in inverter_series` added to the `has_hardware_import` check, routing WIT
+  models to the hardware-register path (same as SPH/XH) and bypassing the formula.
+
+- **Fix: MOD 6000-15000TL3-X shows wrong inverter status and spurious PV Energy Total sensor (Issue #348):**
+  Two bugs in the MOD X (grid-tied) profile:
+
+  1. **Status codes:** `MOD_6000_15000TL3_X` was erroneously included in `PROFILE_STATUS_MAP`
+     with value `'hybrid'`, causing status code `1` to display as *"Self-Test"* instead of
+     *"Normal"* on this purely grid-tied inverter. Removed; MOD X now uses the default
+     `STATUS_CODES` (0=Waiting, 1=Normal, 3=Fault).
+
+  2. **PV Energy Total sensor:** `PV_DC_ENERGY_SENSORS` (which includes `pv_energy_total`) was
+     included in MOD X's sensor group, but the MOD X register map has no backing registers for
+     that sensor (registers 91-92 are absent in the grid-tied profile). The result was a
+     permanently-zero entity. Excluded `PV_DC_ENERGY_SENSORS` from the MOD X sensor composition.
+
+- **Fix: Battery SOC freezes indefinitely on MIN TL-XH when VPP range is preferred (Issue #350):**
+  On MIN TL-XH the VPP protocol suffix (`_vpp`) is used on the 31000-range battery registers
+  (e.g. `battery_soc_vpp` at 31217) to prevent them overriding the authoritative 3000-range
+  registers. However, `_get_register_value_with_fallback('battery_soc')` with `preferred_range
+  = 'vpp'` only searches addresses ≥ 31000. Since no register named exactly `battery_soc`
+  exists in that range, it returned `None`, and the `_cached_battery_soc` last-known-good
+  value was served forever — freezing SOC for days with no recovery path.
+
+  Fix: after `_get_register_value_with_fallback` returns `None`, the code now iterates **all**
+  registers named `battery_soc` regardless of range and uses the first one that has a cached
+  value. This covers MIN TL-XH's register 3171 when VPP is the detected range, and ensures
+  the warning message only fires when no range at all can serve a value.
+
+---
+
+## v1.0.3
+
+Issues: #337, #341, #342
+
+- **Fix: SPH 3-6kW (DTC 3502) still auto-detects as `sph_8000_10000_hu` due to floating PV3 input (Issue #337):**
+  The v1.0.2 detection reorder (check PV3 before reg 1086) was correct but incomplete.
+  On 2-string SPH 3-6kW inverters the unconnected PV3 input floats at ~0.1 V, so legacy
+  register 11 reads raw `1`. The `> 0` threshold treated this residual as "PV3 present",
+  triggering the HU branch.
+
+  Two-part fix:
+  1. **Trust V2.01 when readable** — if the V2.01 PV3 register (31018) returns any value
+     (including 0), that response is authoritative and the legacy reg-11 fallback is skipped
+     entirely. A V2.01 unit with no PV3 correctly returns `0`; reg-11 is never consulted.
+  2. **Noise-floor threshold on reg-11** — when the legacy fallback is still needed (V2.01
+     range not available), the threshold is raised from `> 0` to `> 30` (3 V at ×0.1 scale).
+     Floating inputs read ~1 raw; any genuinely energised PV string reads 300+ under daylight.
+
+- **Fix: Optional VPP range re-logs WARNING every ~5 minutes forever on single-battery SPH/MIN (Issue #341):**
+  The retry logic deleted the failure entry before re-reading the range. If the re-read
+  failed again, `.get()` returned `None` and the fail count reset to 1, re-triggering the
+  WARNING on every retry cycle. The "warn once, then DEBUG" intent was effectively unreachable
+  for permanently absent ranges (e.g. battery cluster-2/3/4 on a single-battery unit).
+
+  Fix: the entry is no longer deleted before the retry read. The existing count survives, so
+  subsequent failures increment past 1 and log at DEBUG only. The entry is cleared on a
+  successful read so the next genuine failure gets its own first-occurrence WARNING.
+
+- **Fix: TOU time writes cross-contaminate sibling registers on back-to-back writes (Issue #342):**
+  The atomic FC16 write for SPH and MOD TOU periods read sibling registers (the one not being
+  set) from `coordinator.data`, which is up to `scan_interval` (default 60 s) stale. Writing
+  start and then end within one poll window caused the end-write to read the old start from
+  cache and write it back, silently reverting the start. Predbat and other controllers that
+  program start+end ~1 s apart were consistently affected.
+
+  Fix: both `GrowattGenericTime` and `GrowattModTouTime` now perform a fresh hardware read of
+  the full register triple/pair immediately before the FC16 write. The cached data is used only
+  as a fallback if the fresh read fails.
+
+---
+
+## v1.0.2
+
+Issues: #336
+
+- **Fix: Grid Import Energy Today/Total uses formula instead of hardware register when register reads 0 (Issue #336 follow-up):**
+  The hardware-path gate for SPH/XH hybrid models had an `energy_to_user_today > 0` guard.
+  When the register legitimately read 0 (no grid import yet that day — common early morning),
+  the guard evaluated `False` and the code fell through to the broken formula:
+  `load + export − energy_today`. On MOD-XH and other XH hybrids, `energy_today` is MPPT DC
+  yield rather than AC output, so the formula produces a non-zero result that rises during
+  morning load and then declines as PV output overtakes consumption — a characteristic
+  curve entirely unrelated to actual grid import.
+
+  Fix: removed the `> 0` guard. The hardware register is now used unconditionally for
+  SPH/XH profiles; zero is a valid reading meaning no grid import has occurred yet today.
+  Same fix applied to the `grid_import_energy_total` (lifetime) sensor.
+
+- **Fix: Grid Energy Today/Total (net grid) shows wrong negative value on XH hybrids (Issue #336 follow-up):**
+  The `grid_energy_today` and `grid_energy_total` net sensors were independently re-deriving
+  grid import using the same broken formula (`load + export − energy_today`) rather than
+  reading the hardware `energy_to_user_today/total` registers directly. This meant even
+  after `grid_import_energy_total` was fixed to report 740.3 kWh from hardware, the net
+  sensor was still computing `327.5 − 1058.5 = −731 kWh` instead of the correct
+  `327.5 − 740.3 = −412.8 kWh`.
+
+  Fix: for SPH and XH hybrid profiles, the net sensors now source their import component
+  from `energy_to_user_today/total` (the same hardware register the import sensors use),
+  not from the formula. Non-hybrid models (MIN, MIC, etc.) continue to use the formula,
+  which is correct for those architectures.
+
+---
+
+## v1.0.1
+
+Issues: #339, #340
+
+- **Fix: Battery SOC permanently stuck at 0% after a single VPP read failure (Issue #340):**
+  The optional VPP register range (31000+) was latched permanently into a skip-list after a
+  single transient read failure. Any inverter that returned a timeout or exception on first boot
+  (e.g. network hiccup, slow inverter startup) would never attempt to read VPP battery registers
+  again for the entire session, leaving `battery_soc` at 0% until a Home Assistant restart.
+
+  Two-part fix:
+  1. **Time-based retry** — the skip-list is now a dict keyed by range address with a
+     `(fail_time, fail_count)` value. Failed ranges are retried after 300 seconds. A `WARNING`
+     is logged on the first failure; subsequent failures within the window log at `DEBUG`.
+  2. **SOC cache** — within the retry window, the last known-good SOC value is served instead
+     of 0.0. The `WARNING` message explicitly says the cached value is being used and will
+     recover automatically.
+
+- **New: Dry contact relay controls (Issue #339):**
+  SPH and MIN TL-X/TL-XH inverters have a hardware dry contact output (relay) that can be
+  triggered when PV output crosses a configurable power threshold. The V1.39 protocol exposes
+  this via four registers: three writable controls in the holding register range and one
+  read-only state register in the input register range.
+
+  New controls (appear automatically when the profile contains the registers):
+  - **Dry Contact Enable** (reg 3016) — select entity: `Disabled` / `Enabled`
+  - **Dry Contact On Rate** (reg 3017) — number entity: 0.0–100.0%, step 0.1% — power
+    threshold at which the relay closes
+  - **Dry Contact Off Rate** (reg 3019) — number entity: 0.0–100.0%, step 0.1% — power
+    threshold at which the relay opens
+  - **Dry Contact State** (reg 3119) — diagnostic sensor (disabled by default): `Off` / `On` —
+    current relay state
+
+  Profiles updated: SPH 3-6kW, SPH 7-10kW, SPH 8-10kW HU, SPH-TL3 3-10kW, MIN 3-6kW,
+  MIN 7-10kW (and their corresponding V2.01 variants which inherit automatically).
+
+---
+
+## v1.0.0
+
+Issues: #338
+
+- **New: Multi-battery channel support — Battery 2, 3, 4 (VPP V2.01/V2.03):**
+  Per VPP V2.03 specification, additional battery channels occupy mirrored 100-register blocks
+  at 31300–31399 (cluster 2), 31400–31499 (cluster 3), and 31500–31599 (cluster 4), with
+  identical layout to cluster 1 (31200–31299). All three extra channels are now fully implemented
+  across the register profiles, reading code, and HA sensor pipeline.
+
+  Each channel exposes 10 sensors per battery: Voltage, Current, Power, State of Charge, State of
+  Health, Temperature, Charge Energy Today, Charge Energy Total, Discharge Energy Today, Discharge
+  Energy Total. Sensors are disabled by default and only created when the channel's voltage register
+  returns a non-zero value at startup (reliable "battery connected" gate — avoids creating dead
+  entities for unpopulated channels).
+
+  Profiles updated:
+  - **WIT 4-15kW**: Battery 2 (31300–31323) added — commercial installations commonly pair two
+    battery stacks.
+  - **WIT 29.9-50K-XHU**: Battery 2 (31300–31323) and Battery 3 (31400–31423) added — matches
+    the 3-channel (55A×3) hardware specification.
+  - **MOD TL3-XH**: Battery 3 (31400–31423) and Battery 4 (31500–31523) added — Battery 2
+    was already mapped; now complete for 4-channel configurations.
+  - **SPH, TL-XH, SPH-TL3**: Battery 2 register block expanded from 8 registers to the full
+    18-register set (added charge/discharge energy today/total, correct paired current registers,
+    SOH). Register addresses unchanged; names corrected (`battery2_charge_power` →
+    `battery2_charge_energy_today`, temperature moved from 31322 → 31323 per spec).
+
+---
+
+## v0.9.10
+
+Issues: #333, #336, #337
+
+- **Fix: MOD-XH `Grid Import Energy Today/Total` shows wrong values (Issue #336):**
+  The calculated grid import formula (`load + export − energy_today`) is incorrect on MOD-XH models
+  because `energy_today` on those profiles is PV DC string energy (due to `use_mppt_energy_today:
+  True`), not AC inverter output. The formula omits the battery charge/discharge contribution,
+  producing a result inflated by net battery discharge. For example: load 38.7 kWh, export 1.2 kWh,
+  PV DC 37.9 kWh → formula gives 2.0 kWh; correct value per energy balance and hardware register
+  is 0.8 kWh. The fix: MOD-XH (and any profile with "xh" in its series name) now reads grid import
+  from the hardware registers directly (`energy_to_user_today` at 3067/3068 and
+  `energy_to_user_total` at 3069/3070), bypassing the calculation entirely. This matches what
+  Growatt's own cloud portal reports. The Total sensor discrepancy (1037.90 vs 725.1 kWh) is
+  pre-existing HA long-term statistics corruption from before v0.9.9 and requires a manual stats
+  reset in HA's energy dashboard — the raw sensor value will now be correct.
+
+- **Fix: SPH time period start/end writes silently revert (Issue #333):**
+  SPH firmware rejects FC06 single-register writes to time period start/end registers — the write
+  is acknowledged by Modbus but the inverter reverts the value within ~6 seconds. All SPH time
+  period controls (AC charge periods 1–3 at registers 1100–1108, Battery First periods 4–6 at
+  1017–1025, Grid First periods 4–9 at 1026–1034 and 1080–1088) now use an atomic FC16 write that
+  sends all three registers in the triple [start, end, enable] in a single transaction. This matches
+  the write behaviour already used for MOD TOU periods, which resolved the same issue on MOD hardware.
+  Falls back to FC06 if sibling registers cannot be resolved (e.g. non-SPH profiles that use
+  `GrowattGenericTime` for other purposes).
+
+- **Fix: SPH 3-6kW auto-detects as `sph_8000_10000_hu` (Issue #337):**
+  The DTC-3502 refinement previously checked register 1086 before checking PV3 string presence.
+  Register 1086 responds on all SPH models with a battery (it returns battery SOC on 3-6kW units),
+  so the HU branch fired immediately for any 3-6kW SPH with a battery installed, regardless of
+  actual model. The detection order is now: (1) check PV3 — if absent return `sph_3000_6000_v201`
+  immediately (HU is a 3-string model, so 2-string units are excluded unconditionally); (2) if PV3
+  confirmed, check register 1086 to distinguish HU from 7-10kW.
+
+- **Fix: DTC display names corrected for WIS/WIT commercial models:**
+  Per VPP V2.03 specification: DTC 5601 is WIT 29.9-50K-XHU (not "WIT 100KTL3-H"); DTC 5800 is
+  WIS 210K (not "WIS 215KTL3"). Updated in `diagnostic.py`, `auto_detection.py`, `wit.py`, and
+  `docs/developer/protocol-vpp.md`.
+
+- **New: WIT 29.9-50K-XHU profile (Issue #338):**
+  New dedicated profile `wit_29900_50000tl3_xhu` for the 5-variant WIT XHU commercial hybrid series
+  (29.9K / 30K / 36K / 40K / 50K-XHU). DTC 5601 now correctly maps to this profile instead of the
+  MID grid-tied profile. Hardware confirmed from manual: 4 MPPT trackers (50 d.c.A×4 / 40 d.c.A×4),
+  3 battery channels (55A×3), 200-900V battery range, off-grid capable, three-phase 3P3W+PE/3P4W+PE.
+  The profile inherits the full WIT register set and adds PV3 (registers 11-14, universally confirmed
+  pattern) and PV4 (registers 15-18, inferred from sequential pattern — pending hardware register scan
+  verification). PV3/PV4 energy today/total registers at 67-74 follow the WIT per-MPPT energy tracking
+  pattern. PV4 sensors are disabled by default and gate on a non-zero voltage reading. The per-MPPT
+  `energy_today` sanity limit is raised from 100 kWh to 1000 kWh to accommodate 50 kW 4-string
+  commercial systems on high-production days. Battery channel 2/3 registers require Modbus
+  documentation (not in manual) — to be addressed when register documentation becomes available.
+
+---
+
+## v0.9.9
+
+Issues: #335, #336
+
+- **Fix: ENERGY_GUARD false-zeroes WIT 15K daily sensors after gateway reconnect (Issue #335):**
+  The stale-data debounce logic contained a `hours_since_midnight × 2 kWh/h` heuristic to detect
+  stale daily totals after a wake-up event. For high-output systems (WIT 15KTL3 produces 70+ kWh/day),
+  this correctly classifies a legitimate 50 kWh mid-afternoon reading as "too high" and resets all
+  daily energy sensors to 0, permanently corrupting that day's stats. The heuristic is removed;
+  only an exact match against yesterday's final value is used as a stale indicator.
+
+- **Fix: ENERGY_GUARD spike threshold too low for WIT 15K (Issue #335):**
+  The 20 kWh spike-rejection threshold blocked legitimate first-reads after a gateway reconnect on
+  high-output profiles. WIT profiles now use an 80 kWh threshold (their full daily production is
+  the maximum realistic single-poll reading, and genuine word-tear glitches produce values in the
+  thousands of kWh).
+
+- **Docs: WIT DTC 5603 confirmed (Issue #335):**
+  Register 30000 = 5603 on a WIT 15KTL3 hardware unit confirmed by community contributor Wojak129.
+  This DTC was already mapped in auto-detection since v0.0.7-beta4 — this is independent field
+  confirmation. Added to protocol-vpp.md DTC table with source note.
+
+- **Docs: Registers 30407/30408/30409 are EEPROM-safe ("Not storage"):**
+  The VPP V2.03 spec explicitly marks these as "Not storage" — they bypass non-volatile memory
+  and are safe for high-frequency automation (e.g., updating charge/discharge power every minute).
+  Register 30408 = 0 means unlimited/continuous control with no automatic timeout. Documented in
+  wit-guide.md.
+
+- **Docs: VPP export limitation section added to wit-guide.md:**
+  Registers 30200–30208 now documented including the 5000W legacy register 203 grid compliance cap
+  explanation, VPP standby hazard table, and note that 30208 is not used by WIT/WIS models.
+
+- **Fix: MOD/MID-XH `Grid Import Energy Total` missing (Issue #336):**
+  Registers 3069/3070 (`energy_to_user_total_high/low`) were absent from `mod.py` despite 3067/3068
+  (daily) and 3071–3074 (grid export) being present — a clear omission in the 3067–3074 block.
+  Without these registers the coordinator fell back to VPP 31120/31121, which returns a different
+  (inflated) value on MID 15KTL3-XH hardware and oscillates due to non-atomic word reads, causing
+  the `total_increasing` HA sensor to show backward steps and corrupt the energy dashboard.
+  Adding 3069/3070 restores the stable 3000-range source (matching the register scan value) and
+  eliminates the drops.
+
+- **Hardware contributor credit:** [@Wojak129](https://github.com/Wojak129) — WIT 15KTL3 field
+  testing, DTC 5603 confirmation, register scanning, official VPP protocol documentation obtained
+  from Growatt service (Poland), and safety limit discovery that led to v0.9.8 safety fixes.
+
+---
+
+## v0.9.8
+
+Issues: #335
+
+- **Safety fix: WIT `vpp_export_limit_power_rate` (reg 30201) clamped to 0–100% (Issue #335):**
+  The entity previously allowed negative values (−100 to +100%). On WIT hardware, writing a
+  negative value to register 30201 while VPP is active triggers **warning 401** and puts the
+  inverter into a fault state requiring a service technician reset. The minimum is now 0%
+  (zero export). Negative values are not valid export throttle commands on this hardware.
+
+- **Fix: WIT `Export Limit (W)` number entity removed (Issue #335):**
+  Holding register 203 is not writable on WIT inverters — writes are rejected with an
+  application-level error even when `control_authority`, `vpp_export_limit_enable`, and
+  `remote_power_control_enable` are all enabled. The misleading writable entity has been
+  removed. The register continues to be polled and its value is available in coordinator
+  data. Existing stale entities are cleaned up automatically on upgrade.
+
+---
+
+## v0.9.7
+
+Issues: #331
+
+> **Note:** WIT TOU schedule entities are new and untested on hardware.
+> Please report any write failures or unexpected inverter behaviour on issue #331.
+
+- **Improvement: WIT TOU period start/end times use proper HA time pickers:**
+  Start and end time entities for TOU periods 1–10 are now `TimeEntity` instances showing a
+  native HH:MM time picker, replacing the previous number inputs that required entering
+  minutes since midnight (e.g. 480 for 08:00). Existing v0.9.6 number entities are
+  automatically removed from the entity registry on upgrade.
+
+---
+
+## v0.9.6
+
+Issues: #331
+
+> **Note:** WIT TOU schedule entities are new and untested on hardware.
+> Please report any write failures or unexpected inverter behaviour on issue #331.
+
+- **Feature: WIT VPP Time-of-Use schedule controls (Issue #331):**
+  The WIT profile already had TOU period registers mapped (30411–30441) but no Home Assistant
+  entities to control them. Ten periods are now exposed with entities per period:
+  - **Start time** — HH:MM time picker (v0.9.7+); previously minutes since midnight
+  - **End time** — HH:MM time picker (v0.9.7+); previously minutes since midnight
+  - **Power level** — signed percentage (−100% to +100%; negative = discharge, positive = charge)
+  - **Active period count** (reg 30411, 0–20) — already existed; now accompanied by period entities
+
+  Setting a period with a negative power value during peak tariff hours forces the inverter to
+  cover household load from battery, achieving zero grid import safely within grid regulations.
+  Periods are written using FC16 (Write Multiple Registers). Periods must not overlap.
+  Profile extended from 5 periods (30412–30426) to 10 periods (30412–30441).
+
+---
+
+## v0.9.5
+
+Issues: #316, #320, #324, #332
+
+- **Fix: `inverter_status` entity shows energy total value instead of status code (Issue #316):**
+  The data extraction code used `min_addr` (the lowest register address in the profile) as the
+  status register address, relying on the implicit assumption that the status register is always
+  the profile's first register. This assumption holds for current profiles but is fragile.
+  The status is now looked up by name (`inverter_status` or `status`) via `_find_register_by_name`,
+  eliminating the assumption and making status reading robust to any future register ordering.
+
+- **Fix: WIT `vpp_export_limit_w` write rejected by inverter (Issue #320):**
+  The WIT inverter returns Modbus exception 1 (Illegal Function) when register 203 is written
+  with FC06 (Write Single Register). Register 203 requires FC16 (Write Multiple Registers).
+  The write now uses `write_registers` instead of `write_register`.
+
+- **Fix: SPH TL3 battery charge/discharge energy sensors always 0 on V2.01 profile (Issue #324):**
+  The battery register range detection function (`_detect_battery_register_range`) used a hardcoded
+  list of sensor names to score which register range (VPP 31000+ vs fallback 1000+) contains
+  active data. The list included `battery_discharge_today_low` and `battery_charge_today_low`,
+  but the SPH TL3 profile names these registers `discharge_energy_today_low` and
+  `charge_energy_today_low` (no `battery_` prefix). The fallback range scored 2 instead of 4,
+  the VPP range won (score 3), and daily energy was read from the 31000+ range where those
+  registers don't exist — returning 0.0. The alternate names are now included in the scoring
+  list. The data-reading code already handled both names; only the range detection was wrong.
+
+- **Fix: WIT `battery_voltage_bms` 10× too high on standard BMS firmware (Issue #332):**
+  The v0.9.4 scale change (0.1 → 1) for register 8095 corrected readings for DIY JK BMS units
+  (which report in whole volts) but broke OEM BMS firmware (YE1.0 etc.) that follows the
+  standard Growatt 0.1 V/LSB convention. The scale is reverted to 0.1 and the integration now
+  auto-detects whole-volt BMS firmware at runtime: if the BMS-reported voltage is less than 20%
+  of the inverter's own battery voltage reading (register 8034), it is automatically multiplied
+  by 10. Both firmware variants are now handled correctly with no user configuration required.
+
+---
+
+## v0.9.4
+
+Issues: #311, #323, #326, #327
+
+- **Feature: MIN TL-XH priority mode control (Issue #311):**
+  Register 3018 (`tl_xh_priority_mode`) hardware-confirmed on MIN 4200TL-XH: write 0 → Load First, 2 → Battery First, 3 → Grid First (default). Appears as a select entity under the Battery device on `MIN_TL_XH_3000_10000_V201` profiles. Note: value 1 is not a valid priority mode on this hardware (V1.39 maps it as a system topology setting).
+
+- **Fix: WIT `battery_voltage_bms` reads 1/10th of actual (Issue #323):**
+  Register 8095 (`battery_voltage_bms`) on WIT inverters with JK BMS returns whole volts (e.g., raw 54 at 54.0 V). The previous `scale: 0.1` was producing readings of 5.4 V. Scale corrected to `1`.
+
+- **Fix: WIT `solar_total_power` spikes to 429 MW (Issue #323):**
+  The WIT `pv_total_power` 32-bit register pair (regs 1–2) was missing `signed: True`. When the
+  inverter sends a small negative value (e.g. at night or during certain grid conditions), it was
+  read as an unsigned 32-bit integer — `0xFFFFFFFF × 0.1 = 429,496,729.5 W`. Now correctly
+  resolves to approximately −0.1 W.
+
+- **Fix: WIT `vpp_export_limit_w` entity always shows Unknown (Issue #323):**
+  Holding register 203 (`export_limit_w`) was defined in the WIT profile but never polled or
+  stored in the data object. The number entity read from a field that was never populated.
+  Register 203 is now read each poll cycle and stored in `data.export_limit_w`.
+
+- **Fix: Grid import/export and load sensors missing on SPH 3/6kW and 7/10kW (Issue #326):**
+  Power-flow registers 1015/1016 (`power_to_user`), 1021/1022 (`power_to_load`),
+  1029/1030 (`power_to_grid`), and 1037/1038 (`self_consumption_power`) were present in
+  `SPH_8000_10000_HU` and the V2.01 profiles but missing from the two base profiles
+  `SPH_3000_6000` and `SPH_7000_10000`. Without them, grid sensors fell back to a derived
+  value that reported ~2.6 kW export when the inverter was actually importing. Both base
+  profiles now include the full power-flow register set.
+
+- **Fix: Spurious WARNING log before every control write (Issue #327):**
+  The integration intentionally closes the Modbus socket after each read cycle. When a
+  write is requested, `is_socket_open()` correctly returns `False` and the code reconnects
+  before writing — this is by design, not a fault. The "Socket not open, attempting
+  reconnect" message has been downgraded from `WARNING` to `DEBUG`.
+
+---
+
 ## v0.9.3
 
 Issues: #317, #319

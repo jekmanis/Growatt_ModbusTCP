@@ -43,6 +43,15 @@ async def async_setup_entry(
         entities.append(GrowattGenericTime(coordinator, config_entry, control_name, control_config))
         _LOGGER.info("%s time control enabled (register %d)", control_name, control_config['register'])
 
+    # WIT VPP TOU time pickers (periods 1-10, start + end each = up to 20 entities)
+    is_wit = str(register_map_name).upper() in ("WIT_4000_15000TL3", "WIT_29900_50000TL3_XHU")
+    if is_wit:
+        for _period in range(1, 11):
+            _start_reg = 30412 + (_period - 1) * 3
+            if _start_reg in holding_registers:
+                entities.append(GrowattWitVppTouTime(coordinator, config_entry, _period, is_start=True))
+                entities.append(GrowattWitVppTouTime(coordinator, config_entry, _period, is_start=False))
+
     # MOD TL3-XH TOU time pickers (4 start + 4 end = 8 entities)
     if 3038 in holding_registers:
         for period_def in MOD_TOU_PERIODS:
@@ -55,6 +64,74 @@ async def async_setup_entry(
     if entities:
         _LOGGER.info("Created %d time entities for %s", len(entities), config_entry.data['name'])
         async_add_entities(entities)
+
+
+class GrowattWitVppTouTime(CoordinatorEntity, TimeEntity):
+    """WIT VPP TOU period start or end time.
+
+    Stores time as plain minutes since midnight (0–1439 start, 0–1440 end).
+    Converts to/from datetime.time for the HA time picker.
+    Writes use FC16 — WIT inverter rejects FC06 on VPP holding registers.
+    """
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(
+        self,
+        coordinator: GrowattModbusCoordinator,
+        config_entry: ConfigEntry,
+        period: int,
+        is_start: bool,
+    ) -> None:
+        super().__init__(coordinator)
+        self._config_entry = config_entry
+        self._period = period
+        self._is_start = is_start
+        offset = 0 if is_start else 1
+        self._register = 30412 + (period - 1) * 3 + offset
+        self._coordinator_attr = f"wit_vpp_tou_p{period}_{'start' if is_start else 'end'}"
+
+        self._attr_icon = "mdi:clock-start" if is_start else "mdi:clock-end"
+        label = "Start" if is_start else "End"
+        entry_name = config_entry.data.get("name", config_entry.title)
+        self._attr_name = f"{entry_name} TOU Period {period} {label}"
+        self._attr_unique_id = f"{config_entry.entry_id}_vpp_tou_p{period}_{'start' if is_start else 'end'}"
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return self.coordinator.get_device_info(DEVICE_TYPE_BATTERY)
+
+    @property
+    def native_value(self) -> dt_time | None:
+        minutes = getattr(self.coordinator, self._coordinator_attr, None)
+        if minutes is None:
+            return None
+        try:
+            m = int(minutes)
+            return dt_time(m // 60, m % 60)
+        except (ValueError, ZeroDivisionError):
+            return None
+
+    async def async_set_value(self, value: dt_time) -> None:
+        minutes = value.hour * 60 + value.minute
+        slot = "start" if self._is_start else "end"
+        _LOGGER.info("[WIT-TOU] Period %d %s → %s (%d min, reg %d)",
+                     self._period, slot, value.strftime("%H:%M"), minutes, self._register)
+        try:
+            success = await self.hass.async_add_executor_job(
+                self.coordinator.modbus_client.write_registers,
+                self._register,
+                [minutes],
+            )
+            if success:
+                setattr(self.coordinator, self._coordinator_attr, minutes)
+                _LOGGER.info("[WIT-TOU] Period %d %s set to %s", self._period, slot, value.strftime("%H:%M"))
+                await self.coordinator.async_request_refresh()
+            else:
+                _LOGGER.error("[WIT-TOU] Failed to write period %d %s (reg %d)", self._period, slot, self._register)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.exception("[WIT-TOU] Period %d %s write error: %s", self._period, slot, err)
 
 
 class GrowattGenericTime(CoordinatorEntity, TimeEntity):
@@ -111,9 +188,105 @@ class GrowattGenericTime(CoordinatorEntity, TimeEntity):
             return None
 
     async def async_set_value(self, value: dt_time) -> None:
-        """Write a new time value encoded as hex-packed bytes to the Modbus register."""
+        """Write a new time value using atomic FC16 for [start, end, enable] triples.
+
+        SPH firmware silently rejects FC06 single-register writes to time period start/end
+        registers — the value appears to write but reverts within ~6 seconds. The inverter
+        requires all three registers [start, end, enable] written atomically in one FC16 call.
+
+        Falls back to FC06 single-register write if sibling registers can't be resolved.
+        """
         raw_value = (value.hour << 8) | value.minute
         register = self._control_config['register']
+        name = self._control_name
+
+        # Identify start/end triples and resolve siblings
+        if name.endswith('_start'):
+            base = name[:-6]
+            is_start = True
+        elif name.endswith('_end'):
+            base = name[:-4]
+            is_start = False
+        else:
+            await self._write_single(register, raw_value, value)
+            return
+
+        start_name = f"{base}_start"
+        end_name = f"{base}_end"
+        enable_name = f"{base}_enable"
+
+        start_cfg = WRITABLE_REGISTERS.get(start_name)
+        end_cfg = WRITABLE_REGISTERS.get(end_name)
+        enable_cfg = WRITABLE_REGISTERS.get(enable_name)
+
+        if not start_cfg or not end_cfg or not enable_cfg:
+            _LOGGER.warning(
+                "%s: sibling registers not found — falling back to single-register FC06 write", name,
+            )
+            await self._write_single(register, raw_value, value)
+            return
+
+        start_reg = start_cfg['register']
+        end_reg = end_cfg['register']
+        enable_reg = enable_cfg['register']
+        if end_reg != start_reg + 1 or enable_reg != start_reg + 2:
+            _LOGGER.warning(
+                "%s: registers not consecutive (start=%d end=%d enable=%d) — falling back",
+                name, start_reg, end_reg, enable_reg,
+            )
+            await self._write_single(register, raw_value, value)
+            return
+
+        # Read the current [start, end, enable] triple fresh from hardware rather than
+        # trusting coordinator.data (which is up to scan_interval stale). Using cached
+        # values for sibling registers causes back-to-back writes within the same poll
+        # window to revert each other: the second write reads the old sibling value and
+        # writes it back, silently undoing the first write.
+        triple = await self.hass.async_add_executor_job(
+            self.coordinator.modbus_client.read_holding_registers, start_reg, 3
+        )
+        if triple is not None and len(triple) >= 3:
+            current_start, current_end, current_enable = int(triple[0]), int(triple[1]), int(triple[2])
+        else:
+            _LOGGER.warning(
+                "%s: could not read fresh register triple (reg %d) — falling back to cached data",
+                name, start_reg,
+            )
+            data = self.coordinator.data
+            current_start = int(getattr(data, start_name, 0) or 0) if data else 0
+            current_end = int(getattr(data, end_name, 0) or 0) if data else 0
+            current_enable = int(getattr(data, enable_name, 0) or 0) if data else 0
+
+        new_start = raw_value if is_start else current_start
+        new_end = raw_value if not is_start else current_end
+
+        _LOGGER.debug(
+            "%s: atomic FC16 → reg %d [start=0x%04X, end=0x%04X, enable=%d]",
+            name, start_reg, new_start, new_end, current_enable,
+        )
+        try:
+            success = await self.hass.async_add_executor_job(
+                self.coordinator.modbus_client.write_registers,
+                start_reg,
+                [new_start, new_end, current_enable],
+            )
+        except ModbusWriteError:
+            _LOGGER.error("Failed atomic FC16 write for %s (register %d)", name, start_reg)
+            return
+
+        if success:
+            _LOGGER.info(
+                "Set %s to %s (atomic FC16: start=0x%04X, end=0x%04X, enable=%d)",
+                name, value.strftime("%H:%M"), new_start, new_end, current_enable,
+            )
+            self.coordinator.track_write(start_reg, new_start, start_name)
+            self.coordinator.track_write(end_reg, new_end, end_name)
+            await self.coordinator.async_request_refresh()
+        else:
+            _LOGGER.warning("%s: atomic FC16 write returned False (register %d)", name, start_reg)
+
+    async def _write_single(self, register: int, raw_value: int, value: dt_time) -> None:
+        """Fallback: write a single register via FC06 with readback verification."""
         try:
             write_ok, verified = await self.hass.async_add_executor_job(
                 self.coordinator.modbus_client.write_register_verified, register, raw_value,
@@ -211,18 +384,32 @@ class GrowattModTouTime(CoordinatorEntity, TimeEntity):
         Writing both registers in one Modbus FC16 call prevents the inverter from ever seeing
         a partial update (start changed but end not yet written), which can cause TOU reversion.
         """
-        data = self.coordinator.data
         period = self._period_def
 
+        # Read the current [start, end] pair fresh from hardware rather than trusting
+        # coordinator.data (stale by up to scan_interval). Stale siblings cause the second
+        # of two back-to-back writes in the same poll window to revert the first.
+        pair = await self.hass.async_add_executor_job(
+            self.coordinator.modbus_client.read_holding_registers, period["start_reg"], 2
+        )
+        if pair is not None and len(pair) >= 2:
+            current_start, current_end = int(pair[0]), int(pair[1])
+        else:
+            _LOGGER.warning(
+                "MOD TOU period %d: could not read fresh register pair (reg %d) — falling back to cached data",
+                self._period, period["start_reg"],
+            )
+            data = self.coordinator.data
+            current_start = int(getattr(data, period["start_field"], 0) if data else 0)
+            current_end = int(getattr(data, period["end_field"], 0) if data else 0)
+
         # Compute new start raw, preserving priority (bits 13-14) and enable (bit 15)
-        current_start = int(getattr(data, period["start_field"], 0) if data else 0)
         if self._is_start:
             new_start = (current_start & 0xE000) | ((value.hour << 8) | value.minute)
         else:
             new_start = current_start  # unchanged — keep current start when writing end
 
         # Compute new end raw (plain hex-packed)
-        current_end = int(getattr(data, period["end_field"], 0) if data else 0)
         if not self._is_start:
             new_end = (value.hour << 8) | value.minute
         else:

@@ -17,6 +17,12 @@ PV3_SENSORS: Set[str] = {
     "pv3_energy_total",  # disabled-by-default; condition-gated on actual non-zero data
 }
 
+PV4_SENSORS: Set[str] = {
+    "pv4_voltage", "pv4_current", "pv4_power",
+    "pv4_energy_today",  # disabled-by-default; condition-gated on actual non-zero data
+    "pv4_energy_total",  # disabled-by-default; condition-gated on actual non-zero data
+}
+
 BASIC_AC_SENSORS: Set[str] = {
     "ac_voltage", "ac_current", "ac_power", "ac_frequency",
 }
@@ -68,6 +74,16 @@ BATTERY_SENSORS: Set[str] = {
     "ac_charge_energy_today", "ac_charge_energy_total", "ac_discharge_energy_total",
 }
 
+_EXTRA_BATTERY_FIELDS = (
+    'voltage', 'current', 'power', 'soc', 'soh', 'temp',
+    'charge_energy_today', 'charge_energy_total',
+    'discharge_energy_today', 'discharge_energy_total',
+)
+
+BATTERY2_SENSORS: Set[str] = {f"battery2_{f}" for f in _EXTRA_BATTERY_FIELDS}
+BATTERY3_SENSORS: Set[str] = {f"battery3_{f}" for f in _EXTRA_BATTERY_FIELDS}
+BATTERY4_SENSORS: Set[str] = {f"battery4_{f}" for f in _EXTRA_BATTERY_FIELDS}
+
 BMS_SENSORS: Set[str] = {
     "bms_status", "bms_error", "bms_warn_info",
     "bms_max_current", "bms_cycle_count", "bms_soh",
@@ -83,6 +99,8 @@ TEMPERATURE_SENSORS: Set[str] = {
 STATUS_SENSORS: Set[str] = {
     "status", "grid_connection_status", "last_update", "derating_mode", "fault_code", "warning_code",
     "wit_mode_status",
+    # Dry contact relay state (read-only, SPH/MIN TL-X/TL-XH)
+    "dry_contact_state",
     # WIT debug/safety registers (read-only, disabled by default)
     "ntognd_detect", "nonstd_vac_enable", "enable_spec_set", "fast_mppt_enable",
 }
@@ -142,6 +160,21 @@ WIT_EXTRA_SENSORS: Set[str] = {
     # Extra/parallel inverter output (multi-inverter systems)
     "extra_power_to_grid",
     "extra_energy_today", "extra_energy_total",
+}
+
+BACKUP_BOX_SENSORS: Set[str] = {
+    # Growatt ARK transfer switch, connected via RS485 to TL-X/TL-XH inverters.
+    # Sensors gated on box_connect_flag==1 (reg 3320); box_connect_flag itself is always shown.
+    "box_connect_flag",
+    "box_bypass_status",
+    "box_work_mode",
+    "box_error_code",
+    "box_warning_code",
+    "box_temperature",
+    "box_grid_voltage",
+    "box_grid_power",
+    "box_load_power",
+    "box_relay_status",
 }
 
 
@@ -329,9 +362,9 @@ INVERTER_PROFILES = {
         "has_pv3": True,
         "has_battery": True,
         "max_power_kw": 10.0,
-        "sensors": HYBRID_1P_SENSORS | PV3_SENSORS,
+        "sensors": HYBRID_1P_SENSORS | PV3_SENSORS | BACKUP_BOX_SENSORS,
     },
-    
+
     "tl_xh_us_3000_10000": {
         "name": "TL-XH US 3000-10000",
         "description": "US hybrid single-phase inverter with battery (3-10kW)",
@@ -340,7 +373,7 @@ INVERTER_PROFILES = {
         "has_pv3": True,
         "has_battery": True,
         "max_power_kw": 10.0,
-        "sensors": HYBRID_1P_SENSORS | PV3_SENSORS,
+        "sensors": HYBRID_1P_SENSORS | PV3_SENSORS | BACKUP_BOX_SENSORS,
     },
 
     # TL-XH V2.01 VPP Protocol
@@ -353,7 +386,7 @@ INVERTER_PROFILES = {
         "has_battery": True,
         "max_power_kw": 10.0,
         "protocol_version": "v2.01",
-        "sensors": HYBRID_1P_SENSORS | PV3_SENSORS,
+        "sensors": HYBRID_1P_SENSORS | PV3_SENSORS | BACKUP_BOX_SENSORS,
     },
 
     "tl_xh_us_3000_10000_v201": {
@@ -365,7 +398,7 @@ INVERTER_PROFILES = {
         "has_battery": True,
         "max_power_kw": 10.0,
         "protocol_version": "v2.01",
-        "sensors": HYBRID_1P_SENSORS | PV3_SENSORS,
+        "sensors": HYBRID_1P_SENSORS | PV3_SENSORS | BACKUP_BOX_SENSORS,
     },
 
     # MIN TL-XH Hybrid - Uses MIN 3000+ range with VPP battery
@@ -390,7 +423,8 @@ INVERTER_PROFILES = {
             ENERGY_BREAKDOWN_SENSORS |
             BATTERY_SENSORS |
             TEMPERATURE_SENSORS |
-            STATUS_SENSORS
+            STATUS_SENSORS |
+            BACKUP_BOX_SENSORS
         ),
     },
 
@@ -637,7 +671,8 @@ INVERTER_PROFILES = {
             PV3_SENSORS |
             THREE_PHASE_SENSORS |
             ENERGY_SENSORS |
-            PV_DC_ENERGY_SENSORS |
+            # PV_DC_ENERGY_SENSORS intentionally excluded: MOD X grid-tied profile has no
+            # pv_energy_total registers (91-92 absent), so the sensor would always read 0.
             PV_MPPT_TOTAL_SENSORS |
             TEMPERATURE_SENSORS |
             STATUS_SENSORS
@@ -652,7 +687,7 @@ INVERTER_PROFILES = {
         "has_pv3": True,
         "has_battery": True,
         "max_power_kw": 15.0,
-        "sensors": HYBRID_3P_SENSORS | PV3_SENSORS,
+        "sensors": HYBRID_3P_SENSORS | PV3_SENSORS | BACKUP_BOX_SENSORS,
     },
 
     "mod_6000_15000tl3_xh_v201": {
@@ -664,7 +699,7 @@ INVERTER_PROFILES = {
         "has_pv3": True,
         "has_battery": True,
         "max_power_kw": 15.0,
-        "sensors": HYBRID_3P_SENSORS | PV3_SENSORS,
+        "sensors": HYBRID_3P_SENSORS | PV3_SENSORS | BACKUP_BOX_SENSORS,
     },
 
     # MID 11-30KTL3-XH / MID 8-15KTL3-XHL/JP — three-phase commercial hybrid
@@ -682,7 +717,7 @@ INVERTER_PROFILES = {
         "has_pv3": True,
         "has_battery": True,
         "max_power_kw": 30.0,
-        "sensors": HYBRID_3P_SENSORS | PV3_SENSORS,
+        "sensors": HYBRID_3P_SENSORS | PV3_SENSORS | BACKUP_BOX_SENSORS,
     },
 
     # ========================================================================
@@ -712,6 +747,40 @@ INVERTER_PROFILES = {
             PV_MPPT_TOTAL_SENSORS |
             ENERGY_BREAKDOWN_SENSORS |
             BATTERY_SENSORS |
+            BATTERY2_SENSORS |
+            WIT_EXTRA_SENSORS |
+            TEMPERATURE_SENSORS |
+            STATUS_SENSORS
+        ),
+    },
+    "wit_29900_50000tl3_xhu": {
+        "name": "WIT 29.9-50K-XHU",
+        "description": "Commercial three-phase hybrid inverter, 4 MPPT, 3 battery channels (29.9-50kW)",
+        "register_map": "WIT_29900_50000TL3_XHU",
+        "phases": 3,
+        "has_pv3": True,
+        "has_pv4": True,
+        "has_battery": True,
+        "max_power_kw": 50.0,
+        "protocol_version": "v2.03",  # VPP Protocol V2.03 (DTC 5601)
+        "dtc_code": 5601,
+        "sensors": (
+            BASIC_PV_SENSORS |
+            PV3_SENSORS |
+            PV4_SENSORS |
+            BASIC_AC_SENSORS |
+            THREE_PHASE_SENSORS |
+            SYSTEM_OUTPUT_SENSORS |
+            GRID_SENSORS |
+            POWER_FLOW_SENSORS |
+            CONSUMPTION_SENSORS |
+            ENERGY_SENSORS |
+            PV_DC_ENERGY_SENSORS |
+            PV_MPPT_TOTAL_SENSORS |
+            ENERGY_BREAKDOWN_SENSORS |
+            BATTERY_SENSORS |
+            BATTERY2_SENSORS |
+            BATTERY3_SENSORS |
             WIT_EXTRA_SENSORS |
             TEMPERATURE_SENSORS |
             STATUS_SENSORS
@@ -837,6 +906,11 @@ PROFILE_DISPLAY_NAMES = {
         "base": "wit_4000_15000tl3",
         "v201": "wit_4000_15000tl3",  # Only one variant
         "description": "Three-phase hybrid with advanced storage",
+    },
+    "WIT (29.9-50kW XHU)": {
+        "base": "wit_29900_50000tl3_xhu",
+        "v201": "wit_29900_50000tl3_xhu",
+        "description": "Commercial three-phase hybrid, 4 MPPT, 3 battery channels",
     },
 
     # Off-Grid

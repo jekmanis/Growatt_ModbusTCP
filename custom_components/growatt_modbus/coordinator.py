@@ -29,11 +29,14 @@ from .const import (
     DEVICE_TYPE_GRID,
     DEVICE_TYPE_LOAD,
     DEVICE_TYPE_BATTERY,
+    DEVICE_TYPE_BACKUPBOX,
+    SHARED_LOCK_TIMEOUT,
+    DEFAULT_INTER_SLAVE_DELAY_MS,
 )
 
 from .const import REGISTER_MAPS
 
-from .growatt_modbus import GrowattModbus, GrowattData
+from .growatt_modbus import GrowattModbus, GrowattData, SharedModbusConnection
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -96,11 +99,13 @@ def test_connection(config: dict) -> dict:
 class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
     """Growatt Modbus data update coordinator."""
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry,
+                 hub: 'SharedModbusConnection | None' = None) -> None:
         """Initialize the coordinator."""
         self.entry = entry
         self.config = entry.data
         self.hass = hass
+        self._hub = hub  # Shared connection hub (TCP multi-entry same host:port)
 
         self._slave_id = entry.data[CONF_SLAVE_ID]
         
@@ -359,10 +364,17 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                     slave_id=self.config[CONF_SLAVE_ID],
                     register_map=register_map,
                     timeout=timeout,
-                    invert_battery_power=invert_battery_power
+                    invert_battery_power=invert_battery_power,
+                    shared_conn=self._hub,
                 )
-                _LOGGER.debug("Initialized TCP Growatt client at %s:%s (invert_battery_power=%s)",
-                             self.config[CONF_HOST], self.config[CONF_PORT], invert_battery_power)
+                if self._hub:
+                    _LOGGER.debug(
+                        "Initialized TCP Growatt client at %s:%s (shared connection mode, invert_battery_power=%s)",
+                        self.config[CONF_HOST], self.config[CONF_PORT], invert_battery_power,
+                    )
+                else:
+                    _LOGGER.debug("Initialized TCP Growatt client at %s:%s (invert_battery_power=%s)",
+                                 self.config[CONF_HOST], self.config[CONF_PORT], invert_battery_power)
             else:  # serial
                 self._client = GrowattModbus(
                     connection_type="serial",
@@ -598,10 +610,15 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         # Daily totals: same logic, but retention clears at midnight.
         # Spike guard: the inverter writes 32-bit register pairs (high word, then low
         # word) separately.  During the midnight daily-counter reset, the two words
-        # can be read in an inconsistent state, producing a transient garbage value
-        # (e.g. 79 kWh when the real value should be near 0).  Any daily-counter jump
-        # larger than _SPIKE_THRESHOLD_KWH in a single poll is rejected as a glitch.
-        _SPIKE_THRESHOLD_KWH = 20.0  # safe upper bound for any poll interval / system size
+        # can be read in an inconsistent state, producing a transient garbage value.
+        # Any daily-counter jump larger than _SPIKE_THRESHOLD_KWH in a single poll
+        # is rejected as a glitch.  WIT 15KTL3 and similar high-output systems can
+        # legitimately read 50–80 kWh on the first post-reconnect poll if the gateway
+        # was offline for part of the day; use a higher threshold for those profiles.
+        # True word-tear glitches produce values in the thousands of kWh range and
+        # are caught by any reasonable threshold.
+        _is_high_output = 'wit' in (self._register_map_key or '').lower()
+        _SPIKE_THRESHOLD_KWH = 80.0 if _is_high_output else 20.0
 
         # Expire the midnight grace window once the time has passed (self-cleaning).
         if self._midnight_grace_expires and datetime.now() >= self._midnight_grace_expires:
@@ -847,22 +864,21 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 energy_today = getattr(data, 'energy_today', 0)
                 yesterday_energy = self._previous_day_totals.get('energy_today', 0)
 
-                # Stale data detection: matches yesterday's final value OR is suspiciously high for early morning
-                hours_since_midnight = (current_time.hour * 60 + current_time.minute) / 60
-                max_expected_early = hours_since_midnight * 2.0  # Assume max 2 kWh/hour in early morning
-
-                is_stale = (abs(energy_today - yesterday_energy) < tolerance and energy_today > 0) or \
-                          (energy_today > max_expected_early and energy_today > 1.0)
+                # Stale data detection: value exactly matches yesterday's final reading.
+                # The "suspiciously high for time of day" heuristic (hours * 2 kWh/h) was
+                # removed — it produces false positives for high-output systems (e.g. WIT
+                # 15KTL3 can legitimately read 50+ kWh on a mid-day reconnect) and the
+                # spike guard in _protect_energy_totals handles genuinely bad values.
+                is_stale = (abs(energy_today - yesterday_energy) < tolerance and energy_today > 0)
 
                 _mins_since_wake = (current_time - self._just_came_online_time).total_seconds() / 60
                 if is_stale:
                     _LOGGER.warning(
                         "[ENERGY_GUARD] Stale daily totals detected in debounce window "
-                        "(%.1f min since wake-up): energy_today=%.3f kWh "
-                        "(yesterday=%.3f kWh, max_expected=%.3f kWh, hours_since_midnight=%.2f) — "
+                        "(%.1f min since wake-up): energy_today=%.3f kWh matches yesterday=%.3f kWh — "
                         "resetting all daily totals to 0",
                         _mins_since_wake,
-                        energy_today, yesterday_energy, max_expected_early, hours_since_midnight,
+                        energy_today, yesterday_energy,
                     )
                     # Reset stale daily totals to zero
                     data.energy_today = 0
@@ -878,11 +894,10 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 else:
                     _LOGGER.debug(
                         "[ENERGY_GUARD] Debounce window active (%.1f min since wake-up): "
-                        "energy_today=%.3f kWh (yesterday=%.3f kWh, max_expected=%.3f kWh, "
-                        "hours_since_midnight=%.2f) — energy_to_user_today=%.3f kWh — "
-                        "values accepted as valid",
+                        "energy_today=%.3f kWh (yesterday=%.3f kWh) — "
+                        "energy_to_user_today=%.3f kWh — values accepted as valid",
                         _mins_since_wake,
-                        energy_today, yesterday_energy, max_expected_early, hours_since_midnight,
+                        energy_today, yesterday_energy,
                         getattr(data, 'energy_to_user_today', 0.0),
                     )
             elif self._just_came_online_time:
@@ -955,8 +970,69 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             self.data = GrowattData()
             return self.data
 
+    def _fetch_data_shared(self) -> GrowattData | None:
+        """Fetch data using the shared connection hub (holds hub lock for the full poll)."""
+        hub = self._hub
+        inter_slave_delay = self.config_entry.options.get(
+            "inter_slave_delay", DEFAULT_INTER_SLAVE_DELAY_MS
+        ) / 1000.0
+
+        acquired = hub._lock.acquire(timeout=SHARED_LOCK_TIMEOUT)
+        if not acquired:
+            _LOGGER.warning(
+                "Shared Modbus connection busy (lock timeout %ds) for %s:%s slave %s — skipping this poll",
+                SHARED_LOCK_TIMEOUT,
+                self.config.get(CONF_HOST),
+                self.config.get(CONF_PORT),
+                self.config.get(CONF_SLAVE_ID),
+            )
+            return None
+
+        try:
+            if not hub.ensure_connected():
+                _LOGGER.warning(
+                    "Shared Modbus connection could not connect to %s:%s",
+                    self.config.get(CONF_HOST), self.config.get(CONF_PORT),
+                )
+                return None
+
+            # Double-flush: the first flush clears bytes already in the TCP buffer.
+            # A 30ms pause then lets any RS485 bytes still in transit through the
+            # gateway arrive, so the second flush catches them too. Without the pause,
+            # in-flight bytes arrive after the flush and cause TID mismatches on the
+            # first read of this slave's poll.
+            hub._flush_receive_buffer()
+            time.sleep(0.030)
+            hub._flush_receive_buffer()
+
+            self._client._battery_voltage_range = self.config_entry.options.get(
+                "battery_voltage_range", "Auto-detect"
+            )
+            delay_s = self.config_entry.options.get("modbus_delay", 250) / 1000.0
+            self._client._default_min_read_interval = delay_s
+            if not self._client._backed_off:
+                self._client.min_read_interval = delay_s
+
+            data = self._client.read_all_data()
+            if data is not None and not self._serial_number:
+                self._read_device_identification()
+
+            time.sleep(inter_slave_delay)
+            return data
+
+        except Exception as err:
+            _LOGGER.warning("Error during shared data fetch for slave %s: %s",
+                            self.config.get(CONF_SLAVE_ID), err)
+            return None
+
+        finally:
+            hub._lock.release()
+
     def _fetch_data(self) -> GrowattData | None:
         """Fetch data from the inverter (runs in executor)."""
+        if self._hub is not None:
+            return self._fetch_data_shared()
+
         max_retries = 3
         retry_delay = 3  # seconds - increased from 2
 
@@ -1467,6 +1543,15 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 "name": f"{base_name} Battery",
                 "manufacturer": "Growatt",
                 "model": "Battery Storage",
+                "via_device": via_device,
+            }
+
+        elif device_type == DEVICE_TYPE_BACKUPBOX:
+            return {
+                "identifiers": {(DOMAIN, f"{entry_id}_backup_box")},
+                "name": f"{base_name} Backup Box",
+                "manufacturer": "Growatt",
+                "model": "ARK Backup Box",
                 "via_device": via_device,
             }
 

@@ -42,12 +42,13 @@ async def async_setup_entry(
     # WIT-specific controls (VPP remote) - use dedicated entities with
     # work mode re-assertion logic
     # ---------------------------------------------------------------------
-    is_wit = str(register_map_name).upper() == "WIT_4000_15000TL3"
+    is_wit = str(register_map_name).upper() in ("WIT_4000_15000TL3", "WIT_29900_50000TL3_XHU")
 
     if is_wit:
         # Only create controls if the registers exist in this map
-        if 203 in holding_registers:
-            entities.append(GrowattWitExportLimitWNumber(coordinator, config_entry))
+        # NOTE: reg 203 (export_limit_w) is intentionally NOT exposed as a writable entity —
+        # writes are rejected by WIT firmware (exception_code=0) even with all VPP enables set.
+        # The register is still polled for reading; add a sensor if display-only is desired.
         if 201 in holding_registers:
             entities.append(GrowattWitActivePowerRateNumber(coordinator, config_entry))
 
@@ -69,6 +70,12 @@ async def async_setup_entry(
             entities.append(GrowattWitVppDischargeCutoffSocNumber(coordinator, config_entry))
         if 30411 in holding_registers:
             entities.append(GrowattWitVppTouPeriodsNumber(coordinator, config_entry))
+
+        # TOU period power entities (periods 1-10, power only — start/end are TimeEntity in time.py)
+        for _period in range(1, 11):
+            _base = 30412 + (_period - 1) * 3
+            if _base in holding_registers:
+                entities.append(GrowattWitVppTouPeriodNumber(coordinator, config_entry, _period, 'power'))
 
         # NOTE: work_mode is a Select entity (in select.py)
         if entities:
@@ -93,6 +100,14 @@ async def async_setup_entry(
         register_num = control_config['register']
         if register_num not in holding_registers:
             continue  # Skip if register not in this profile
+
+        # Profile-specific filter: only_profiles restricts to named maps; not_profiles excludes them
+        _only = control_config.get('only_profiles')
+        if _only and register_map_name not in _only:
+            continue
+        _not = control_config.get('not_profiles')
+        if _not and register_map_name in _not:
+            continue
 
         # VPP export limit requires live confirmation that the inverter responds to 30200-30201
         if control_name == 'vpp_export_limit_power_rate':
@@ -458,10 +473,12 @@ class GrowattWitExportLimitWNumber(CoordinatorEntity, NumberEntity):
         raw_value = int(max(0, min(int(value), 20000)))
         _LOGGER.debug("[WIT] Writing export_limit_w (203) = %d", raw_value)
         try:
+            # WIT inverter rejects FC06 (Write Single Register) on reg 203 with Illegal Function.
+            # Must use FC16 (Write Multiple Registers) instead.
             success = await self.hass.async_add_executor_job(
-                self.coordinator.modbus_client.write_register,
+                self.coordinator.modbus_client.write_registers,
                 203,
-                raw_value,
+                [raw_value],
             )
         except Exception as err:  # noqa: BLE001
             _LOGGER.exception("[WIT] export_limit_w write failed: %s", err)
@@ -729,3 +746,69 @@ class GrowattWitVppTouPeriodsNumber(CoordinatorEntity, NumberEntity):
 
         except Exception as err:  # noqa: BLE001
             _LOGGER.exception("[WIT-VPP] Failed to set TOU periods: %s", err)
+
+
+class GrowattWitVppTouPeriodNumber(CoordinatorEntity, NumberEntity):
+    """WIT VPP TOU period power entity.
+
+    Handles the power level for a single TOU period (+100 = full charge, -100 = full discharge).
+    Start/end times are TimeEntity instances in time.py.
+
+    Register: base 30412 + (period-1)*3 + 2 (power offset).
+    Writes use FC16 (write_registers) — WIT inverter rejects FC06 on VPP registers.
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_native_min_value = -100.0
+    _attr_native_max_value = 100.0
+    _attr_native_step = 1.0
+    _attr_native_unit_of_measurement = '%'
+    _attr_mode = NumberMode.SLIDER
+    _attr_icon = 'mdi:battery-arrow-up-outline'
+
+    def __init__(
+        self,
+        coordinator: GrowattModbusCoordinator,
+        config_entry: ConfigEntry,
+        period: int,
+        slot: str = 'power',
+    ) -> None:
+        super().__init__(coordinator)
+        self._config_entry = config_entry
+        self._period = period
+        self._slot = 'power'
+        self._register = 30412 + (period - 1) * 3 + 2  # power offset within the period triplet
+        self._coordinator_attr = f"wit_vpp_tou_p{period}_power"
+
+        entry_name = config_entry.data.get("name", config_entry.title)
+        self._attr_name = f"{entry_name} TOU Period {period} Power"
+        self._attr_unique_id = f"{config_entry.entry_id}_vpp_tou_p{period}_power"
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return self.coordinator.get_device_info(get_device_type_for_control("work_mode"))
+
+    @property
+    def native_value(self) -> float | None:
+        default = 0.0
+        return float(getattr(self.coordinator, self._coordinator_attr, default))
+
+    async def async_set_native_value(self, value: float) -> None:
+        raw = int(value)
+        # Two's complement for negative power values
+        encoded = raw & 0xFFFF
+        _LOGGER.info("[WIT-TOU] Period %d %s → %d (reg %d)", self._period, self._slot, raw, self._register)
+        try:
+            success = await self.hass.async_add_executor_job(
+                self.coordinator.modbus_client.write_registers,
+                self._register,
+                [encoded],
+            )
+            if success:
+                setattr(self.coordinator, self._coordinator_attr, raw)
+                _LOGGER.info("[WIT-TOU] Period %d %s set to %d", self._period, self._slot, raw)
+                await self.coordinator.async_request_refresh()
+            else:
+                _LOGGER.error("[WIT-TOU] Failed to write period %d %s", self._period, self._slot)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.exception("[WIT-TOU] Period %d %s write error: %s", self._period, self._slot, err)

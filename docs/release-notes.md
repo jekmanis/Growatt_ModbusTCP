@@ -6,6 +6,88 @@
 
 ---
 
+## v0.9.10
+
+Issues: [#333](https://github.com/0xAHA/Growatt_ModbusTCP/issues/333), [#336](https://github.com/0xAHA/Growatt_ModbusTCP/issues/336), [#337](https://github.com/0xAHA/Growatt_ModbusTCP/issues/337)
+
+- **Fix: MOD-XH `Grid Import Energy Today/Total` shows inflated values (Issue #336):** The calculated grid import formula uses `energy_today` as a proxy for AC inverter output, but on MOD-XH `energy_today` is PV DC string energy (battery contribution excluded). This inflates the result by the net battery discharge — e.g. 2.0 kWh calculated vs 0.8 kWh actual at end of day. MOD-XH (and any profile with "xh" in its series name) now reads directly from the hardware registers (`energy_to_user_today` at 3067/3068, `energy_to_user_total` at 3069/3070), matching Growatt's own cloud portal. The Total sensor discrepancy visible in HA's energy dashboard is pre-v0.9.9 statistics corruption and requires a manual stats reset.
+
+- **Fix: SPH time period start/end writes silently revert (Issue #333):** SPH firmware rejects FC06 single-register writes to time period start/end registers — the write ACKs but the inverter rolls back the value within ~6 seconds. All SPH time period controls (AC charge periods 1–3, Battery First periods 4–6, Grid First periods 4–9) now use an atomic FC16 write that sends the full [start, end, enable] triple in a single transaction. Falls back to FC06 only if sibling registers can't be resolved.
+
+- **Fix: SPH 3-6kW auto-detects as `sph_8000_10000_hu` (Issue #337):** The DTC-3502 refinement checked register 1086 before PV3 string presence. Register 1086 responds on all SPH models with a battery (returning battery SOC ~95 on 3-6kW units), so the HU branch fired unconditionally for any 3-6kW SPH with a battery. Detection order is now: (1) check PV3 — absent means `sph_3000_6000_v201` immediately (HU is 3-string; 2-string units are excluded); (2) PV3 present → check 1086 to distinguish HU from 7-10kW.
+
+- **Fix: WIS/WIT commercial DTC display names corrected:** Per VPP V2.03: DTC 5601 = WIT 29.9-50K-XHU, DTC 5800 = WIS 210K.
+
+---
+
+## v0.9.9
+
+Issues: [#335](https://github.com/0xAHA/Growatt_ModbusTCP/issues/335), [#336](https://github.com/0xAHA/Growatt_ModbusTCP/issues/336)
+
+- **Fix: ENERGY_GUARD daily sensors permanently zeroed after gateway reconnect (WIT 15K):** A `hours × 2 kWh/h` heuristic incorrectly flagged large-system legitimate daily totals (e.g. 50 kWh at 2pm) as stale and reset all energy sensors to 0 for a 15-minute window. Only an exact match against yesterday's final total is now used as a stale indicator.
+
+- **Fix: ENERGY_GUARD spike threshold too low for WIT 15K:** The 20 kWh rejection threshold blocked the first valid post-reconnect read on high-output profiles. WIT profiles now use an 80 kWh threshold — above a full day's production for residential WIT, far below any real word-tear glitch (which produces thousands of kWh).
+
+- **Fix: MOD/MID-XH `Grid Import Energy Total` missing and incorrect (Issue #336):** Registers 3069/3070 (`energy_to_user_total`) were absent from the MOD profile despite the surrounding 3067–3074 energy block being present. The coordinator fell back to the VPP range (31120/31121), which returns a different value on MID 15KTL3-XH hardware and oscillates due to non-atomic word reads — causing the sensor to drop backward and corrupt the HA energy dashboard. Registers 3069/3070 are now defined, restoring the stable 3000-range source.
+
+- **Hardware contributor credit:** [@Wojak129](https://github.com/Wojak129) — WIT 15KTL3 field testing, DTC 5603 hardware confirmation, VPP register scanning, and official Growatt protocol documentation that shaped the WIT implementation. Credited in README.
+
+---
+
+## v0.9.8
+
+Issues: [#335](https://github.com/0xAHA/Growatt_ModbusTCP/issues/335)
+
+- **Safety fix: WIT `vpp_export_limit_power_rate` clamped to 0–100%:** Negative values on register 30201 trigger WIT warning 401 and a fault state requiring a service technician reset. Minimum is now 0% (zero export).
+
+- **Fix: WIT Export Limit (W) write entity removed:** Register 203 is not writable on WIT firmware regardless of VPP enable state. The misleading number entity is removed; stale entities are cleaned up automatically on upgrade.
+
+---
+
+## v0.9.7
+
+> **Note:** WIT TOU schedule entities are new and untested on hardware. Please report any issues on [#331](https://github.com/0xAHA/Growatt_ModbusTCP/issues/331).
+
+- **Improvement: WIT TOU period start/end times use proper HA time pickers:** Start and end time entities are now native HH:MM time pickers instead of number inputs requiring minutes since midnight. Existing v0.9.6 number entities are removed automatically on upgrade.
+
+---
+
+## v0.9.6
+
+> **Note:** WIT TOU schedule entities are new and untested on hardware. Please report any issues on [#331](https://github.com/0xAHA/Growatt_ModbusTCP/issues/331).
+
+- **Feature: WIT VPP Time-of-Use schedule controls (Issue #331):** Ten TOU periods now exposed — start/end time pickers and power level (−100% to +100%, negative = discharge). Setting negative power during peak hours achieves zero grid import within grid regulations. Periods 1–10 supported (30412–30441), written via FC16.
+
+---
+
+## v0.9.5
+
+- **Fix: `inverter_status` entity shows energy total instead of status code (Issue #316):** The data extraction code used `min_addr` (the lowest register address in the profile) as the status register address, assuming it always corresponds to the inverter status. The status is now looked up by name (`inverter_status`) making it robust to any profile register ordering.
+
+- **Fix: WIT `vpp_export_limit_w` write rejected by inverter (Issue #320):** Register 203 only accepts FC16 (Write Multiple Registers); FC06 (Write Single Register) returns Illegal Function. The write now uses the correct function code.
+
+- **Fix: SPH TL3 battery charge/discharge energy sensors always 0 on V2.01 profile (Issue #324):** The battery register range detector scored VPP (31000+) higher than the fallback (1000+) range because it looked for `battery_discharge_today_low` but the SPH TL3 profile names those registers `discharge_energy_today_low`. The fallback range missed the score points, VPP won, and daily energy read from a range where those registers don't exist. Both naming variants are now included in the scoring list.
+
+- **Fix: WIT `battery_voltage_bms` 10× too high on standard BMS firmware (Issue #332):** The v0.9.4 scale change broke OEM BMS users (YE1.0 firmware) while fixing JK BMS users. Scale reverted to 0.1 with runtime auto-detection: if the BMS voltage reads less than 20% of the inverter's own battery voltage, it is automatically multiplied by 10. Both firmware variants now work with no user configuration.
+
+---
+
+## v0.9.4
+
+- **Feature: MIN TL-XH priority mode control (Issue #311):** Register 3018 hardware-confirmed on MIN 4200TL-XH: Load First (0), Battery First (2), Grid First (3). Appears as a select entity under the Battery device.
+
+- **Fix: WIT `battery_voltage_bms` reads 1/10th of actual (Issue #323):** Register 8095 scale corrected from 0.1 to 1 — WIT/JK BMS returns whole volts, not tenths.
+
+- **Fix: WIT `solar_total_power` spikes to 429 MW (Issue #323):** 32-bit unsigned overflow when the inverter sends a small negative value at night. Register pair regs 1–2 now treated as signed — resolves to ≈ −0.1 W instead of 429,496,729.5 W.
+
+- **Fix: WIT `vpp_export_limit_w` entity always Unknown (Issue #323):** Holding register 203 was defined in the WIT profile but never read. Now polled each cycle and stored; the number entity shows the current export limit and accepts writes.
+
+- **Fix: Grid import/export and load sensors missing on SPH 3/6kW and 7/10kW (Issue #326):** Power-flow registers 1015–1038 were present in `SPH_8000_10000_HU` and V2.01 profiles but absent from `SPH_3000_6000` and `SPH_7000_10000`. Both base profiles now include `power_to_user`, `power_to_load`, `power_to_grid`, and `self_consumption_power`.
+
+- **Fix: Spurious WARNING log before every control write (Issue #327):** "Socket not open, attempting reconnect" downgraded from WARNING to DEBUG — the socket closing between read cycles is by design, not a fault.
+
+---
+
 ## v0.9.3
 
 - **Fix: TCP receive buffer flush on reconnect (Issue #317):** After an HA restart, RS485-to-TCP adapters that buffer stale responses from a previous session caused repeated transaction ID mismatch errors. The integration now drains the adapter's receive buffer immediately after each `connect()` call.

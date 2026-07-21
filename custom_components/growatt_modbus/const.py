@@ -61,6 +61,14 @@ DEFAULT_BAUDRATE = 9600
 CURRENT_DEVICE_STRUCTURE_VERSION = 2
 
 # ============================================================================
+# SHARED CONNECTION MODE
+# When two TCP entries share the same host:port, a single ModbusTcpClient is
+# reused with a threading.Lock to serialize reads and prevent RS485 cross-talk.
+# ============================================================================
+SHARED_LOCK_TIMEOUT = 60       # seconds to wait for shared bus lock before giving up
+DEFAULT_INTER_SLAVE_DELAY_MS = 50  # ms pause after each slave poll to let RS485 bus settle
+
+# ============================================================================
 # SENSOR TYPE CLASSIFICATIONS FOR OFFLINE BEHAVIOR
 # ============================================================================
 
@@ -141,6 +149,7 @@ WRITABLE_REGISTERS = {
     },
     'export_limit_power': {
         'register': 123,
+        'not_profiles': ['SPE_8000_12000_ES'],  # SPE reg 123 = export_min_soc (different semantic)
         'scale': 0.1,  # Store as 0-1000, display as 0-100.0%
         'valid_range': (0, 1000),  # 0 = 0%, 1000 = 100%
         'unit': '%'
@@ -201,7 +210,7 @@ WRITABLE_REGISTERS = {
             0: 'Disabled',
             1: 'Enabled'
         },
-        'desc': 'VPP master enable switch'
+        'desc': 'VPP master enable switch. WARNING: enabling this without also enabling remote_power_control (30407) suspends local battery logic and causes the inverter to draw load from the grid (VPP standby state).'
     },
     'vpp_export_limit_enable': {
         'register': 30200,
@@ -216,10 +225,10 @@ WRITABLE_REGISTERS = {
     'vpp_export_limit_power_rate': {
         'register': 30201,
         'scale': 1,
-        'valid_range': (-100, 100),
+        'valid_range': (0, 100),
         'unit': '%',
         'signed': True,
-        'desc': 'Export limit power rate (-100 to +100%, positive=export, 0=zero export)'
+        'desc': 'Export limit power rate (0–100%; 0=zero export, 100=full export). Negative values trigger WIT warning 401 fault state.'
     },
     'remote_power_control_enable': {
         'register': 30407,
@@ -273,17 +282,6 @@ WRITABLE_REGISTERS = {
         'valid_range': (10, 100),
         'unit': '%',
         'desc': 'VPP discharge cutoff SOC (stop discharging at this SOC)'
-    },
-    'vpp_ac_charge_enable': {
-        'register': 30410,
-        'scale': 1,
-        'valid_range': (0, 2),
-        'options': {
-            0: 'Disabled',
-            1: 'PV Priority',
-            2: 'AC Priority'
-        },
-        'desc': 'VPP AC charge mode (0=disabled, 1=PV priority, 2=AC priority)'
     },
 
 
@@ -361,6 +359,93 @@ WRITABLE_REGISTERS = {
         'unit': 'V/%',  # Unit depends on battery_type
         'desc': 'Grid to Battery: SOC level to switch back from utility to battery mode',
         'battery_dependent': True
+    },
+
+    # SPE 8000-12000 ES Grid-Tie Export Controls (confirmed working via nicauswu field data, Issue #322)
+    # These registers are SPE-only (only_profiles guard prevents cross-profile contamination).
+    'spe_grid_export_enable': {
+        'register': 115,
+        'only_profiles': ['SPE_8000_12000_ES'],
+        'scale': 1,
+        'valid_range': (0, 1),
+        'options': {0: 'Disabled', 1: 'Enabled'},
+        'desc': 'Grid export enable/disable',
+    },
+    'spe_battery_export_enable': {
+        'register': 118,
+        'only_profiles': ['SPE_8000_12000_ES'],
+        'scale': 1,
+        'valid_range': (0, 1),
+        'options': {0: 'Disabled', 1: 'Enabled'},
+        'desc': 'Battery-to-grid export enable/disable',
+    },
+    'spe_export_limit_power': {
+        'register': 119,
+        'only_profiles': ['SPE_8000_12000_ES'],
+        'scale': 0.1,
+        'valid_range': (0, 120),
+        'unit': 'kW',
+        'desc': 'Grid export power limit (0-12kW, stored as 0-120 × 0.1 kW)',
+    },
+    'spe_output_priority': {
+        'register': 116,
+        'only_profiles': ['SPE_8000_12000_ES'],
+        'scale': 1,
+        'valid_range': (0, 2),
+        'options': {0: 'Charge First', 1: 'Load First', 2: 'Feed First'},
+        'desc': 'Output priority (uwLoadFirst): charge first / load first / feed first',
+    },
+    'spe_feed_range': {
+        'register': 117,
+        'only_profiles': ['SPE_8000_12000_ES'],
+        'scale': 1,
+        'valid_range': (0, 3),
+        'options': {0: 'Asia', 1: 'Europe', 2: 'South America', 3: 'South Africa'},
+        'desc': 'Grid compliance region (uwFeedRange)',
+    },
+    'spe_battery_export_max_current': {
+        'register': 120,
+        'only_profiles': ['SPE_8000_12000_ES'],
+        'scale': 1,
+        'valid_range': (0, 400),
+        'unit': 'A',
+        'desc': 'Max battery current for grid export (uwBatFeedCurr): 0-400 A per Protocol V0.26',
+    },
+    'spe_bat_feed_vloss': {
+        'register': 121,
+        'only_profiles': ['SPE_8000_12000_ES'],
+        'scale': 0.1,
+        'valid_range': (420, 540),
+        'unit': 'V',
+        'desc': 'Battery voltage loss point to stop export (uwBatFeedVLoss): raw 420-540 = 42-54V',
+    },
+    'spe_bat_feed_vback': {
+        'register': 122,
+        'only_profiles': ['SPE_8000_12000_ES'],
+        'scale': 0.1,
+        'valid_range': (440, 560),
+        'unit': 'V',
+        'desc': 'Battery voltage back point to resume export (uwBatFeedVBack): raw 440-560 = 44-56V',
+    },
+    # SPE reg 123 = export min SOC. Separate from SPH reg 123 = export_limit_power (%).
+    # The not_profiles guard on export_limit_power prevents cross-contamination.
+    # Protocol V0.26 valid range is 5-90, not 0-100.
+    'spe_export_min_soc': {
+        'register': 123,
+        'only_profiles': ['SPE_8000_12000_ES'],
+        'scale': 1,
+        'valid_range': (5, 90),
+        'unit': '%',
+        'desc': 'Min battery SOC to allow export (uwBatFeedSocLoss): 5-90% per Protocol V0.26',
+    },
+    # Protocol V0.26 valid range is 15-100.
+    'spe_export_back_soc': {
+        'register': 124,
+        'only_profiles': ['SPE_8000_12000_ES'],
+        'scale': 1,
+        'valid_range': (15, 100),
+        'unit': '%',
+        'desc': 'SOC back point to resume export (uwBatFeedSocBack): 15-100% per Protocol V0.26',
     },
 
     'discharge_power_rate': {
@@ -548,6 +633,28 @@ WRITABLE_REGISTERS = {
         'desc': 'Fallback output power rate applied when export limitation control fails (0–100%)'
     },
 
+    # SPH / MIN TL-X / TL-XH: dry contact relay controls (V1.39 §3016-3019)
+    'dry_contact_enable': {
+        'register': 3016,
+        'scale': 1,
+        'options': {0: 'Disabled', 1: 'Enabled'},
+        'desc': 'Dry contact function enable'
+    },
+    'dry_contact_on_rate': {
+        'register': 3017,
+        'scale': 0.1,
+        'valid_range': (0, 1000),
+        'unit': '%',
+        'desc': 'Power rate to close relay (0.0–100.0%)'
+    },
+    'dry_contact_off_rate': {
+        'register': 3019,
+        'scale': 0.1,
+        'valid_range': (0, 1000),
+        'unit': '%',
+        'desc': 'Power rate to open relay (0.0–100.0%)'
+    },
+
     # MOD GEN4 power rate limits for priority modes
     # Scan #228 confirmed: 3036=100 (GridFirstDischargePowerRate), 3047=80 (BatFirstPowerRate)
     'grid_first_discharge_power_rate': {
@@ -556,6 +663,16 @@ WRITABLE_REGISTERS = {
         'valid_range': (1, 100),
         'unit': '%',
         'desc': 'Discharge power rate when Grid First mode (1-100%)'
+    },
+    'tl_xh_priority_mode': {
+        'register': 3018,
+        'scale': 1,
+        'options': {
+            0: 'Load First',
+            2: 'Battery First',
+            3: 'Grid First',
+        },
+        'desc': 'Priority mode — hardware-confirmed on MIN TL-XH (Issue #311)'
     },
     'batt_first_charge_power_rate': {
         'register': 3047,
@@ -676,6 +793,7 @@ DEVICE_TYPE_SOLAR = "solar"
 DEVICE_TYPE_GRID = "grid"
 DEVICE_TYPE_LOAD = "load"
 DEVICE_TYPE_BATTERY = "battery"
+DEVICE_TYPE_BACKUPBOX = "backup_box"
 
 # Sensor to Device Mapping
 # Each sensor is assigned to a logical device for better organization
@@ -687,6 +805,8 @@ SENSOR_DEVICE_MAP = {
         'battery_derating_mode',  # Battery-related status on inverter
         # SPF Off-Grid fan speeds
         'inverter_fan_speed',
+        # Dry contact relay state (read-only, SPH/MIN TL-X/TL-XH)
+        'dry_contact_state',
         # WIT debug/safety registers (read-only, disabled by default)
         'ntognd_detect', 'nonstd_vac_enable', 'enable_spec_set', 'fast_mppt_enable',
         # WIT Direct Control mode status
@@ -699,6 +819,8 @@ SENSOR_DEVICE_MAP = {
         'pv1_voltage', 'pv1_current', 'pv1_power',
         'pv2_voltage', 'pv2_current', 'pv2_power',
         'pv3_voltage', 'pv3_current', 'pv3_power',
+        'pv4_voltage', 'pv4_current', 'pv4_power',
+        'pv4_energy_today', 'pv4_energy_total',
         'pv_total_power',
         # AC output (single phase) - current and power
         'ac_current', 'ac_power', 'ac_apparent_power', 'ac_frequency',
@@ -770,6 +892,26 @@ SENSOR_DEVICE_MAP = {
         'bms_module_num', 'bms_battery_count',
         'bms_max_soc', 'bms_min_soc',
         'bms_gauge_rm', 'bms_gauge_fcc', 'bms_fw_version', 'bms_delta_volt',
+        # Multi-battery channels (VPP V2.01/V2.03, 31300/31400/31500)
+        *(f"battery{n}_{f}" for n in (2, 3, 4) for f in (
+            'voltage', 'current', 'power', 'soc', 'soh', 'temp',
+            'charge_energy_today', 'charge_energy_total',
+            'discharge_energy_today', 'discharge_energy_total',
+        )),
+    },
+
+    # Backup Box device — Growatt ARK transfer switch (TL-X/TL-XH only, regs 3281-3342)
+    DEVICE_TYPE_BACKUPBOX: {
+        'box_connect_flag',
+        'box_bypass_status',
+        'box_work_mode',
+        'box_error_code',
+        'box_warning_code',
+        'box_temperature',
+        'box_grid_voltage',
+        'box_grid_power',
+        'box_load_power',
+        'box_relay_status',
     },
 }
 
@@ -949,7 +1091,7 @@ PROFILE_STATUS_MAP: dict[str, str] = {
     'SPH_TL3_3000_10000_V201':  'hybrid',
     # Hybrid — MOD three-phase
     'MOD_6000_15000TL3_XH': 'hybrid',
-    'MOD_6000_15000TL3_X':  'hybrid',
+    # MOD_6000_15000TL3_X is grid-tied (no battery) — uses default STATUS_CODES, not hybrid
     # Hybrid — WIT commercial
     'WIT_4000_15000TL3': 'hybrid',
     # Hybrid — MIN TL-XH

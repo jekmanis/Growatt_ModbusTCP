@@ -203,6 +203,56 @@ SENSOR_DEFINITIONS = {
         "disabled_by_default": True,
         "condition": lambda data: data.pv3_energy_total > 0,
     },
+    "pv4_voltage": {
+        "name": "PV4 Voltage",
+        "icon": "mdi:solar-panel",
+        "device_class": SensorDeviceClass.VOLTAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfElectricPotential.VOLT,
+        "attr": "pv4_voltage",
+        "disabled_by_default": True,
+        "condition": lambda data: data.pv4_voltage > 0,
+    },
+    "pv4_current": {
+        "name": "PV4 Current",
+        "icon": "mdi:solar-panel",
+        "device_class": SensorDeviceClass.CURRENT,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfElectricCurrent.AMPERE,
+        "attr": "pv4_current",
+        "disabled_by_default": True,
+        "condition": lambda data: data.pv4_voltage > 0,
+    },
+    "pv4_power": {
+        "name": "PV4 Power",
+        "icon": "mdi:solar-panel",
+        "device_class": SensorDeviceClass.POWER,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfPower.WATT,
+        "attr": "pv4_power",
+        "disabled_by_default": True,
+        "condition": lambda data: data.pv4_voltage > 0,
+    },
+    "pv4_energy_today": {
+        "name": "PV4 Energy Today",
+        "icon": "mdi:solar-panel",
+        "device_class": SensorDeviceClass.ENERGY,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "unit": UnitOfEnergy.KILO_WATT_HOUR,
+        "attr": "pv4_energy_today",
+        "disabled_by_default": True,
+        "condition": lambda data: data.pv4_energy_today > 0,
+    },
+    "pv4_energy_total": {
+        "name": "PV4 Energy Total",
+        "icon": "mdi:solar-panel",
+        "device_class": SensorDeviceClass.ENERGY,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "unit": UnitOfEnergy.KILO_WATT_HOUR,
+        "attr": "pv4_energy_total",
+        "disabled_by_default": True,
+        "condition": lambda data: data.pv4_energy_total > 0,
+    },
 
     # Solar Total
     "pv_total_power": {
@@ -789,6 +839,42 @@ SENSOR_DEFINITIONS = {
         "description": "Battery voltage as reported directly by the Battery Management System (BMS) via its communication bus. May differ slightly from Battery Voltage which is measured by the inverter's own hardware. The BMS reading is generally more accurate for cell-level monitoring.",
     },
 
+    # ---- Battery clusters 2 / 3 / 4 (VPP 31300 / 31400 / 31500) ----
+    # Sensors only created when batteryN_voltage is set on data (> 0 at read time).
+    **{
+        f"battery{n}_{field}": {
+            "name": f"Battery {n} {label}",
+            "icon": icon,
+            **extra,
+            "attr": f"battery{n}_{field}",
+            "condition": (lambda nn: lambda data: hasattr(data, f"battery{nn}_voltage"))(n),
+            "disabled_by_default": True,
+        }
+        for n in (2, 3, 4)
+        for field, label, icon, extra in (
+            ("voltage",  "Voltage",    "mdi:battery",
+             {"device_class": SensorDeviceClass.VOLTAGE,  "state_class": SensorStateClass.MEASUREMENT, "unit": UnitOfElectricPotential.VOLT}),
+            ("current",  "Current",    "mdi:current-dc",
+             {"device_class": SensorDeviceClass.CURRENT,  "state_class": SensorStateClass.MEASUREMENT, "unit": UnitOfElectricCurrent.AMPERE}),
+            ("power",    "Power",      "mdi:battery-charging",
+             {"device_class": SensorDeviceClass.POWER,    "state_class": SensorStateClass.MEASUREMENT, "unit": UnitOfPower.WATT}),
+            ("soc",      "State of Charge", "mdi:battery-medium",
+             {"device_class": SensorDeviceClass.BATTERY,  "state_class": SensorStateClass.MEASUREMENT, "unit": PERCENTAGE}),
+            ("soh",      "State of Health", "mdi:battery-heart",
+             {"state_class": SensorStateClass.MEASUREMENT, "unit": PERCENTAGE}),
+            ("temp",     "Temperature", "mdi:thermometer",
+             {"device_class": SensorDeviceClass.TEMPERATURE, "state_class": SensorStateClass.MEASUREMENT, "unit": UnitOfTemperature.CELSIUS}),
+            ("charge_energy_today",    "Charge Today",    "mdi:battery-plus",
+             {"device_class": SensorDeviceClass.ENERGY, "state_class": SensorStateClass.TOTAL_INCREASING, "unit": UnitOfEnergy.KILO_WATT_HOUR}),
+            ("charge_energy_total",    "Charge Total",    "mdi:battery-plus",
+             {"device_class": SensorDeviceClass.ENERGY, "state_class": SensorStateClass.TOTAL_INCREASING, "unit": UnitOfEnergy.KILO_WATT_HOUR}),
+            ("discharge_energy_today", "Discharge Today", "mdi:battery-minus",
+             {"device_class": SensorDeviceClass.ENERGY, "state_class": SensorStateClass.TOTAL_INCREASING, "unit": UnitOfEnergy.KILO_WATT_HOUR}),
+            ("discharge_energy_total", "Discharge Total", "mdi:battery-minus",
+             {"device_class": SensorDeviceClass.ENERGY, "state_class": SensorStateClass.TOTAL_INCREASING, "unit": UnitOfEnergy.KILO_WATT_HOUR}),
+        )
+    },
+
     "ac_charge_energy_today": {
         "name": "AC Charge Energy Today",
         "icon": "mdi:battery-charging-50",
@@ -922,6 +1008,14 @@ SENSOR_DEFINITIONS = {
         "icon": "mdi:alert",
         "attr": "warning_code",
     },
+    "dry_contact_state": {
+        "name": "Dry Contact State",
+        "icon": "mdi:electric-switch",
+        "attr": "dry_contact_state",
+        "disabled_by_default": True,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "value_map": {0: "Off", 1: "On"},
+    },
 
     # Safety/compliance read-only diagnostic registers 235-238 (Issue #282).
     # These are installer/grid-compliance controls. Writing them is intentionally
@@ -1030,6 +1124,91 @@ SENSOR_DEFINITIONS = {
         "unit": None,
         "attr": "wit_mode_status",
         "condition": lambda data: hasattr(data, 'wit_mode_status') and data.wit_mode_status != "",
+    },
+
+    # Backup Box Sensors (Growatt ARK transfer switch, TL-X/TL-XH only, regs 3281-3342)
+    "box_connect_flag": {
+        "name": "Backup Box Status",
+        "icon": "mdi:transfer-right",
+        "attr": "box_connect_flag",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "disabled_by_default": True,
+        "value_map": {0: "Abnormal", 1: "Normal"},
+    },
+    "box_work_mode": {
+        "name": "Backup Box Work Mode",
+        "icon": "mdi:home-switch",
+        "attr": "box_work_mode",
+        "condition": lambda data: getattr(data, 'box_connect_flag', 0) == 1,
+        "value_map": {0: "Off-Grid", 1: "On-Grid", 2: "Generator"},
+    },
+    "box_bypass_status": {
+        "name": "Backup Box Bypass",
+        "icon": "mdi:electric-switch",
+        "attr": "box_bypass_status",
+        "condition": lambda data: getattr(data, 'box_connect_flag', 0) == 1,
+        "value_map": {0: "Off", 1: "On"},
+    },
+    "box_temperature": {
+        "name": "Backup Box Temperature",
+        "icon": "mdi:thermometer",
+        "device_class": SensorDeviceClass.TEMPERATURE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfTemperature.CELSIUS,
+        "attr": "box_temperature",
+        "condition": lambda data: getattr(data, 'box_connect_flag', 0) == 1,
+    },
+    "box_grid_voltage": {
+        "name": "Backup Box Grid Voltage",
+        "icon": "mdi:transmission-tower",
+        "device_class": SensorDeviceClass.VOLTAGE,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfElectricPotential.VOLT,
+        "attr": "box_grid_voltage",
+        "condition": lambda data: getattr(data, 'box_connect_flag', 0) == 1,
+    },
+    "box_grid_power": {
+        "name": "Backup Box Grid Power",
+        "icon": "mdi:transmission-tower",
+        "device_class": SensorDeviceClass.POWER,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfPower.WATT,
+        "attr": "box_grid_power",
+        "condition": lambda data: getattr(data, 'box_connect_flag', 0) == 1,
+    },
+    "box_load_power": {
+        "name": "Backup Box Load Power",
+        "icon": "mdi:home-lightning-bolt",
+        "device_class": SensorDeviceClass.POWER,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfPower.WATT,
+        "attr": "box_load_power",
+        "condition": lambda data: getattr(data, 'box_connect_flag', 0) == 1,
+    },
+    "box_error_code": {
+        "name": "Backup Box Error Code",
+        "icon": "mdi:alert-circle",
+        "attr": "box_error_code",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "disabled_by_default": True,
+        "condition": lambda data: getattr(data, 'box_connect_flag', 0) == 1,
+    },
+    "box_warning_code": {
+        "name": "Backup Box Warning Code",
+        "icon": "mdi:alert",
+        "attr": "box_warning_code",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "disabled_by_default": True,
+        "condition": lambda data: getattr(data, 'box_connect_flag', 0) == 1,
+    },
+    "box_relay_status": {
+        "name": "Backup Box Relay",
+        "icon": "mdi:electric-switch-closed",
+        "attr": "box_relay_status",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "disabled_by_default": True,
+        "condition": lambda data: getattr(data, 'box_connect_flag', 0) == 1,
+        "value_map": {0: "Not Supported", 1: "Open", 2: "Closed"},
     },
 }
 
@@ -1225,6 +1404,8 @@ class GrowattModbusSensor(CoordinatorEntity, SensorEntity):
         invert_grid_power = self._config_entry.options.get(CONF_INVERT_GRID_POWER, False)
         inverter_series = self._config_entry.data.get(CONF_INVERTER_SERIES, "").lower()
         is_sph_family = inverter_series.startswith("sph_")
+        # XH hybrid models (MOD-XH, etc.) expose energy_to_user registers via 3000-range
+        is_xh_hybrid = "xh" in inverter_series
         
         # Special handling for calculated sensors
         if self._sensor_def.get("attr") == "calculated":
@@ -1385,66 +1566,75 @@ class GrowattModbusSensor(CoordinatorEntity, SensorEntity):
             
             
             elif self._sensor_key == "grid_energy_today":
-                # Combined grid energy: positive=export, negative=import
-                # Net grid energy = export - import
+                # Net grid energy = export − import. Positive = net export for the day.
                 export_energy = getattr(data, "energy_to_grid_today", 0)
-                load_energy = getattr(data, "load_energy_today", 0)
-                solar_energy = getattr(data, "energy_today", 0)
-                
-                # Import = load - solar + export
-                import_energy = max(0, load_energy - solar_energy + export_energy)
-                
-                # Net: positive when more export than import
+
+                # SPH / XH hybrids: use the hardware bidirectional meter directly.
+                # The formula (load + export − energy_today) is wrong on these models
+                # because energy_today is MPPT DC yield, not AC output. Issue #336.
+                if is_sph_family or is_xh_hybrid:
+                    import_energy = getattr(data, "energy_to_user_today", 0)
+                else:
+                    load_energy = getattr(data, "load_energy_today", 0)
+                    solar_energy = getattr(data, "energy_today", 0)
+                    import_energy = max(0, load_energy - solar_energy + export_energy)
+
                 net_energy = export_energy - import_energy
-                
-                # Apply inversion if configured
+
                 if invert_grid_power:
                     net_energy = -net_energy
-                
+
                 raw_value = round(net_energy, 2)
                 return self.coordinator.get_sensor_value(self._sensor_key, raw_value)
-            
+
             elif self._sensor_key == "grid_energy_total":
-                # Combined grid energy: positive=export, negative=import
-                # Net grid energy = export - import
+                # Net grid energy = export − import. Positive = net export lifetime.
                 export_energy = getattr(data, "energy_to_grid_total", 0)
-                load_energy = getattr(data, "load_energy_total", 0)
-                solar_energy = getattr(data, "energy_total", 0)
-                
-                # Import = load - solar + export
-                import_energy = max(0, load_energy - solar_energy + export_energy)
-                
-                # Net: positive when more export than import
+
+                # SPH / XH hybrids: use the hardware bidirectional meter directly.
+                # The formula is unreliable on hybrid models because energy_total
+                # includes battery cycling losses. Issue #336.
+                if is_sph_family or is_xh_hybrid:
+                    import_energy = getattr(data, "energy_to_user_total", 0)
+                else:
+                    load_energy = getattr(data, "load_energy_total", 0)
+                    solar_energy = getattr(data, "energy_total", 0)
+                    import_energy = max(0, load_energy - solar_energy + export_energy)
+
                 net_energy = export_energy - import_energy
-                
-                # Apply inversion if configured
+
                 if invert_grid_power:
                     net_energy = -net_energy
-                
+
                 raw_value = round(net_energy, 2)
                 return self.coordinator.get_sensor_value(self._sensor_key, raw_value)
 
             elif self._sensor_key == "grid_import_energy_today":
-                # Grid import energy - use hardware register if available, otherwise calculate
-                # SPH/SPH-TL3: energy_to_user_today (hardware bidirectional meter = grid import)
-                # Other models: energy_from_grid_today
-
-                # Check if inverter has hardware import energy register
-                # SPH family uses "energy_to_user" for import, while non-SPH models
-                # should not treat energy_to_user as grid import
-                has_hardware_import = hasattr(data, "energy_from_grid_today") or (
-                    is_sph_family and hasattr(data, "energy_to_user_today")
+                # Grid import energy - use hardware register if available, otherwise calculate.
+                # SPH: energy_to_user_today (hardware bidirectional meter = grid import)
+                # MOD-XH and other XH hybrids: same register via 3000-range (3067/3068) — Issue #336
+                # Other models: energy_from_grid_today or calculation
+                #
+                # The calculation (load + export - energy_today) is WRONG for XH hybrids because
+                # energy_today on those models is PV DC energy (use_mppt_energy_today=True), not
+                # AC inverter output. The hardware register gives the correct value directly.
+                energy_to_user_today = getattr(data, "energy_to_user_today", 0)
+                has_hardware_import = (
+                    hasattr(data, "energy_from_grid_today") or
+                    (is_sph_family or is_xh_hybrid) or
+                    "wit_" in inverter_series
                 )
 
                 if has_hardware_import:
-                    # Hardware energy registers are accumulated by the inverter's internal
-                    # bidirectional power meter, independent of CT clamp orientation.
-                    # energy_to_user_today always correctly measures grid import regardless
-                    # of CT direction — do NOT swap based on invert_grid_power (Issue #211).
-                    raw_value = getattr(data, "energy_to_user_today", 0) if hasattr(data, "energy_to_user_today") else getattr(data, "energy_from_grid_today", 0)
+                    # Hardware bidirectional meter — do NOT gate on > 0.
+                    # A zero reading is valid (no grid import yet today); gating on > 0
+                    # caused the broken formula path to fire on hybrid profiles mid-day,
+                    # producing values that rise then fall as PV output increases. Issue #336.
+                    # energy_from_grid_today takes priority if present; fall back to energy_to_user_today.
+                    raw_value = getattr(data, "energy_from_grid_today", energy_to_user_today)
                 else:
-                    # No hardware import register - must calculate
-                    # This calculation works for non-hybrid inverters (MIN, etc.)
+                    # No hardware import register — calculate from load/solar/export.
+                    # Valid for non-hybrid inverters (MIN, etc.) where energy_today = AC output.
                     load_energy = getattr(data, "load_energy_today", 0)
                     solar_energy = getattr(data, "energy_today", 0)
                     export_energy = getattr(data, "energy_to_grid_today", 0)
@@ -1454,26 +1644,25 @@ class GrowattModbusSensor(CoordinatorEntity, SensorEntity):
                 return self.coordinator.get_sensor_value(self._sensor_key, raw_value)
 
             elif self._sensor_key == "grid_import_energy_total":
-                # Grid import energy - use hardware register if available, otherwise calculate
-                # SPH/SPH-TL3: energy_to_user_total (hardware bidirectional meter = grid import)
-                # Other models: energy_from_grid_total
-
-                # Check if inverter has hardware import energy register
-                # SPH family uses "energy_to_user" for import, while non-SPH models
-                # should not treat energy_to_user as grid import
-                has_hardware_import = hasattr(data, "energy_from_grid_total") or (
-                    is_sph_family and hasattr(data, "energy_to_user_total")
+                # Grid import energy total - same hardware-first logic as the daily sensor.
+                # SPH: energy_to_user_total from hardware register
+                # MOD-XH and other XH hybrids: same register via 3000-range (3069/3070) — Issue #336
+                # The lifetime calculation (load_total + export_total - energy_total) is unreliable
+                # for hybrid models because energy_total includes battery cycling losses.
+                energy_to_user_total = getattr(data, "energy_to_user_total", 0)
+                has_hardware_import = (
+                    hasattr(data, "energy_from_grid_total") or
+                    (is_sph_family or is_xh_hybrid) or
+                    "wit_" in inverter_series
                 )
 
                 if has_hardware_import:
-                    # Hardware energy registers are accumulated by the inverter's internal
-                    # bidirectional power meter, independent of CT clamp orientation.
-                    # energy_to_user_total always correctly measures grid import regardless
-                    # of CT direction — do NOT swap based on invert_grid_power (Issue #211).
-                    raw_value = getattr(data, "energy_to_user_total", 0) if hasattr(data, "energy_to_user_total") else getattr(data, "energy_from_grid_total", 0)
+                    # Hardware bidirectional meter — do NOT gate on > 0 (same fix as daily sensor).
+                    # energy_from_grid_total takes priority if present; fall back to energy_to_user_total.
+                    raw_value = getattr(data, "energy_from_grid_total", energy_to_user_total)
                 else:
-                    # No hardware import register - must calculate
-                    # This calculation works for non-hybrid inverters (MIN, etc.)
+                    # No hardware import register — calculate from load/solar/export.
+                    # Valid for non-hybrid inverters (MIN, etc.).
                     load_energy = getattr(data, "load_energy_total", 0)
                     solar_energy = getattr(data, "energy_total", 0)
                     export_energy = getattr(data, "energy_to_grid_total", 0)
