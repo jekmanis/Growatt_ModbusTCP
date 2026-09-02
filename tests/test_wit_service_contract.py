@@ -1183,3 +1183,28 @@ def test_a_read_the_bus_cannot_take_is_reported_rather_than_raised(wired_shared)
     assert result["success"] is False
     assert result["values"] == []
     assert "bus wedged" in str(result.get("error"))
+
+
+@pytest.mark.parametrize("mode", sorted(_const.WIT_MODES))
+def test_every_offered_mode_writes_all_four_verified_registers(wired, mode):
+    """No mode may reach the end of the sequence having skipped a step.
+
+    Each of steps 2 (30410), 4 (30200) and 5 (30407/30409) is an if/elif chain over
+    literal mode names with no else, so a mode string that is in `const.WIT_MODES` -
+    and therefore accepted by the schema - but missing from one of those tuples writes
+    only 30100/30476/30411 and still returns success=True. The optimizer would then
+    read registers that match nothing it predicted: MISMATCH, resend, ERROR, every
+    slot, with the action reporting success throughout. That is one const.py line away,
+    so the coverage is asserted from the mode list itself rather than from the
+    hand-written command table above.
+    """
+    _, _, _, handlers = wired()
+    response = _set_wit_mode(handlers, device_id=DEVICE_ID, mode=mode,
+                             duration_minutes=20, power_percent=100)
+    written = {int(k) for k in response["registers_written"]}
+    missing = [r for r in (REG_AC_CHARGE_ENABLE, REG_EXPORT_LIMIT_ENABLE,
+                           REG_REMOTE_ENABLE, REG_REMOTE_POWER) if r not in written]
+    assert not missing, (
+        f"mode '{mode}' reported success without writing {missing}; "
+        f"it is missing from a step's mode tuple in set_wit_mode"
+    )
