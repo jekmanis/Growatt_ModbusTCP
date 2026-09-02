@@ -14,13 +14,22 @@ from .const import (
     DOMAIN,
     WRITABLE_REGISTERS,
     CONF_REGISTER_MAP,
+    control_is_blocked,
     get_device_type_for_control,
+    is_read_only_register,
     VPP_CONTROL_AVAILABILITY_FLAG,
 )
 from .coordinator import GrowattModbusCoordinator
+from .entity import GrowattEntity
 from .growatt_modbus import ModbusWriteError
 
 _LOGGER = logging.getLogger(__name__)
+
+# 1, not 0: these entities WRITE to the inverter. An RS485 bus cannot carry
+# concurrent transactions — that constraint is why SharedModbusConnection holds a
+# lock at all. Serialising at the platform level keeps HA from issuing overlapping
+# service calls that would only queue on that lock anyway.
+PARALLEL_UPDATES = 1
 
 
 async def async_setup_entry(
@@ -29,7 +38,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Growatt Modbus number entities."""
-    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator = config_entry.runtime_data
     
     # Get the register map for this inverter
     register_map_name = config_entry.data.get(CONF_REGISTER_MAP)
@@ -65,6 +74,9 @@ async def async_setup_entry(
                     _LOGGER.info("%s control enabled (register %d found)", control_name, register_num)
 
         # VPP Battery Control number entities (30xxx registers)
+        # Local setpoint (no register of its own) read by GrowattWitVppBatteryModeSelect
+        # when it applies Charge/Discharge — created unconditionally, as upstream does.
+        entities.append(GrowattWitVppPowerPercentNumber(coordinator, config_entry))
         if 30404 in holding_registers:
             entities.append(GrowattWitVppChargeCutoffSocNumber(coordinator, config_entry))
         if 30405 in holding_registers:
@@ -102,6 +114,21 @@ async def async_setup_entry(
         if register_num not in holding_registers:
             continue  # Skip if register not in this profile
 
+        # A profile marking the register read-only means "this model has the address but
+        # will not accept a write" — so do not offer a control for it (#374).
+        #
+        # Until v1.6.1 `access` was documentation that nothing read. v1.6.0 added the VPP
+        # registers to the MOD profile as 'RO' expecting that to be enough, and this loop
+        # created five writable controls anyway — including the power setpoint measured
+        # importing from the grid to reach its target. The flag now means what everyone
+        # already assumed it meant.
+        if is_read_only_register(holding_registers.get(register_num)):
+            _LOGGER.debug(
+                "Skipping %s: register %d is read-only on this profile",
+                control_name, register_num,
+            )
+            continue
+
         # Profile-specific filter: only_profiles restricts to named maps; not_profiles excludes them
         _only = control_config.get('only_profiles')
         if _only and register_map_name not in _only:
@@ -126,11 +153,23 @@ async def async_setup_entry(
         async_add_entities(entities)
 
 
-class GrowattGenericNumber(CoordinatorEntity, NumberEntity):
+class GrowattGenericNumber(GrowattEntity, NumberEntity):
     """Generic number entity for any numeric control."""
 
-    _attr_has_entity_name = True
-    _attr_mode = NumberMode.SLIDER
+    # has_entity_name comes from GrowattEntity, as do unique_id and device_info.
+    # BOX, not SLIDER. Home Assistant's number row fires its write on the DOM `change`
+    # event: for a text box that is once, on blur or Enter; for a slider it is once per
+    # step while dragging.
+    #
+    # So dragging a slider to set a battery threshold wrote every value it passed through.
+    # A reporter aiming for 48.0 V left his inverter on 49.6 V, confirmed on the LCD
+    # (#402). Every control on this platform is a persistent holding register, likely
+    # EEPROM-backed (#392), so the intermediate values cost write cycles as well as
+    # landing on the wrong one.
+    #
+    # A box is also simply better here: bat_low_to_uti spans a thousand steps, which
+    # nobody can hit precisely by dragging on a phone.
+    _attr_mode = NumberMode.BOX
     _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(
@@ -141,11 +180,22 @@ class GrowattGenericNumber(CoordinatorEntity, NumberEntity):
         control_config: dict,
     ) -> None:
         """Initialize the number entity."""
-        super().__init__(coordinator)
+        super().__init__(
+            coordinator,
+            config_entry,
+            control_name,
+            get_device_type_for_control(control_name),
+        )
 
-        self._config_entry = config_entry
         self._control_name = control_name
         self._control_config = control_config
+
+        # Controls that should exist but not be operable until someone chooses to enable
+        # them. Used for the SPF bulk and float charging voltages (#384), where a wrong
+        # in-range value damages a battery bank rather than producing a wrong reading —
+        # unlike every other control here, where the worst case is a visible mistake.
+        if control_config.get('disabled_by_default'):
+            self._attr_entity_registry_enabled_default = False
 
         # Generate friendly name
         friendly_overrides = {
@@ -155,10 +205,22 @@ class GrowattGenericNumber(CoordinatorEntity, NumberEntity):
             'max_output_power_rate': 'Max Output Power Rate',
             'vpp_export_limit_power_rate': 'VPP Export Limit Power Rate',
             'load_first_battery_minimum_soc': 'Load First Battery Minimum SOC',
+            # Register 3067. Growatt calls it "Grid First", but #362 demonstrated it
+            # also governs discharge in Load/self-consumption operation, so the mode
+            # prefix misleads more than it describes. The entity_id of existing
+            # installs is unaffected — that is fixed at creation from the unique_id.
+            'grid_first_discharge_stopped_soc': 'Discharge Stopped SOC',
+            # Register 3048, and the same correction for the same reason (#362): measured
+            # to stop charging under Load Priority with all TOU periods disabled, so the
+            # "(Battery First)" suffix told users it could be ignored outside that mode.
+            'batt_first_charge_stopped_soc': 'Charge Stopped SOC',
+            # Register 3312 (#372). "Grid" rather than "AC" deliberately: the cloud calls
+            # it ub_ac_charging_stop_soc, but next to "Charge Stopped SOC" above, "AC" does
+            # not tell a user which of the two applies to them.
+            'grid_charge_stopped_soc': 'Grid Charge Stopped SOC',
         }
         friendly_name = friendly_overrides.get(control_name, control_name.replace('_', ' ').title())
         self._attr_name = friendly_name
-        self._attr_unique_id = f"{config_entry.entry_id}_{control_name}"
 
         # Set icon
         self._attr_icon = self._get_icon(control_name)
@@ -166,12 +228,50 @@ class GrowattGenericNumber(CoordinatorEntity, NumberEntity):
         # Configure range and unit
         self._configure_range_and_unit()
 
+    @property
+    def available(self) -> bool:
+        """Withhold the control when the inverter will not accept a write.
+
+        Some settings are conditional on another register rather than on the profile. The
+        SPF's max charge current cannot be set while battery type is Lithium — the BMS takes
+        over charge control — and this hardware discards a rejected save silently rather
+        than refusing it, so an offered-but-ignored slider would look like it worked (#376).
+
+        Declarative as `('field', value)` rather than a callable: a lambda here would be
+        hard to test and easy to make decorative, which is a mistake this project has
+        already shipped once.
+
+        The second reason is a block that was not read at all this poll. Registers
+        30100 / 30200-30201 / 30407-30410 are optional best-effort reads; when one is
+        missed, GrowattData still carries its dataclass default (0), which HA would
+        publish as a real "Disabled"/0 setting. That is the same class of defect as the
+        mode sensor frozen at "Passthrough" — a fabricated reading is worse than none.
+        VPP_CONTROL_AVAILABILITY_FLAG maps the control to the flag that proves its block
+        responded; controls not backed by such a block have no entry and are unaffected.
+
+        The two conditions are ANDed, not substituted for one another: they answer
+        different questions ("will the write be accepted?" vs "do we know the current
+        value?").
+        """
+        if not super().available:
+            return False
+        if control_is_blocked(self._control_config, self.coordinator.data):
+            return False
+        flag = VPP_CONTROL_AVAILABILITY_FLAG.get(self._control_name)
+        if flag is None:
+            return True
+        data = self.coordinator.data
+        return bool(data is not None and getattr(data, flag, False))
+
     def _get_icon(self, control_name: str) -> str:
         """Get icon based on control name."""
         icon_map = {
             'export_limit_power': 'mdi:speedometer',
             'export_limit_failed_power_rate': 'mdi:transmission-tower-export',
             'active_power_rate': 'mdi:speedometer',
+            'max_charge_current': 'mdi:battery-charging-high',
+            'bulk_charge_voltage': 'mdi:battery-charging-100',
+            'float_charge_voltage': 'mdi:battery-charging-60',
             'ac_charge_current': 'mdi:current-ac',
             'gen_charge_current': 'mdi:current-ac',
             'bat_low_to_uti': 'mdi:battery-alert',
@@ -225,30 +325,6 @@ class GrowattGenericNumber(CoordinatorEntity, NumberEntity):
             self._attr_native_unit_of_measurement = unit
 
     @property
-    def device_info(self) -> dict[str, Any]:
-        """Return device information."""
-        device_type = get_device_type_for_control(self._control_name)
-        return self.coordinator.get_device_info(device_type)
-
-    @property
-    def available(self) -> bool:
-        """Unavailable while the backing VPP block was not read this poll.
-
-        Registers 30100 / 30200-30201 / 30407-30410 are optional best-effort reads.
-        When a block is missed, GrowattData carries its dataclass default (0), which
-        would otherwise be published as a real "Disabled"/0 setting. Reporting
-        unavailable keeps a stale-but-honest state in HA instead. Controls not backed
-        by such a block are unaffected.
-        """
-        if not super().available:
-            return False
-        flag = VPP_CONTROL_AVAILABILITY_FLAG.get(self._control_name)
-        if flag is None:
-            return True
-        data = self.coordinator.data
-        return bool(data is not None and getattr(data, flag, False))
-
-    @property
     def native_value(self) -> float | None:
         """Return the current value."""
         data = self.coordinator.data
@@ -256,7 +332,14 @@ class GrowattGenericNumber(CoordinatorEntity, NumberEntity):
             return None
 
         # A block that was not read this poll carries dataclass defaults — report
-        # unknown rather than a fabricated value (see available()).
+        # unknown rather than a fabricated value (see available()). Kept in addition to
+        # the availability gate because HA keeps the last state of an unavailable entity
+        # around, and a 0 written there once would linger as a plausible-looking value.
+        # Written out rather than factored into a helper shared with available(): the
+        # wiring is asserted at source level by
+        # tests/test_optional_holding_backoff.py::test_control_entities_consult_the_availability_map,
+        # which counts two literal flag lookups per platform file (so this comment must
+        # not spell the expression out a third time).
         flag = VPP_CONTROL_AVAILABILITY_FLAG.get(self._control_name)
         if flag is not None and not getattr(data, flag, False):
             return None
@@ -282,6 +365,49 @@ class GrowattGenericNumber(CoordinatorEntity, NumberEntity):
 
         # Write to Modbus register with read-back verification
         register = self._control_config['register']
+
+        # Skip a write that would change nothing (#384).
+        #
+        # These registers are held in EEPROM, which has a finite write endurance. Nothing in
+        # the integration writes on its own - a write happens only when this method is
+        # called - but an automation that re-applies the same value on a schedule would
+        # burn a write cycle every time it ran, for no effect. A repairer working on this
+        # inverter family reported four SPF6000ES units with failed EEPROMs in a year, and
+        # while that is not attributable to anything here, there is no reason to spend
+        # cycles on writes that cannot change the value.
+        #
+        # Compared against a FRESH read, not coordinator.data. The cache is up to a scan
+        # interval old, so a register changed since the last poll - by the Growatt cloud,
+        # by another controller on the bus, or by the firmware itself - still reads as the
+        # value the user is now trying to set, and the write is silently skipped.
+        #
+        # The flow that hits it is the obvious one: set a value, see on the inverter's own
+        # display that it did not take, set it again. That second attempt is exactly the
+        # one a stale cache drops, and numeric entry (#402) makes it a more likely thing
+        # to do than dragging a slider was.
+        #
+        # time.py already re-reads its sibling registers before an atomic write, for a
+        # closely related reason - trusting the cache there made back-to-back writes
+        # revert each other. This brings the single-register path in line with it.
+        #
+        # One extra read, on a user-initiated write only. Nothing here writes by itself.
+        current_raw = await self.hass.async_add_executor_job(
+            self.coordinator.modbus_client.read_holding_registers, register, 1
+        )
+        if current_raw is not None and len(current_raw) >= 1:
+            if int(current_raw[0]) == (raw_value & 0xFFFF):
+                _LOGGER.debug(
+                    "%s already reads %s (raw %d) — skipping write to register %d",
+                    self._control_name, value, raw_value, register,
+                )
+                return
+        else:
+            # Unreadable: the comparison is meaningless, so the write goes ahead. A
+            # skipped write that should have happened is worse than a redundant one.
+            _LOGGER.debug(
+                "%s: could not read register %d before writing - proceeding without the "
+                "no-op check", self._control_name, register,
+            )
         try:
             write_ok, verified = await self.hass.async_add_executor_job(
                 self.coordinator.modbus_client.write_register_verified,
@@ -296,8 +422,16 @@ class GrowattGenericNumber(CoordinatorEntity, NumberEntity):
             if verified:
                 _LOGGER.info("Set %s to %.1f (raw=%d, verified)", self._control_name, value, raw_value)
             else:
+                # Two quite different causes, and the message used to name only the
+                # first. A MIN TL-XH accepts high SOC limits and silently discards low
+                # ones - the write reports success and the register keeps its old value,
+                # with no exception returned. Someone reading "cloud override" will go
+                # looking at their ShineStick rather than at the firmware (#400).
                 _LOGGER.warning(
-                    "%s: write succeeded but value reverted (possible cloud override)",
+                    "%s: the write was accepted but the register did not take the value. "
+                    "Either the inverter firmware rejected it silently (some models "
+                    "discard out-of-range SOC limits this way) or the Growatt cloud "
+                    "overwrote it.",
                     self._control_name,
                 )
             self.coordinator.track_write(register, raw_value, self._control_name)
@@ -305,10 +439,11 @@ class GrowattGenericNumber(CoordinatorEntity, NumberEntity):
 
 
 # Legacy class for backwards compatibility (remove in future version)
-class GrowattExportLimitPowerNumber(CoordinatorEntity, NumberEntity):
+class GrowattExportLimitPowerNumber(GrowattEntity, NumberEntity):
     """Number entity for export limit power percentage."""
 
-    _attr_mode = NumberMode.SLIDER
+    # Box rather than slider - see GrowattGenericNumber (#402).
+    _attr_mode = NumberMode.BOX
     _attr_native_min_value = 0.0
     _attr_native_max_value = 100.0
     _attr_native_step = 0.1
@@ -321,19 +456,16 @@ class GrowattExportLimitPowerNumber(CoordinatorEntity, NumberEntity):
         config_entry: ConfigEntry,
     ) -> None:
         """Initialize the number entity."""
-        super().__init__(coordinator)
+        super().__init__(
+            coordinator,
+            config_entry,
+            "export_limit_power",
+            get_device_type_for_control('export_limit_power'),
+        )
 
-        self._config_entry = config_entry
-        self._attr_name = f"{config_entry.data['name']} Export Limit Power"
-        self._attr_unique_id = f"{config_entry.entry_id}_export_limit_power"
+        self._attr_name = "Export Limit Power"
         self._attr_icon = "mdi:speedometer"
 
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return device information."""
-        # Determine device based on control type
-        device_type = get_device_type_for_control('export_limit_power')
-        return self.coordinator.get_device_info(device_type)
 
     @property
     def native_value(self) -> float | None:
@@ -382,10 +514,11 @@ class GrowattExportLimitPowerNumber(CoordinatorEntity, NumberEntity):
             await self.coordinator.async_request_refresh()
 
 
-class GrowattActivePowerRateNumber(CoordinatorEntity, NumberEntity):
+class GrowattActivePowerRateNumber(GrowattEntity, NumberEntity):
     """Number entity for active power rate (max output power %)."""
 
-    _attr_mode = NumberMode.SLIDER
+    # Box rather than slider - see GrowattGenericNumber (#402).
+    _attr_mode = NumberMode.BOX
     _attr_native_min_value = 0.0
     _attr_native_max_value = 100.0
     _attr_native_step = 1.0
@@ -398,19 +531,16 @@ class GrowattActivePowerRateNumber(CoordinatorEntity, NumberEntity):
         config_entry: ConfigEntry,
     ) -> None:
         """Initialize the number entity."""
-        super().__init__(coordinator)
+        super().__init__(
+            coordinator,
+            config_entry,
+            "active_power_rate",
+            get_device_type_for_control('active_power_rate'),
+        )
 
-        self._config_entry = config_entry
-        self._attr_name = f"{config_entry.data['name']} Active Power Rate"
-        self._attr_unique_id = f"{config_entry.entry_id}_active_power_rate"
+        self._attr_name = "Active Power Rate"
         self._attr_icon = "mdi:speedometer"
 
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return device information."""
-        # Determine device based on control type (should go to Solar device)
-        device_type = get_device_type_for_control('active_power_rate')
-        return self.coordinator.get_device_info(device_type)
 
     @property
     def native_value(self) -> float | None:
@@ -457,10 +587,11 @@ class GrowattActivePowerRateNumber(CoordinatorEntity, NumberEntity):
             await self.coordinator.async_request_refresh()
 
 
-class GrowattWitExportLimitWNumber(CoordinatorEntity, NumberEntity):
+class GrowattWitExportLimitWNumber(GrowattEntity, NumberEntity):
     """WIT VPP: Export limit in watts (holding register 203)."""
 
-    _attr_mode = NumberMode.SLIDER
+    # Box rather than slider - see GrowattGenericNumber (#402).
+    _attr_mode = NumberMode.BOX
     _attr_native_min_value = 0.0
     _attr_native_max_value = 20000.0
     _attr_native_step = 1.0
@@ -472,17 +603,15 @@ class GrowattWitExportLimitWNumber(CoordinatorEntity, NumberEntity):
         coordinator: GrowattModbusCoordinator,
         config_entry: ConfigEntry,
     ) -> None:
-        super().__init__(coordinator)
-        self._config_entry = config_entry
-        entry_name = config_entry.data.get("name", config_entry.title)
-        self._attr_name = f"{entry_name} Export Limit (W)"
-        self._attr_unique_id = f"{config_entry.entry_id}_export_limit_w"
+        super().__init__(
+            coordinator,
+            config_entry,
+            "export_limit_w",
+            get_device_type_for_control("export_limit_w"),
+        )
+        self._attr_name = "Export Limit (W)"
         self._attr_icon = "mdi:transmission-tower-export"
 
-    @property
-    def device_info(self) -> dict[str, Any]:
-        device_type = get_device_type_for_control("export_limit_w")
-        return self.coordinator.get_device_info(device_type)
 
     @property
     def native_value(self) -> float | None:
@@ -516,14 +645,15 @@ class GrowattWitExportLimitWNumber(CoordinatorEntity, NumberEntity):
             _LOGGER.error("[WIT] Failed to write export_limit_w")
 
 
-class GrowattWitActivePowerRateNumber(CoordinatorEntity, NumberEntity):
+class GrowattWitActivePowerRateNumber(GrowattEntity, NumberEntity):
     """WIT VPP: Active power rate percent (holding register 201).
 
     WIT requires work_mode (202) to be written for charging/discharging.
     We re-assert work_mode before writing power rate when possible.
     """
 
-    _attr_mode = NumberMode.SLIDER
+    # Box rather than slider - see GrowattGenericNumber (#402).
+    _attr_mode = NumberMode.BOX
     _attr_native_min_value = 0.0
     _attr_native_max_value = 100.0
     _attr_native_step = 1.0
@@ -535,17 +665,15 @@ class GrowattWitActivePowerRateNumber(CoordinatorEntity, NumberEntity):
         coordinator: GrowattModbusCoordinator,
         config_entry: ConfigEntry,
     ) -> None:
-        super().__init__(coordinator)
-        self._config_entry = config_entry
-        entry_name = config_entry.data.get("name", config_entry.title)
-        self._attr_name = f"{entry_name} Active Power Rate (VPP %)"
-        self._attr_unique_id = f"{config_entry.entry_id}_active_power_rate_vpp"
+        super().__init__(
+            coordinator,
+            config_entry,
+            "active_power_rate_vpp",
+            get_device_type_for_control("active_power_rate"),
+        )
+        self._attr_name = "Active Power Rate (VPP %)"
         self._attr_icon = "mdi:speedometer"
 
-    @property
-    def device_info(self) -> dict[str, Any]:
-        device_type = get_device_type_for_control("active_power_rate")
-        return self.coordinator.get_device_info(device_type)
 
     @property
     def native_value(self) -> float | None:
@@ -604,10 +732,52 @@ class GrowattWitActivePowerRateNumber(CoordinatorEntity, NumberEntity):
 # WIT VPP-specific Number Entities (30xxx registers)
 # =============================================================================
 
-class GrowattWitVppChargeCutoffSocNumber(CoordinatorEntity, NumberEntity):
+class GrowattWitVppPowerPercentNumber(GrowattEntity, NumberEntity):
+    """WIT VPP: Power percentage for charge/discharge operations.
+
+    This value is applied when Battery Mode is set to Charge or Discharge.
+    It's stored locally and used by the Battery Mode select entity.
+    """
+
+    # Box rather than slider - see GrowattGenericNumber (#402).
+    _attr_mode = NumberMode.BOX
+    _attr_native_min_value = 1.0
+    _attr_native_max_value = 100.0
+    _attr_native_step = 1.0
+    _attr_native_unit_of_measurement = "%"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_icon = "mdi:gauge"
+
+    def __init__(
+        self,
+        coordinator: GrowattModbusCoordinator,
+        config_entry: ConfigEntry,
+    ) -> None:
+        super().__init__(
+            coordinator,
+            config_entry,
+            "vpp_power_percent",
+            get_device_type_for_control("active_power_rate"),
+        )
+        self._attr_name = "VPP Power Rate"
+
+
+    @property
+    def native_value(self) -> float | None:
+        return float(getattr(self.coordinator, "wit_vpp_power_percent", 100))
+
+    async def async_set_native_value(self, value: float) -> None:
+        """Store the power percentage for use by Battery Mode entity."""
+        power_percent = int(value)
+        setattr(self.coordinator, "wit_vpp_power_percent", power_percent)
+        _LOGGER.info("[WIT-VPP] Set power rate to %d%% (will apply on next mode change)", power_percent)
+
+
+class GrowattWitVppChargeCutoffSocNumber(GrowattEntity, NumberEntity):
     """WIT VPP: Charge cutoff SOC (30404) - stop charging when SOC reaches this %."""
 
-    _attr_mode = NumberMode.SLIDER
+    # Box rather than slider - see GrowattGenericNumber (#402).
+    _attr_mode = NumberMode.BOX
     _attr_native_min_value = 10.0
     _attr_native_max_value = 100.0
     _attr_native_step = 1.0
@@ -622,16 +792,14 @@ class GrowattWitVppChargeCutoffSocNumber(CoordinatorEntity, NumberEntity):
         coordinator: GrowattModbusCoordinator,
         config_entry: ConfigEntry,
     ) -> None:
-        super().__init__(coordinator)
-        self._config_entry = config_entry
-        entry_name = config_entry.data.get("name", config_entry.title)
-        self._attr_name = f"{entry_name} Charge Cutoff SOC"
-        self._attr_unique_id = f"{config_entry.entry_id}_vpp_charge_cutoff_soc"
+        super().__init__(
+            coordinator,
+            config_entry,
+            "vpp_charge_cutoff_soc",
+            get_device_type_for_control("work_mode"),
+        )
+        self._attr_name = "Charge Cutoff SOC"
 
-    @property
-    def device_info(self) -> dict[str, Any]:
-        device_type = get_device_type_for_control("work_mode")
-        return self.coordinator.get_device_info(device_type)
 
     @property
     def native_value(self) -> float | None:
@@ -659,10 +827,11 @@ class GrowattWitVppChargeCutoffSocNumber(CoordinatorEntity, NumberEntity):
             _LOGGER.exception("[WIT-VPP] Failed to set charge cutoff SOC: %s", err)
 
 
-class GrowattWitVppDischargeCutoffSocNumber(CoordinatorEntity, NumberEntity):
+class GrowattWitVppDischargeCutoffSocNumber(GrowattEntity, NumberEntity):
     """WIT VPP: Discharge cutoff SOC (30405) - stop discharging when SOC drops to this %."""
 
-    _attr_mode = NumberMode.SLIDER
+    # Box rather than slider - see GrowattGenericNumber (#402).
+    _attr_mode = NumberMode.BOX
     _attr_native_min_value = 10.0
     _attr_native_max_value = 100.0
     _attr_native_step = 1.0
@@ -677,16 +846,14 @@ class GrowattWitVppDischargeCutoffSocNumber(CoordinatorEntity, NumberEntity):
         coordinator: GrowattModbusCoordinator,
         config_entry: ConfigEntry,
     ) -> None:
-        super().__init__(coordinator)
-        self._config_entry = config_entry
-        entry_name = config_entry.data.get("name", config_entry.title)
-        self._attr_name = f"{entry_name} Discharge Cutoff SOC"
-        self._attr_unique_id = f"{config_entry.entry_id}_vpp_discharge_cutoff_soc"
+        super().__init__(
+            coordinator,
+            config_entry,
+            "vpp_discharge_cutoff_soc",
+            get_device_type_for_control("work_mode"),
+        )
+        self._attr_name = "Discharge Cutoff SOC"
 
-    @property
-    def device_info(self) -> dict[str, Any]:
-        device_type = get_device_type_for_control("work_mode")
-        return self.coordinator.get_device_info(device_type)
 
     @property
     def native_value(self) -> float | None:
@@ -714,7 +881,7 @@ class GrowattWitVppDischargeCutoffSocNumber(CoordinatorEntity, NumberEntity):
             _LOGGER.exception("[WIT-VPP] Failed to set discharge cutoff SOC: %s", err)
 
 
-class GrowattWitVppTouPeriodsNumber(CoordinatorEntity, NumberEntity):
+class GrowattWitVppTouPeriodsNumber(GrowattEntity, NumberEntity):
     """WIT VPP: Number of active TOU periods (30411).
 
     Setting this to 0 disables TOU schedule and returns to self-consumption.
@@ -736,16 +903,14 @@ class GrowattWitVppTouPeriodsNumber(CoordinatorEntity, NumberEntity):
         coordinator: GrowattModbusCoordinator,
         config_entry: ConfigEntry,
     ) -> None:
-        super().__init__(coordinator)
-        self._config_entry = config_entry
-        entry_name = config_entry.data.get("name", config_entry.title)
-        self._attr_name = f"{entry_name} TOU Active Periods"
-        self._attr_unique_id = f"{config_entry.entry_id}_vpp_tou_periods"
+        super().__init__(
+            coordinator,
+            config_entry,
+            "vpp_tou_periods",
+            get_device_type_for_control("work_mode"),
+        )
+        self._attr_name = "TOU Active Periods"
 
-    @property
-    def device_info(self) -> dict[str, Any]:
-        device_type = get_device_type_for_control("work_mode")
-        return self.coordinator.get_device_info(device_type)
 
     @property
     def native_value(self) -> float | None:
@@ -773,7 +938,7 @@ class GrowattWitVppTouPeriodsNumber(CoordinatorEntity, NumberEntity):
             _LOGGER.exception("[WIT-VPP] Failed to set TOU periods: %s", err)
 
 
-class GrowattWitVppTouPeriodNumber(CoordinatorEntity, NumberEntity):
+class GrowattWitVppTouPeriodNumber(GrowattEntity, NumberEntity):
     """WIT VPP TOU period power entity.
 
     Handles the power level for a single TOU period (+100 = full charge, -100 = full discharge).
@@ -788,7 +953,8 @@ class GrowattWitVppTouPeriodNumber(CoordinatorEntity, NumberEntity):
     _attr_native_max_value = 100.0
     _attr_native_step = 1.0
     _attr_native_unit_of_measurement = '%'
-    _attr_mode = NumberMode.SLIDER
+    # Box rather than slider - see GrowattGenericNumber (#402).
+    _attr_mode = NumberMode.BOX
     _attr_icon = 'mdi:battery-arrow-up-outline'
 
     def __init__(
@@ -798,20 +964,18 @@ class GrowattWitVppTouPeriodNumber(CoordinatorEntity, NumberEntity):
         period: int,
         slot: str = 'power',
     ) -> None:
-        super().__init__(coordinator)
-        self._config_entry = config_entry
+        super().__init__(
+            coordinator,
+            config_entry,
+            f"vpp_tou_p{period}_power",
+            get_device_type_for_control("work_mode"),
+        )
         self._period = period
         self._slot = 'power'
         self._register = 30412 + (period - 1) * 3 + 2  # power offset within the period triplet
         self._coordinator_attr = f"wit_vpp_tou_p{period}_power"
 
-        entry_name = config_entry.data.get("name", config_entry.title)
-        self._attr_name = f"{entry_name} TOU Period {period} Power"
-        self._attr_unique_id = f"{config_entry.entry_id}_vpp_tou_p{period}_power"
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        return self.coordinator.get_device_info(get_device_type_for_control("work_mode"))
+        self._attr_name = f"TOU Period {period} Power"
 
     @property
     def native_value(self) -> float | None:

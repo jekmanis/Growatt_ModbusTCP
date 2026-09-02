@@ -226,7 +226,50 @@ SPF_3000_6000_ES_PLUS = {
              'desc': 'Battery to Grid: SOC level to switch from battery to utility. Non-Lithium: 20.0-64.0V, Lithium: 0-100%',
              'battery_dependent': True},
 
-        # AC Charge Current
+        # Max Total Charge Current — LCD "Program 02" (#376)
+        #
+        # Total across both chargers: "Max. charging current = utility charging current +
+        # solar charging current". Caps register 38 when set lower — the manual states that
+        # if Program 02 is below Program 11, the inverter uses Program 02 for the utility
+        # charger too.
+        #
+        # Range is from the SPF 6000ES Plus LCD manual: 10A~100A, step 1A, default 60A.
+        # NOT the 0~400 in the off-grid protocol document, which covers the whole family.
+        # The floor of 10 matters: this panel scrolls to 999 and silently discards an
+        # out-of-range save, so values below 10 would look accepted and do nothing.
+        #
+        # Confirmed for the 6000 only. The reporter notes the SPF 3000ES is "much more
+        # restricted regarding amperage", and that manual has not been seen. Shipping the
+        # 6000 range is safe because out-of-range writes are cleanly rejected — the register
+        # keeps its previous value, so write verification reverts the entity visibly rather
+        # than leaving a setting that appears to have applied.
+        #
+        # Cannot be set at all when battery type (39) is Lithium; see WRITABLE_REGISTERS.
+        34: {'name': 'max_charge_current', 'scale': 1, 'unit': 'A', 'access': 'RW',
+             'valid_range': (10, 100),
+             'desc': 'Max total charge current, solar + utility (LCD Program 02). '
+                     '10-100A confirmed on SPF 6000ES Plus; unavailable on Lithium'},
+
+        # Bulk and float charging voltage — LCD "Program 19" and "Program 20" (#384).
+        #
+        # 48.0-58.4V on both, confirmed by comparing the SPF 6000ES Plus and SPF 3000-5000 ES
+        # manuals directly: Programs 19 and 20 are identical, so these do not vary across the
+        # family the way max charge current does. Read 555 and 551 on a 6000ES Plus (55.5V
+        # bulk, 55.1V float), inside that range.
+        #
+        # Settable only on a self-defined battery type — both programs say "If self-defined
+        # is selected in program 5". Exposed disabled by default; see WRITABLE_REGISTERS.
+        35: {'name': 'bulk_charge_voltage', 'scale': 0.1, 'unit': 'V', 'access': 'RW',
+             'valid_range': (480, 584),
+             'desc': 'Bulk / C.V. charging voltage (LCD Program 19). 48.0-58.4V, default '
+                     '56.4V. Requires a self-defined battery type'},
+        36: {'name': 'float_charge_voltage', 'scale': 0.1, 'unit': 'V', 'access': 'RW',
+             'valid_range': (480, 584),
+             'desc': 'Float charging voltage (LCD Program 20). 48.0-58.4V, default 54.0V. '
+                     'Requires a self-defined battery type'},
+
+        # AC Charge Current — LCD "Program 11", 0A~80A per the same manual, which confirms
+        # the limit this profile already assumed.
         38: {'name': 'ac_charge_current', 'scale': 1, 'unit': 'A', 'access': 'RW',
              'valid_range': (0, 80),
              'desc': 'AC charging current limit (SPF 6000 hardware max: 80A, stored directly)'},

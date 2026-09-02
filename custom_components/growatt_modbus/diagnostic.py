@@ -10,12 +10,13 @@ from typing import Any, Dict, List, Tuple, Optional
 import voluptuous as vol
 
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 import homeassistant.helpers.config_validation as cv
 
-from .const import DOMAIN, CONF_INVERTER_SERIES
-from .device_profiles import get_display_name_for_profile, get_profile
-from .auto_detection import convert_to_legacy_profile
+from .const import DOMAIN, CONF_INVERTER_SERIES, resolve_block_size
+from .device_profiles import fill_register_map, get_display_name_for_profile, get_profile
+from .auto_detection import ASSUMED, CONFIRMED, DTC_REGISTRY, convert_to_legacy_profile
 
 # Import register maps for "Suggested Match" column
 try:
@@ -32,6 +33,60 @@ except ImportError:
     HOLDING_REGISTERS = {}
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _coordinator_for_entry(hass: HomeAssistant, entry_id: str):
+    """Resolve a coordinator from a config entry id, or None.
+
+    Coordinators live on `entry.runtime_data` rather than in `hass.data[DOMAIN]`.
+    Service handlers receive only an entry id, so they resolve the entry first.
+
+    Returns None when the entry does not exist or is not loaded, which callers
+    already handle — previously that was expressed as "not in hass.data".
+    """
+    entry = hass.config_entries.async_get_entry(entry_id)
+    return getattr(entry, "runtime_data", None) if entry else None
+
+
+def _config_entry_id_for_device(hass: HomeAssistant, device_entry) -> str | None:
+    """The loaded Growatt config entry backing a device, or None.
+
+    Every service that takes a `device_id` needs this, and each had its own copy of the
+    same five lines. That is the duplication pattern this project has been bitten by
+    before — v1.3.5 fixed a stored-format bug in one of two byte-identical blocks and
+    left the other raising on every poll.
+
+    It also isolates a deprecation. `DeviceEntry.config_entries` is a set of entry ids;
+    Core 2026.8 deprecates it in favour of the single `config_entry_id`, with removal in
+    2027.8, because a device now belongs to exactly one config entry. Reading the old
+    attribute on a new core writes a deprecation warning naming this integration into the
+    user's log — which is how somebody else's rename turns into bug reports here.
+
+    `hasattr` rather than a value check, deliberately: on a new core the old attribute
+    still exists behind a compatibility shim, so testing the value would touch it and
+    emit the warning we are avoiding.
+    """
+    if hasattr(device_entry, "config_entry_id"):
+        entry_ids = [device_entry.config_entry_id] if device_entry.config_entry_id else []
+    else:  # Core < 2026.8
+        entry_ids = list(device_entry.config_entries)
+
+    for entry_id in entry_ids:
+        if _coordinator_for_entry(hass, entry_id) is not None:
+            return entry_id
+    return None
+
+
+def _all_coordinators(hass: HomeAssistant):
+    """Every loaded Growatt coordinator, as (entry_id, coordinator) pairs.
+
+    Replaces iterating hass.data[DOMAIN], which also contained the "_connections"
+    registry and so needed a defensive hasattr() check on every item.
+    """
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        coordinator = getattr(entry, "runtime_data", None)
+        if coordinator is not None:
+            yield entry.entry_id, coordinator
 
 def _get_integration_version() -> str:
     """Get integration version from manifest.json."""
@@ -53,6 +108,7 @@ SERVICE_READ_REGISTER = "read_register"
 SERVICE_SET_BATTERY_MODE = "set_battery_mode"
 SERVICE_SYNC_TOU_SCHEDULE = "sync_tou_schedule"
 SERVICE_GET_REGISTER_DATA = "get_register_data"
+SERVICE_SYNC_INVERTER_TIME = "sync_inverter_time"
 SERVICE_SET_WIT_MODE = "set_wit_mode"
 
 # Universal scan ranges - covers all Grid-Tied Growatt series
@@ -63,6 +119,17 @@ UNIVERSAL_SCAN_RANGES = [
     {"name": "Extended Range 125-249",   "start": 125,   "count": 125, "group": "legacy"},
     # Battery/storage range (SPH, SPM, MIN battery models)
     {"name": "Storage Range 1000-1124",  "start": 1000,  "count": 125, "group": "storage"},
+    # SPA second input block. The Growatt storage protocol splits these by type:
+    #
+    #   Storage (SPH type):  FC04 range 0~124,    1000~1124
+    #   Storage (SPA type):  FC04 range 1000~1124, 2000~2124
+    #
+    # So SPA has no input registers at 0-124 at all, and carries a second block at
+    # 2000-2124 that SPH does not. This scanner never covered 2000-2124, which is why
+    # SPA scans came back looking half-empty and why data visible in other tools had no
+    # address we could point at (#360). Harmless on non-SPA models — the range simply
+    # does not respond.
+    {"name": "SPA Extended 2000-2124",   "start": 2000,  "count": 125, "group": "storage"},
     # MIN/MOD extended data ranges (input registers FC03)
     {"name": "MIN/MOD Range 3000-3124",         "start": 3000, "count": 125, "group": "mod_extended"},
     {"name": "MOD Extended 3125-3249",          "start": 3125, "count": 125, "group": "mod_extended"},
@@ -131,7 +198,13 @@ SERVICE_EXPORT_DUMP_SCHEMA = vol.Schema(
         vol.Optional("scan_vpp_control",  default=False): cv.boolean,  # VPP control 30100-30499
         vol.Optional("scan_vpp_data",     default=False): cv.boolean,  # VPP data 31000-31399
         # Block size for range reads: 125 (default, fastest), 25 (for finicky inverters), 1 (single-register, slowest but most compatible)
-        vol.Optional("block_size", default=125): vol.All(vol.Coerce(int), vol.In([125, 25, 1])),
+        # Same set the options flow offers (BLOCK_SIZE_OPTIONS), so a scan can be run at
+        # whatever block size the poller is using. These were [125, 25, 1] while the
+        # options flow offered 50 and 10 as well, which made "reproduce it with a scan"
+        # impossible for anyone on the sizes in between.
+        vol.Optional("block_size", default=125): vol.All(
+            vol.Coerce(int), vol.In([125, 50, 25, 10, 5, 1])
+        ),
     }
 )
 
@@ -186,6 +259,19 @@ SERVICE_SYNC_TOU_SCHEDULE_SCHEMA = vol.Schema(
         vol.Optional("default_mode", default=0): vol.All(vol.Coerce(int), vol.Range(min=0, max=2)),
     }
 )
+SERVICE_SYNC_INVERTER_TIME_SCHEMA = vol.Schema(
+    {
+        vol.Required("device_id"): cv.string,
+        # Skip the write when the inverter is already close enough. Default 0 writes every
+        # time, which is what a one-off manual sync wants; a daily automation should raise
+        # it so it only spends a write when there is drift worth correcting. These are
+        # holding registers and very likely EEPROM-backed (#392).
+        vol.Optional("min_drift_seconds", default=0): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=86400)
+        ),
+    }
+)
+
 SERVICE_GET_REGISTER_DATA_SCHEMA = vol.Schema(
     {
         vol.Required("device_id"): cv.string,
@@ -231,21 +317,6 @@ SERVICE_SET_WIT_MODE_SCHEMA = vol.Schema({
         vol.Coerce(int), vol.Range(min=10, max=30)
     ),
 })
-
-
-def _get_coordinator_by_device_id(hass, device_id):
-    """Resolve a coordinator from a device_id."""
-    device_reg = dr.async_get(hass)
-    device_entry = device_reg.async_get(device_id)
-
-    if not device_entry:
-        return None
-
-    for entry_id in device_entry.config_entries:
-        if entry_id in hass.data.get(DOMAIN, {}):
-            return hass.data[DOMAIN][entry_id]
-
-    return None
 
 
 def _read_single_register(client, register: int, register_type: str = 'input') -> dict:
@@ -415,6 +486,9 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         offgrid_mode = call.data.get("offgrid_mode", False)
         block_size = call.data.get("block_size", 125)
 
+        # Overridden from the entry's own modbus_delay when one is selected below.
+        scan_delay_ms = 250
+
         # Build enabled scan groups from boolean flags.
         # If none are explicitly checked, scan everything (full scan is the default).
         # Check one or more to restrict the scan to those register ranges only.
@@ -439,22 +513,52 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         config_entry_id = call.data.get("config_entry")
 
         if config_entry_id:
-            coordinator = hass.data.get(DOMAIN, {}).get(config_entry_id)
-            if not coordinator or not hasattr(coordinator, 'entry'):
+            # Resolve the entry itself, not the coordinator (#360).
+            #
+            # This path used to require `entry.runtime_data`, which exists only while the
+            # entry is loaded. The documented scan procedure tells users to DISABLE the
+            # integration first, to stop the poller contending with the scanner for the
+            # gateway — so following the instructions guaranteed this lookup failed, the
+            # service aborted, and the only way to get a scan at all was to re-enter the
+            # connection by hand. Doing that silently discarded the entry's tuned
+            # slave_id, modbus_delay and block size, and reverted to defaults that a
+            # marginal gateway cannot serve. The user then sees "no response" on every
+            # range from hardware that polls perfectly.
+            #
+            # `entry.data` and `entry.options` are persisted, so they are readable while
+            # the entry is disabled. The coordinator is now used only to enrich the CSV
+            # with profile and entity values, and its absence degrades that rather than
+            # failing the scan.
+            entry = hass.config_entries.async_get_entry(config_entry_id)
+            if entry is None:
                 _LOGGER.error("config_entry '%s' not found in Growatt Modbus integration", config_entry_id)
                 return
 
-            entry_data = coordinator.entry.data
+            entry_data = entry.data
             connection_type = entry_data.get("connection_type", "tcp")
             host = entry_data.get("host")
             port = entry_data.get("port", 502)
             device = entry_data.get("device")
             baudrate = entry_data.get("baudrate", 9600)
             slave_id = entry_data.get("slave_id", 1)
-            pre_resolved_coordinator = coordinator
+
+            # Pace the scan like the poller this gateway is known to tolerate.
+            try:
+                scan_delay_ms = int(entry.options.get("modbus_delay", 250))
+            except (AttributeError, TypeError, ValueError):
+                scan_delay_ms = 250
+
+            # Same for block size, unless the caller asked for a specific one. A gateway
+            # that needs 25-register reads will fail the 125-register service default.
+            if "block_size" not in call.data:
+                block_size = resolve_block_size(entry.options.get("max_block_size")) or block_size
+
+            pre_resolved_coordinator = _coordinator_for_entry(hass, config_entry_id)
             _LOGGER.info(
-                "Using config entry '%s' (%s) for register scan",
-                coordinator.entry.title, config_entry_id
+                "Using config entry '%s' (%s) for register scan: slave %s, %d ms pacing, "
+                "block size %s, coordinator %s",
+                entry.title, config_entry_id, slave_id, scan_delay_ms, block_size,
+                "loaded" if pre_resolved_coordinator else "not loaded (entry disabled)",
             )
         else:
             connection_type = call.data.get("connection_type", "tcp")
@@ -485,7 +589,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         # Run export in executor — pass pre-resolved coordinator if available
         result = await hass.async_add_executor_job(
-            _export_registers_to_csv, hass, connection_type, host, port, device, baudrate, slave_id, offgrid_mode, enabled_groups, pre_resolved_coordinator, block_size
+            _export_registers_to_csv, hass, connection_type, host, port, device, baudrate, slave_id, offgrid_mode, enabled_groups, pre_resolved_coordinator, block_size, scan_delay_ms
         )
         
         if result["success"]:
@@ -565,18 +669,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             raise ValueError(f"Device {device_id} not found")
 
         # Find the config entry for this device
-        config_entry_id = None
-        for entry_id in device_entry.config_entries:
-            if entry_id in hass.data.get(DOMAIN, {}):
-                config_entry_id = entry_id
-                break
+        config_entry_id = _config_entry_id_for_device(hass, device_entry)
 
         if not config_entry_id:
             _LOGGER.error("No config entry found for device %s", device_id)
             raise ValueError(f"No config entry found for device {device_id}")
 
         # Get the coordinator
-        coordinator = hass.data[DOMAIN][config_entry_id]
+        coordinator = _coordinator_for_entry(hass, config_entry_id)
 
         if not coordinator:
             _LOGGER.error("Coordinator not found for config entry %s", config_entry_id)
@@ -620,18 +720,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             raise ValueError(f"Device {device_id} not found")
 
         # Find the config entry for this device
-        config_entry_id = None
-        for entry_id in device_entry.config_entries:
-            if entry_id in hass.data.get(DOMAIN, {}):
-                config_entry_id = entry_id
-                break
+        config_entry_id = _config_entry_id_for_device(hass, device_entry)
 
         if not config_entry_id:
             _LOGGER.error("No config entry found for device %s", device_id)
             raise ValueError(f"No config entry found for device {device_id}")
 
         # Get the coordinator
-        coordinator = hass.data[DOMAIN][config_entry_id]
+        coordinator = _coordinator_for_entry(hass, config_entry_id)
 
         if not coordinator:
             _LOGGER.error("Coordinator not found for config entry %s", config_entry_id)
@@ -650,6 +746,98 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             _LOGGER.error("Modbus write error: %s", e.error_message)
             raise ValueError(f"Modbus write failed: {e.error_message}")
 
+    async def sync_inverter_time(call: ServiceCall) -> dict:
+        """Set the inverter's clock from Home Assistant's local time (#393).
+
+        The inverter runs its own RTC and it drifts. That matters because time-of-use
+        windows fire against the *inverter's* idea of the time, not yours — a reporter's
+        13:00 export window started two minutes late, and the clock was the reason.
+
+        Reads first so the response can report what the drift actually was, and so
+        `min_drift_seconds` can skip a pointless write. Local time, not UTC: the inverter
+        has no timezone concept and its schedule is set in wall-clock terms.
+        """
+        import homeassistant.util.dt as dt_util
+
+        device_id = call.data["device_id"]
+        min_drift = call.data.get("min_drift_seconds", 0)
+
+        device_reg = dr.async_get(hass)
+        device_entry = device_reg.async_get(device_id)
+        if not device_entry:
+            raise ValueError(f"Device {device_id} not found")
+
+        config_entry_id = _config_entry_id_for_device(hass, device_entry)
+        if not config_entry_id:
+            raise ValueError(f"No config entry found for device {device_id}")
+
+        coordinator = _coordinator_for_entry(hass, config_entry_id)
+        client = coordinator.modbus_client
+
+        if not client.is_clock_supported:
+            raise ValueError(
+                "Clock sync is not available on off-grid profiles. The off-grid protocol "
+                "stores the year as an offset from 2000 and uses register 51 for something "
+                "other than the weekday, and no scan has confirmed the encoding (#393)."
+            )
+
+        # One line per call, at debug. Confirmed working on a MIN TL-X in v1.8.4: the write
+        # was accepted and a subsequent reload found no drift. The encoding is still absent
+        # from the protocol document, so the note stays for anyone reading a debug log on a
+        # model that has not been tried (#393).
+        _LOGGER.debug(
+            "Setting the inverter clock. The year register takes a two-digit value and "
+            "reports four — undocumented, and confirmed on MIN TL-X only"
+        )
+
+        now = dt_util.now().replace(tzinfo=None)
+
+        before = await hass.async_add_executor_job(client.read_inverter_time)
+        drift = (now - before).total_seconds() if before else None
+
+        if drift is not None and abs(drift) < min_drift:
+            _LOGGER.info(
+                "Inverter clock is %.0f s from Home Assistant, below the %d s threshold — "
+                "not writing", drift, min_drift,
+            )
+            return {
+                "written": False,
+                "inverter_time": before.isoformat(),
+                "home_assistant_time": now.isoformat(),
+                "drift_seconds": drift,
+            }
+
+        # Re-read the wall clock immediately before writing: the read above and any retry
+        # inside it can take a second or two, which is a large fraction of the error we are
+        # trying to correct.
+        now = dt_util.now().replace(tzinfo=None)
+        try:
+            written = await hass.async_add_executor_job(client.write_inverter_time, now)
+        except Exception as err:  # noqa: BLE001 - surfaced to the user, not swallowed
+            # Raised as HomeAssistantError so the message reaches the UI. A bare exception
+            # from a service handler shows only "Unknown error" and sends the user to the
+            # log to find out what happened.
+            raise HomeAssistantError(
+                f"Could not set the inverter clock: {err}. The clock registers (45-51) were "
+                f"tried as one block and then individually. If your model does not accept "
+                f"them, the time can still be set from the Growatt app."
+            ) from err
+        if not written:
+            raise HomeAssistantError("The inverter rejected the clock write")
+
+        _LOGGER.info(
+            "Inverter clock set to %s (was %s, drift %s)",
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+            before.strftime("%Y-%m-%d %H:%M:%S") if before else "unreadable",
+            f"{drift:+.0f} s" if drift is not None else "unknown",
+        )
+        return {
+            "written": True,
+            "inverter_time": before.isoformat() if before else None,
+            "home_assistant_time": now.isoformat(),
+            "drift_seconds": drift,
+        }
+
     async def detect_grid_orientation(call: ServiceCall) -> None:
         """Detect if grid power CT clamp needs inversion based on current power flow."""
         device_id = call.data.get("device_id")
@@ -661,24 +849,17 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             if not device_entry:
                 raise ValueError(f"Device {device_id} not found")
 
-            config_entry_id = None
-            for entry_id in device_entry.config_entries:
-                if entry_id in hass.data.get(DOMAIN, {}):
-                    config_entry_id = entry_id
-                    break
+            config_entry_id = _config_entry_id_for_device(hass, device_entry)
 
             if not config_entry_id:
                 raise ValueError(f"No config entry found for device {device_id}")
 
-            coordinator = hass.data[DOMAIN][config_entry_id]
+            coordinator = _coordinator_for_entry(hass, config_entry_id)
         else:
             # Use first available coordinator
-            if not hass.data.get(DOMAIN):
-                raise ValueError("No Growatt Modbus integrations found")
-
-            coordinator = next(iter(hass.data[DOMAIN].values()))
+            coordinator = next((c for _, c in _all_coordinators(hass)), None)
             if not coordinator:
-                raise ValueError("No coordinator found")
+                raise ValueError("No Growatt Modbus integrations found")
 
         # Check if inverter is online and producing
         if not coordinator.data:
@@ -871,18 +1052,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             raise ValueError(f"Device {device_id} not found")
 
         # Find the config entry for this device
-        config_entry_id = None
-        for entry_id in device_entry.config_entries:
-            if entry_id in hass.data.get(DOMAIN, {}):
-                config_entry_id = entry_id
-                break
+        config_entry_id = _config_entry_id_for_device(hass, device_entry)
 
         if not config_entry_id:
             _LOGGER.error("No config entry found for device %s", device_id)
             raise ValueError(f"No config entry found for device {device_id}")
 
         # Get the coordinator
-        coordinator = hass.data[DOMAIN][config_entry_id]
+        coordinator = _coordinator_for_entry(hass, config_entry_id)
 
         if not coordinator:
             _LOGGER.error("Coordinator not found for config entry %s", config_entry_id)
@@ -1068,21 +1245,35 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             raise ValueError(f"Device {device_id} not found")
 
         # Find the config entry for this device
-        config_entry_id = None
-        for entry_id in device_entry.config_entries:
-            if entry_id in hass.data.get(DOMAIN, {}):
-                config_entry_id = entry_id
-                break
+        config_entry_id = _config_entry_id_for_device(hass, device_entry)
 
         if not config_entry_id:
             raise ValueError(f"No config entry found for device {device_id}")
 
-        coordinator = hass.data[DOMAIN][config_entry_id]
+        coordinator = _coordinator_for_entry(hass, config_entry_id)
         if not coordinator:
             _LOGGER.error("Coordinator not found for config entry %s", config_entry_id)
             raise ValueError(f"Coordinator not found for device {device_id}")
 
         client = coordinator._client
+
+        # This action was written for WIT/WIS and its HOLD branch depends on the TOU
+        # +1% workaround, which in turn depends on the SOC-limit registers accepting a
+        # value near the current SOC. On a MIN TL-XH they accept high values and silently
+        # discard low ones, so HOLD charges the battery toward the stuck limit - the
+        # opposite of standby - and imports from the grid to do it. The action was offered
+        # on every model regardless, with the WIT scope stated only in its description
+        # (#400).
+        holding = client.register_map.get('holding_registers', {})
+        missing = [r for r in (30100, 30407, 30409) if r not in holding]
+        if missing:
+            raise HomeAssistantError(
+                f"Set Battery Mode (VPP) is not available on this model. Its profile "
+                f"({client.register_map.get('name', 'unknown')}) does not carry the VPP "
+                f"control registers {missing}. This action is for WIT and WIS inverters; "
+                f"on other models use the Battery First / Grid First time period controls "
+                f"instead. See issue #400."
+            )
 
         # VPP Register addresses
         VPP_CONTROL_AUTHORITY = 30100
@@ -1173,16 +1364,12 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             raise ValueError(f"Device {device_id} not found")
 
         # Find the config entry for this device
-        config_entry_id = None
-        for entry_id in device_entry.config_entries:
-            if entry_id in hass.data.get(DOMAIN, {}):
-                config_entry_id = entry_id
-                break
+        config_entry_id = _config_entry_id_for_device(hass, device_entry)
 
         if not config_entry_id:
             raise ValueError(f"No config entry found for device {device_id}")
 
-        coordinator = hass.data[DOMAIN][config_entry_id]
+        coordinator = _coordinator_for_entry(hass, config_entry_id)
         if not coordinator:
             _LOGGER.error("Coordinator not found for config entry %s", config_entry_id)
             raise ValueError(f"Coordinator not found for device {device_id}")
@@ -1242,16 +1429,12 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         if not device_entry:
             raise ValueError(f"Device {device_id} not found")
 
-        config_entry_id = None
-        for entry_id in device_entry.config_entries:
-            if entry_id in hass.data.get(DOMAIN, {}):
-                config_entry_id = entry_id
-                break
+        config_entry_id = _config_entry_id_for_device(hass, device_entry)
 
         if not config_entry_id:
             raise ValueError(f"No config entry found for device {device_id}")
 
-        coordinator = hass.data[DOMAIN][config_entry_id]
+        coordinator = _coordinator_for_entry(hass, config_entry_id)
         if not coordinator:
             raise ValueError(f"Coordinator not found for device {device_id}")
 
@@ -1261,6 +1444,28 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         VPP_TOU_NUM_PERIODS = 30411
         VPP_TOU_DEFAULT_MODE = 30476
         VPP_TOU_PERIOD_BASE = 30412
+
+        # This action writes the VPP TOU block and nothing else. Only the WIT maps carry
+        # it - every SPH, MOD, MID and MIN profile lacks 30411/30412 entirely, and their
+        # own time-of-use schedules live in a different register space altogether (SPH uses
+        # holding 1080-1108). Offered ungated, it wrote to addresses that do not exist and
+        # reported partial failure rather than saying it did not apply (#396).
+        #
+        # Gated on 30411 and 30412 only, deliberately. 30100 and 30476 failures are already
+        # warned-and-continued, so requiring them would block a profile that could still do
+        # the useful part; and the period count is not checked either, because the maps
+        # cover ten periods while the schema accepts twenty - a profile mapping fewer
+        # periods than the hardware supports should not be refused outright.
+        holding = client.register_map.get('holding_registers', {})
+        if VPP_TOU_NUM_PERIODS not in holding or VPP_TOU_PERIOD_BASE not in holding:
+            raise HomeAssistantError(
+                f"Sync TOU Schedule is not available on this model. Its profile "
+                f"({client.register_map.get('name', 'unknown')}) does not carry the VPP "
+                f"time-of-use registers ({VPP_TOU_NUM_PERIODS}, {VPP_TOU_PERIOD_BASE}). "
+                f"This action is for WIT inverters. On SPH, MOD, MID and MIN the schedule "
+                f"is set through the Time Period controls instead - see the Battery & "
+                f"Scheduling documentation."
+            )
 
         try:
             # Step 1: Enable VPP control authority
@@ -1317,10 +1522,23 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         charge_cutoff_soc = data.get("charge_cutoff_soc")
         discharge_cutoff_soc = data.get("discharge_cutoff_soc")
 
-        # Resolve coordinator from device_id
-        coordinator = _get_coordinator_by_device_id(hass, device_id)
-        if coordinator is None:
+        # Resolve coordinator from device_id. Coordinators live on entry.runtime_data,
+        # not in hass.data[DOMAIN] (which now holds only the shared-connection registry),
+        # so this uses the same two-step resolution as every other device_id-taking action.
+        device_reg = dr.async_get(hass)
+        device_entry = device_reg.async_get(device_id)
+        if not device_entry:
+            _LOGGER.error("Device %s not found", device_id)
             raise ValueError(f"Device {device_id} not found")
+
+        config_entry_id = _config_entry_id_for_device(hass, device_entry)
+        if not config_entry_id:
+            raise ValueError(f"No config entry found for device {device_id}")
+
+        coordinator = _coordinator_for_entry(hass, config_entry_id)
+        if not coordinator:
+            _LOGGER.error("Coordinator not found for config entry %s", config_entry_id)
+            raise ValueError(f"Coordinator not found for device {device_id}")
 
         client = coordinator.modbus_client
 
@@ -1338,211 +1556,265 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         VPP_TOU_PERIOD1_BASE = 30412  # 3 regs: start_min, end_min, power%
         VPP_PRIORITY_MODE = 30476     # 0=Load First, 1=Battery First, 2=Grid First
 
-        registers_written = {}
+        # Gate on register presence, not on model family. Every mode this action can
+        # produce ends in a remote-power command (30407/30409) and every mode writes the
+        # AC-charge enable (30410); a profile without them would take the writes and
+        # report success while the inverter ignored them. Family checks are what produced
+        # #373 - MOD carries the VPP control block and a WIT-only gate excluded it.
+        # 30100/30200/30201/30476 are deliberately NOT gated: their failures are already
+        # warn-and-continue or mode-specific.
+        holding = client.register_map.get('holding_registers', {})
+        missing = [
+            r for r in (VPP_REMOTE_POWER_ENABLE, VPP_REMOTE_POWER_PERCENT, VPP_AC_CHARGE_ENABLE)
+            if r not in holding
+        ]
+        if missing:
+            raise HomeAssistantError(
+                f"Set WIT Mode is not available on this model. Its profile "
+                f"({client.register_map.get('name', 'unknown')}) does not carry the VPP "
+                f"remote-power registers {missing}. This action is for WIT and WIS "
+                f"inverters."
+            )
 
-        # Atomic composite write — bypass the per-register 30s rate limiter
-        # that exists to prevent dashboard users from toggling individual controls.
-        # set_wit_mode is a coordinated multi-register operation, not rapid toggling.
-        if hasattr(client, '_wit_control_last_write'):
-            client._wit_control_last_write.clear()
-
-        # 30410 rejects FC 0x06 on some WIT firmware — use FC 0x10 instead
+        # 30410 rejects FC 0x06 on some WIT firmware and accepts FC 0x10 with count=1
+        # (#353). write_single_register_any_fc tries FC 0x06 first and falls back, which
+        # is strictly better than an unconditional FC 0x10: hardware that only accepts
+        # the single-register form keeps working.
         FC10_REGISTERS = {VPP_AC_CHARGE_ENABLE}
 
-        async def _write(reg, val, retries=2):
-            """Write a single register via executor. Returns False on failure (never raises)."""
-            import asyncio
-            for attempt in range(retries):
-                try:
-                    if reg in FC10_REGISTERS:
-                        result = await hass.async_add_executor_job(client.write_registers, reg, [val])
-                    else:
-                        result = await hass.async_add_executor_job(client.write_register, reg, val)
-                    if result is not None:
-                        if hasattr(result, 'isError'):
-                            if not result.isError():
-                                return True
-                        elif result is not False:
-                            return True
-                except Exception as err:
-                    if attempt < retries - 1:
-                        _LOGGER.debug("[WIT] Register %d write attempt %d failed: %s", reg, attempt + 1, err)
-                        await asyncio.sleep(0.5)
-                        continue
-                    _LOGGER.warning("[WIT] Register %d write failed after %d attempts: %s", reg, retries, err)
+        def _apply() -> dict:
+            """Run the whole register sequence on ONE executor thread.
+
+            The sequence only means something as a whole: authority, priority mode, AC
+            charge enable, SOC cutoffs, export limit, TOU clear and the power command.
+            Written one register per executor job, each write took the shared bus
+            separately, so a poll could land in the middle and any single acquisition
+            could time out - leaving the inverter with authority granted and no setpoint
+            (#331). write_batch holds the bus from the first write to the last.
+
+            It must not be split across executor jobs: the bus lock is an RLock and
+            reentrancy is per-thread, so a split sequence would deadlock against itself
+            rather than nest. That is why this is one plain synchronous function the
+            caller awaits with a single async_add_executor_job().
+            """
+            registers_written = {}
+
+            with client.write_batch(f"set_wit_mode -> {mode}"):
+                # Atomic composite write - bypass the per-register 30s rate limiter that
+                # exists to stop dashboard users toggling individual controls.
+                # set_wit_mode is a coordinated multi-register operation, not rapid
+                # toggling. Inside the batch so no other writer can slip between the
+                # clear and the writes it enables.
+                if hasattr(client, '_wit_control_last_write'):
+                    client._wit_control_last_write.clear()
+
+                def _write(reg, val, retries=2):
+                    """Write a single register. Returns False on failure (never raises)."""
+                    for attempt in range(retries):
+                        try:
+                            if reg in FC10_REGISTERS:
+                                result = client.write_single_register_any_fc(reg, val)
+                            else:
+                                result = client.write_register(reg, val)
+                            if result is not None:
+                                if hasattr(result, 'isError'):
+                                    if not result.isError():
+                                        return True
+                                elif result is not False:
+                                    return True
+                        except Exception as err:
+                            if attempt < retries - 1:
+                                _LOGGER.debug("[WIT] Register %d write attempt %d failed: %s", reg, attempt + 1, err)
+                                # Blocking sleep, not asyncio.sleep: this runs in the
+                                # executor with the bus held. Only reached after a failed
+                                # write, and the alternative - releasing the bus between
+                                # attempts - is the half-applied command write_batch
+                                # exists to prevent.
+                                time.sleep(0.5)
+                                continue
+                            _LOGGER.warning("[WIT] Register %d write failed after %d attempts: %s", reg, retries, err)
+                            return False
+                    _LOGGER.warning("[WIT] Register %d write returned False (rate limited?)", reg)
                     return False
-            _LOGGER.warning("[WIT] Register %d write returned False (rate limited?)", reg)
-            return False
+
+                # ---- Step 1: Ensure VPP control authority + safe base mode ----
+                success = _write(VPP_CONTROL_AUTHORITY, 1)
+                if not success:
+                    _LOGGER.warning("[WIT] Failed to enable VPP control authority, continuing anyway...")
+                registers_written[VPP_CONTROL_AUTHORITY] = 1
+
+                # Set priority mode based on operating mode.
+                # 30476 affects behavior BOTH with and without remote control:
+                #   30476=1 (Battery First): required for grid charging, preserve_soc (30409=1),
+                #     and PV surplus routing during discharge modes
+                #   30476=0 (Load First): safe fallback for passthrough only
+                if mode == "passthrough":
+                    priority_val = 0
+                else:
+                    priority_val = 1
+                success = _write(VPP_PRIORITY_MODE, priority_val)
+                if not success:
+                    raise ValueError(f"Failed to set priority mode (30476={priority_val})")
+                registers_written[VPP_PRIORITY_MODE] = priority_val
+
+                # ---- Step 2: AC charge mode (before enabling remote control) ----
+                if ac_charge_mode is not None:
+                    ac_val = AC_CHARGE_MODE_MAP[ac_charge_mode]
+                    success = _write(VPP_AC_CHARGE_ENABLE, ac_val)
+                    if not success and ac_val == 2:
+                        _LOGGER.warning("[WIT] AC priority (30410=2) not supported, falling back to PV priority (1)")
+                        ac_val = 1
+                        success = _write(VPP_AC_CHARGE_ENABLE, 1)
+                    if not success:
+                        raise ValueError(f"Failed to write AC charge mode (30410={ac_val})")
+                    registers_written[VPP_AC_CHARGE_ENABLE] = ac_val
+                elif mode == "grid_charge":
+                    success = _write(VPP_AC_CHARGE_ENABLE, 1)
+                    if not success:
+                        raise ValueError("Failed to write AC charge mode (30410=1)")
+                    registers_written[VPP_AC_CHARGE_ENABLE] = 1
+                elif mode in ("discharge_to_load", "discharge_to_grid", "max_export",
+                              "hold", "preserve_soc", "passthrough"):
+                    success = _write(VPP_AC_CHARGE_ENABLE, 0)
+                    if not success:
+                        raise ValueError("Failed to write AC charge mode (30410=0)")
+                    registers_written[VPP_AC_CHARGE_ENABLE] = 0
+
+                # ---- Step 3: SOC limits (before charge/discharge starts) ----
+                if charge_cutoff_soc is not None:
+                    success = _write(VPP_CHARGE_CUTOFF_SOC, charge_cutoff_soc)
+                    if not success:
+                        raise ValueError(f"Failed to write charge cutoff SOC (30404={charge_cutoff_soc})")
+                    registers_written[VPP_CHARGE_CUTOFF_SOC] = charge_cutoff_soc
+
+                if discharge_cutoff_soc is not None:
+                    success = _write(VPP_DISCHARGE_CUTOFF_SOC, discharge_cutoff_soc)
+                    if not success:
+                        raise ValueError(f"Failed to write discharge cutoff SOC (30405={discharge_cutoff_soc})")
+                    registers_written[VPP_DISCHARGE_CUTOFF_SOC] = discharge_cutoff_soc
+
+                # ---- Step 4: Export rate ----
+                if export_rate is not None:
+                    if export_rate >= 100:
+                        success = _write(VPP_EXPORT_LIMIT_ENABLE, 0)
+                        if not success:
+                            raise ValueError("Failed to disable export limit (30200=0)")
+                        registers_written[VPP_EXPORT_LIMIT_ENABLE] = 0
+                    else:
+                        success = _write(VPP_EXPORT_LIMIT_ENABLE, 1)
+                        if not success:
+                            raise ValueError("Failed to enable export limit (30200=1)")
+                        success = _write(VPP_EXPORT_LIMIT_RATE, export_rate)
+                        if not success:
+                            raise ValueError(f"Failed to write export limit rate (30201={export_rate})")
+                        registers_written[VPP_EXPORT_LIMIT_ENABLE] = 1
+                        registers_written[VPP_EXPORT_LIMIT_RATE] = export_rate
+                elif mode == "discharge_to_load":
+                    # Zero export is CRITICAL for discharge_to_load - without it,
+                    # mode appears as "Max Export" (battery dumps to grid).
+                    success = _write(VPP_EXPORT_LIMIT_ENABLE, 1)
+                    if not success:
+                        raise ValueError("Failed to enable export limit (30200=1) - discharge would export to grid!")
+                    success = _write(VPP_EXPORT_LIMIT_RATE, 0)
+                    if not success:
+                        raise ValueError("Failed to set zero export rate (30201=0)")
+                    registers_written[VPP_EXPORT_LIMIT_ENABLE] = 1
+                    registers_written[VPP_EXPORT_LIMIT_RATE] = 0
+                elif mode in ("max_export", "discharge_to_grid", "hold", "preserve_soc",
+                              "grid_charge", "passthrough"):
+                    # Export enabled: clear stale zero-export from previous modes
+                    # (grid_charge needs this - stale 30200=1 from discharge_to_load blocks charging)
+                    success = _write(VPP_EXPORT_LIMIT_ENABLE, 0)
+                    if not success:
+                        raise ValueError("Failed to clear export limit (30200=0)")
+                    registers_written[VPP_EXPORT_LIMIT_ENABLE] = 0
+
+                # ---- Step 5: Battery power command ----
+                # Clear any leftover TOU periods from previous modes
+                success = _write(VPP_TOU_NUM_PERIODS, 0)
+                if not success:
+                    raise ValueError("Failed to clear TOU periods (30411=0)")
+                registers_written[VPP_TOU_NUM_PERIODS] = 0
+
+                if mode == "passthrough":
+                    # Release all overrides. Zero out power/duration defensively so no
+                    # stale command remains if 30407 is re-enabled externally.
+                    success = _write(VPP_REMOTE_POWER_DURATION, 0)
+                    if not success:
+                        raise ValueError("Failed to clear duration (30408=0)")
+                    success = _write(VPP_REMOTE_POWER_PERCENT, 0)
+                    if not success:
+                        raise ValueError("Failed to clear power (30409=0)")
+                    success = _write(VPP_REMOTE_POWER_ENABLE, 0)
+                    if not success:
+                        raise ValueError("Failed to disable remote power control (30407)")
+                    registers_written[VPP_REMOTE_POWER_DURATION] = 0
+                    registers_written[VPP_REMOTE_POWER_PERCENT] = 0
+                    registers_written[VPP_REMOTE_POWER_ENABLE] = 0
+
+                elif mode in ("hold", "preserve_soc"):
+                    # Preserve SOC: battery idle, PV charges battery, surplus exports.
+                    # Uses 30407=1 with 30409=1 (charge at 1%) to block discharge at any
+                    # SOC level. 30405=30 (max hardware allows) as safety net.
+                    # 30407=0 does NOT work: Load First (30476=0) still discharges battery
+                    # to serve load. 30407=1 + 30409=0 clips PV export.
+                    # 30409=1 (tiny charge) effectively holds battery without PV clipping.
+                    # Confirmed 2026-03-30: Bat goes from -700W to -36W (standby only).
+                    success = _write(VPP_REMOTE_POWER_DURATION, duration_minutes)
+                    if not success:
+                        raise ValueError("Failed to write duration (30408)")
+                    success = _write(VPP_REMOTE_POWER_PERCENT, 1)
+                    if not success:
+                        raise ValueError("Failed to write power (30409=1)")
+                    success = _write(VPP_REMOTE_POWER_ENABLE, 1)
+                    if not success:
+                        raise ValueError("Failed to enable remote power control (30407)")
+                    registers_written[VPP_REMOTE_POWER_DURATION] = duration_minutes
+                    registers_written[VPP_REMOTE_POWER_PERCENT] = 1
+                    registers_written[VPP_REMOTE_POWER_ENABLE] = 1
+
+                elif mode == "grid_charge":
+                    # Grid charge uses remote control (30407=1, 30409=+power%).
+                    # Requires 30476=1 (Battery First) - with 30476=0 or 2, charging = 0W.
+                    # Confirmed 2026-03-30: 30476=1 + 30407=1 + 30409=100 -> 3kW+ charge.
+                    success = _write(VPP_REMOTE_POWER_DURATION, duration_minutes)
+                    if not success:
+                        raise ValueError("Failed to write duration (30408)")
+                    success = _write(VPP_REMOTE_POWER_PERCENT, power_percent)
+                    if not success:
+                        raise ValueError("Failed to write power (30409)")
+                    success = _write(VPP_REMOTE_POWER_ENABLE, 1)
+                    if not success:
+                        raise ValueError("Failed to enable remote power control (30407)")
+                    registers_written[VPP_REMOTE_POWER_DURATION] = duration_minutes
+                    registers_written[VPP_REMOTE_POWER_PERCENT] = power_percent
+                    registers_written[VPP_REMOTE_POWER_ENABLE] = 1
+
+                elif mode in ("discharge_to_load", "discharge_to_grid", "max_export"):
+                    p = power_percent if mode != "max_export" else 100
+                    power_unsigned = 65536 - p
+                    success = _write(VPP_REMOTE_POWER_DURATION, duration_minutes)
+                    if not success:
+                        raise ValueError("Failed to write duration (30408)")
+                    success = _write(VPP_REMOTE_POWER_PERCENT, power_unsigned)
+                    if not success:
+                        raise ValueError("Failed to write power (30409)")
+                    success = _write(VPP_REMOTE_POWER_ENABLE, 1)
+                    if not success:
+                        raise ValueError("Failed to enable remote power control (30407)")
+                    registers_written[VPP_REMOTE_POWER_DURATION] = duration_minutes
+                    registers_written[VPP_REMOTE_POWER_PERCENT] = power_unsigned
+                    registers_written[VPP_REMOTE_POWER_ENABLE] = 1
+
+            return registers_written
 
         try:
-            # ---- Step 1: Ensure VPP control authority + safe base mode ----
-            success = await _write(VPP_CONTROL_AUTHORITY, 1)
-            if not success:
-                _LOGGER.warning("[WIT] Failed to enable VPP control authority, continuing anyway...")
-            registers_written[VPP_CONTROL_AUTHORITY] = 1
-
-            # Set priority mode based on operating mode.
-            # 30476 affects behavior BOTH with and without remote control:
-            #   30476=1 (Battery First): required for grid charging, preserve_soc (30409=1),
-            #     and PV surplus routing during discharge modes
-            #   30476=0 (Load First): safe fallback for passthrough only
-            if mode == "passthrough":
-                priority_val = 0
-            else:
-                priority_val = 1
-            success = await _write(VPP_PRIORITY_MODE, priority_val)
-            if not success:
-                raise ValueError(f"Failed to set priority mode (30476={priority_val})")
-            registers_written[VPP_PRIORITY_MODE] = priority_val
-
-            # ---- Step 2: AC charge mode (before enabling remote control) ----
-            if ac_charge_mode is not None:
-                ac_val = AC_CHARGE_MODE_MAP[ac_charge_mode]
-                success = await _write(VPP_AC_CHARGE_ENABLE, ac_val)
-                if not success and ac_val == 2:
-                    _LOGGER.warning("[WIT] AC priority (30410=2) not supported, falling back to PV priority (1)")
-                    ac_val = 1
-                    success = await _write(VPP_AC_CHARGE_ENABLE, 1)
-                if not success:
-                    raise ValueError(f"Failed to write AC charge mode (30410={ac_val})")
-                registers_written[VPP_AC_CHARGE_ENABLE] = ac_val
-            elif mode == "grid_charge":
-                success = await _write(VPP_AC_CHARGE_ENABLE, 1)
-                if not success:
-                    raise ValueError("Failed to write AC charge mode (30410=1)")
-                registers_written[VPP_AC_CHARGE_ENABLE] = 1
-            elif mode in ("discharge_to_load", "discharge_to_grid", "max_export",
-                          "hold", "preserve_soc", "passthrough"):
-                success = await _write(VPP_AC_CHARGE_ENABLE, 0)
-                if not success:
-                    raise ValueError("Failed to write AC charge mode (30410=0)")
-                registers_written[VPP_AC_CHARGE_ENABLE] = 0
-
-            # ---- Step 3: SOC limits (before charge/discharge starts) ----
-            if charge_cutoff_soc is not None:
-                success = await _write(VPP_CHARGE_CUTOFF_SOC, charge_cutoff_soc)
-                if not success:
-                    raise ValueError(f"Failed to write charge cutoff SOC (30404={charge_cutoff_soc})")
-                registers_written[VPP_CHARGE_CUTOFF_SOC] = charge_cutoff_soc
-
-            if discharge_cutoff_soc is not None:
-                success = await _write(VPP_DISCHARGE_CUTOFF_SOC, discharge_cutoff_soc)
-                if not success:
-                    raise ValueError(f"Failed to write discharge cutoff SOC (30405={discharge_cutoff_soc})")
-                registers_written[VPP_DISCHARGE_CUTOFF_SOC] = discharge_cutoff_soc
-
-            # ---- Step 4: Export rate ----
-            if export_rate is not None:
-                if export_rate >= 100:
-                    success = await _write(VPP_EXPORT_LIMIT_ENABLE, 0)
-                    if not success:
-                        raise ValueError("Failed to disable export limit (30200=0)")
-                    registers_written[VPP_EXPORT_LIMIT_ENABLE] = 0
-                else:
-                    success = await _write(VPP_EXPORT_LIMIT_ENABLE, 1)
-                    if not success:
-                        raise ValueError("Failed to enable export limit (30200=1)")
-                    success = await _write(VPP_EXPORT_LIMIT_RATE, export_rate)
-                    if not success:
-                        raise ValueError(f"Failed to write export limit rate (30201={export_rate})")
-                    registers_written[VPP_EXPORT_LIMIT_ENABLE] = 1
-                    registers_written[VPP_EXPORT_LIMIT_RATE] = export_rate
-            elif mode == "discharge_to_load":
-                # Zero export is CRITICAL for discharge_to_load — without it,
-                # mode appears as "Max Export" (battery dumps to grid).
-                success = await _write(VPP_EXPORT_LIMIT_ENABLE, 1)
-                if not success:
-                    raise ValueError("Failed to enable export limit (30200=1) — discharge would export to grid!")
-                success = await _write(VPP_EXPORT_LIMIT_RATE, 0)
-                if not success:
-                    raise ValueError("Failed to set zero export rate (30201=0)")
-                registers_written[VPP_EXPORT_LIMIT_ENABLE] = 1
-                registers_written[VPP_EXPORT_LIMIT_RATE] = 0
-            elif mode in ("max_export", "discharge_to_grid", "hold", "preserve_soc",
-                          "grid_charge", "passthrough"):
-                # Export enabled: clear stale zero-export from previous modes
-                # (grid_charge needs this — stale 30200=1 from discharge_to_load blocks charging)
-                success = await _write(VPP_EXPORT_LIMIT_ENABLE, 0)
-                if not success:
-                    raise ValueError("Failed to clear export limit (30200=0)")
-                registers_written[VPP_EXPORT_LIMIT_ENABLE] = 0
-
-            # ---- Step 5: Battery power command ----
-            # Clear any leftover TOU periods from previous modes
-            success = await _write(VPP_TOU_NUM_PERIODS, 0)
-            if not success:
-                raise ValueError("Failed to clear TOU periods (30411=0)")
-            registers_written[VPP_TOU_NUM_PERIODS] = 0
-
-            if mode == "passthrough":
-                # Release all overrides. Zero out power/duration defensively so no
-                # stale command remains if 30407 is re-enabled externally.
-                success = await _write(VPP_REMOTE_POWER_DURATION, 0)
-                if not success:
-                    raise ValueError("Failed to clear duration (30408=0)")
-                success = await _write(VPP_REMOTE_POWER_PERCENT, 0)
-                if not success:
-                    raise ValueError("Failed to clear power (30409=0)")
-                success = await _write(VPP_REMOTE_POWER_ENABLE, 0)
-                if not success:
-                    raise ValueError("Failed to disable remote power control (30407)")
-                registers_written[VPP_REMOTE_POWER_DURATION] = 0
-                registers_written[VPP_REMOTE_POWER_PERCENT] = 0
-                registers_written[VPP_REMOTE_POWER_ENABLE] = 0
-
-            elif mode in ("hold", "preserve_soc"):
-                # Preserve SOC: battery idle, PV charges battery, surplus exports.
-                # Uses 30407=1 with 30409=1 (charge at 1%) to block discharge at any
-                # SOC level. 30405=30 (max hardware allows) as safety net.
-                # 30407=0 does NOT work: Load First (30476=0) still discharges battery
-                # to serve load. 30407=1 + 30409=0 clips PV export.
-                # 30409=1 (tiny charge) effectively holds battery without PV clipping.
-                # Confirmed 2026-03-30: Bat goes from -700W to -36W (standby only).
-                success = await _write(VPP_REMOTE_POWER_DURATION, duration_minutes)
-                if not success:
-                    raise ValueError("Failed to write duration (30408)")
-                success = await _write(VPP_REMOTE_POWER_PERCENT, 1)
-                if not success:
-                    raise ValueError("Failed to write power (30409=1)")
-                success = await _write(VPP_REMOTE_POWER_ENABLE, 1)
-                if not success:
-                    raise ValueError("Failed to enable remote power control (30407)")
-                registers_written[VPP_REMOTE_POWER_DURATION] = duration_minutes
-                registers_written[VPP_REMOTE_POWER_PERCENT] = 1
-                registers_written[VPP_REMOTE_POWER_ENABLE] = 1
-
-            elif mode == "grid_charge":
-                # Grid charge uses remote control (30407=1, 30409=+power%).
-                # Requires 30476=1 (Battery First) — with 30476=0 or 2, charging = 0W.
-                # Confirmed 2026-03-30: 30476=1 + 30407=1 + 30409=100 → 3kW+ charge.
-                success = await _write(VPP_REMOTE_POWER_DURATION, duration_minutes)
-                if not success:
-                    raise ValueError("Failed to write duration (30408)")
-                success = await _write(VPP_REMOTE_POWER_PERCENT, power_percent)
-                if not success:
-                    raise ValueError("Failed to write power (30409)")
-                success = await _write(VPP_REMOTE_POWER_ENABLE, 1)
-                if not success:
-                    raise ValueError("Failed to enable remote power control (30407)")
-                registers_written[VPP_REMOTE_POWER_DURATION] = duration_minutes
-                registers_written[VPP_REMOTE_POWER_PERCENT] = power_percent
-                registers_written[VPP_REMOTE_POWER_ENABLE] = 1
-
-            elif mode in ("discharge_to_load", "discharge_to_grid", "max_export"):
-                p = power_percent if mode != "max_export" else 100
-                power_unsigned = 65536 - p
-                success = await _write(VPP_REMOTE_POWER_DURATION, duration_minutes)
-                if not success:
-                    raise ValueError("Failed to write duration (30408)")
-                success = await _write(VPP_REMOTE_POWER_PERCENT, power_unsigned)
-                if not success:
-                    raise ValueError("Failed to write power (30409)")
-                success = await _write(VPP_REMOTE_POWER_ENABLE, 1)
-                if not success:
-                    raise ValueError("Failed to enable remote power control (30407)")
-                registers_written[VPP_REMOTE_POWER_DURATION] = duration_minutes
-                registers_written[VPP_REMOTE_POWER_PERCENT] = power_unsigned
-                registers_written[VPP_REMOTE_POWER_ENABLE] = 1
+            # ONE executor job for the whole sequence - see _apply's docstring for why it
+            # cannot be split. A bus-lock timeout arrives here as ModbusWriteError and is
+            # reported like any other failure: the caller (battery_optimizer's
+            # DirectControl) treats a raised call as a CONFIRMED failure and retries on
+            # the next slot, which is the correct outcome for "nothing was written".
+            registers_written = await hass.async_add_executor_job(_apply)
 
             # ---- Step 6: Update coordinator state ----
             now = datetime.now()
@@ -1598,6 +1870,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     hass.services.async_register(
         DOMAIN,
+        SERVICE_SYNC_INVERTER_TIME,
+        sync_inverter_time,
+        schema=SERVICE_SYNC_INVERTER_TIME_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
         SERVICE_DETECT_GRID_ORIENTATION,
         detect_grid_orientation,
         schema=SERVICE_DETECT_GRID_ORIENTATION_SCHEMA,
@@ -1647,12 +1927,21 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         supports_response=SupportsResponse.OPTIONAL,
     )
 
-def _read_registers_chunked(client, start: int, count: int, slave_id: int, chunk_size: int = 50, register_type: str = 'input') -> Dict[int, Dict[str, Any]]:
+
+def _read_registers_chunked(client, start: int, count: int, slave_id: int, chunk_size: int = 50, register_type: str = 'input', delay_s: float = 0.0) -> Dict[int, Dict[str, Any]]:
     """
     Read registers in chunks to avoid timeouts.
 
     Args:
         register_type: 'input' for input registers (default), 'holding' for holding registers
+        delay_s: pause between chunk reads, mirroring the poller's modbus_delay.
+
+    Pacing matters more than it looks. This uses a raw pymodbus client rather than
+    GrowattModbus, so none of the poller's rate limiting applies — without an explicit
+    pause, chunks are fired back to back as fast as the socket accepts them. A gateway
+    that needs settling time between requests then fails nearly every read, producing a
+    scan that looks like a dead inverter on a system whose entities are updating fine
+    (#360). The only pauses in the scanner used to be between whole ranges, never within.
 
     Returns dict mapping register address to: {
         'value': int or None,
@@ -1661,10 +1950,29 @@ def _read_registers_chunked(client, start: int, count: int, slave_id: int, chunk
     }
     """
     register_data = {}
+    first_chunk = True
 
-    for chunk_start in range(0, count, chunk_size):
-        chunk_count = min(chunk_size, count - chunk_start)
-        chunk_address = start + chunk_start
+    # Adaptive block size (#389). A bridge that cannot relay a large block answers every
+    # request with an exception - 0x0B, "Gateway Target Failed to Respond", is the usual
+    # one - while single-register reads to the same device succeed. A reporter on a LoRa
+    # gateway got 2425 consecutive errors from this scanner and valid data on hundreds of
+    # registers using raw single-register frames, and reasonably concluded our scanner was
+    # broken. It was: it never tried anything but 125 at a time.
+    #
+    # So on the first failing block, probe once with a single-register read. If that works
+    # the bridge is bandwidth-limited rather than absent, and the rest of the scan runs at
+    # one register per request. Probing only once keeps a genuinely dead range cheap.
+    pos = 0
+    effective_chunk = chunk_size
+    probed_single = False
+
+    while pos < count:
+        chunk_count = min(effective_chunk, count - pos)
+        chunk_address = start + pos
+
+        if delay_s and not first_chunk:
+            time.sleep(delay_s)
+        first_chunk = False
 
         try:
             # Choose read method based on register type
@@ -1708,6 +2016,19 @@ def _read_registers_chunked(client, start: int, count: int, slave_id: int, chunk
                     }
                     error_msg = error_names.get(error_code, f"Error Code {error_code}")
 
+                if effective_chunk > 1 and not probed_single:
+                    probed_single = True
+                    if _single_register_read_works(client, chunk_address, slave_id, register_type):
+                        _LOGGER.warning(
+                            "Block read of %d registers at %d failed (%s) but a single-register "
+                            "read succeeded - the gateway cannot relay blocks this large. "
+                            "Continuing this scan at 1 register per request; it will be slower. "
+                            "Set 'Max Register Block Size' to 1 for normal polling too.",
+                            chunk_count, chunk_address, error_msg,
+                        )
+                        effective_chunk = 1
+                        continue  # re-read this chunk one register at a time
+
                 for i in range(chunk_count):
                     register_data[chunk_address + i] = {
                         'value': None,
@@ -1727,7 +2048,25 @@ def _read_registers_chunked(client, start: int, count: int, slave_id: int, chunk
                 }
             _LOGGER.debug(f"Chunk {chunk_address} exception: {e}")
 
+        pos += chunk_count
+
     return register_data
+
+
+def _single_register_read_works(client, address: int, slave_id: int, register_type: str) -> bool:
+    """One register, one request — does the device answer at all?
+
+    Distinguishes "this bridge cannot carry a block that big" from "nothing is there",
+    which look identical when every block read returns the same exception (#389).
+    """
+    try:
+        if register_type == 'holding':
+            response = client.read_holding_registers(address=address, count=1, device_id=slave_id)
+        else:
+            response = client.read_input_registers(address=address, count=1, device_id=slave_id)
+        return not response.isError()
+    except Exception:
+        return False
 
 
 def _detect_inverter_model(register_data: Dict[int, Dict[str, Any]]) -> Dict[str, str]:
@@ -1754,31 +2093,13 @@ def _detect_inverter_model(register_data: Dict[int, Dict[str, Any]]) -> Dict[str
     def reg_exists(addr):
         return addr in register_data and register_data[addr]['status'] == 'success' and register_data[addr]['value'] is not None
 
-    # DTC code → (display name, profile key) — keep in sync with auto_detection.py dtc_map
-    _DTC_MAP = {
-        3501: ('SPH 3-6kW', 'sph_3000_6000_v201'),
-        3502: ('SPH 3-6kW', 'sph_3000_6000_v201'),
-        3503: ('SPH 3-6kW HU', 'sph_3000_6000_v201'),
-        3504: ('SPH 3-6kW HUB', 'sph_3000_6000_v201'),
-        3601: ('SPH-TL3 4-10kW', 'sph_tl3_3000_10000_v201'),
-        3701: ('SPA 1-3kW BL', 'sph_3000_6000_v201'),
-        3715: ('SPA 3-6kW AU', 'sph_3000_6000_v201'),
-        3716: ('SPA 3-6kW AUB', 'sph_3000_6000_v201'),
-        3725: ('SPA-TL3 4-10kW', 'sph_tl3_3000_10000_v201'),
-        3735: ('SPA 3-6kW BL', 'sph_3000_6000_v201'),
-        5001: ('MID 17-25KTL3-X / MID 20-30KTL3-X2', 'mid_15000_25000tl3_x_v201'),
-        5002: ('MID 33-36KTL3-X / MOD 3-15KTL3-X', 'mid_15000_25000tl3_x_v201'),
-        5003: ('MAC 30-70KTL3-X', 'mid_15000_25000tl3_x_v201'),
-        5100: ('TL-XH 3-10kW', 'tl_xh_3000_10000_v201'),
-        5200: ('MIN/MIC 2.5-6kW', 'min_3000_6000_tl_x_v201'),
-        5201: ('MIN 7-10kW', 'min_7000_10000_tl_x_v201'),
-        5400: ('MOD-XH/MID-XH', 'mod_6000_15000tl3_xh_v201'),
-        5600: ('WIS 100K-AM / WIT 50-100K-H/HE/HU/A/AE/AU (incl. US variants)', 'mid_15000_25000tl3_x_v201'),
-        5601: ('WIT 29.9-50K-XHU (commercial hybrid)', 'wit_29900_50000tl3_xhu'),
-        5603: ('WIT 4-15kW Hybrid', 'wit_4000_15000tl3'),
-        5800: ('WIS 210K', 'mid_15000_25000tl3_x_v201'),
-        5801: ('WIS 215K-AM', 'mid_15000_25000tl3_x_v201'),
-    }
+    # DTC lookup comes from auto_detection.DTC_REGISTRY — the single source of truth.
+    #
+    # This used to be a parallel dict with a "keep in sync with auto_detection.py"
+    # comment. It did not stay in sync: nine DTCs existed only in auto_detection, and
+    # 5600 disagreed outright — the scanner reported a MID profile while detection
+    # actually selected a WIT one. A comment is not a mechanism.
+    _DTC_MAP = {code: (e.model, e.profile) for code, e in DTC_REGISTRY.items()}
 
     # Check VPP DTC (holding 30000) first, then V1.39 DTC (holding 43) as fallback.
     # V1.39 grid-tied inverters (MIN TL-X etc.) return 0 from holding 30000 but carry
@@ -1801,9 +2122,30 @@ def _detect_inverter_model(register_data: Dict[int, Dict[str, Any]]) -> Dict[str
             model_name, profile_key = _DTC_MAP[dtc_code]
             detection["model"] = f"{model_name} (DTC {dtc_code})"
             detection["profile_key"] = profile_key
-            detection["confidence"] = "Very High"
             detection["reasoning"].append(f"✓ DTC {dtc_code} matches: {model_name}")
-            detection["reasoning"].append("  → Auto-detection via DTC is most reliable method")
+
+            # Identifying the model from the DTC is reliable — it is read from the
+            # device. Whether the profile behind it suits that model is a separate
+            # question, and reporting one number for both overstated what we know:
+            # #360 was told "Very High" while running an SPH profile on SPA hardware,
+            # which gave it PV entities for MPPTs it does not physically have.
+            _entry = DTC_REGISTRY[dtc_code]
+            if _entry.provenance == CONFIRMED:
+                detection["confidence"] = "Very High"
+                detection["mapping_confirmed"] = True
+                detection["reasoning"].append(
+                    f"  → Profile mapping confirmed on real hardware ({_entry.evidence})"
+                )
+            else:
+                detection["confidence"] = "High (model) / UNCONFIRMED (profile)"
+                detection["mapping_confirmed"] = False
+                detection["reasoning"].append(
+                    f"  ⚠ Model identified, but this profile mapping is UNCONFIRMED: {_entry.evidence}"
+                )
+                detection["reasoning"].append(
+                    "  → Sensors may be missing, or present but meaningless. Attaching this "
+                    "scan to a GitHub issue is what turns the mapping into a confirmed one."
+                )
 
             # Apply protocol version downgrade BEFORE returning — mirrors actual HA detection.
             # Must check here (not in the standalone block below) because the early return at
@@ -1859,6 +2201,7 @@ def _detect_inverter_model(register_data: Dict[int, Dict[str, Any]]) -> Dict[str
     # Also returns when confidence was downgraded to "High" by proto_ver==0 — a matched DTC
     # always wins over register heuristics regardless of protocol version confidence.
     if detection.get("dtc_code") and detection.get("profile_key"):
+        fill_register_map(detection)
         return detection
     
     # Check register ranges (only successful reads with non-zero values)
@@ -2093,10 +2436,11 @@ def _detect_inverter_model(register_data: Dict[int, Dict[str, Any]]) -> Dict[str
                     detection["reasoning"].append("  - MOD extended range (3125-3249) responding")
                 detection["reasoning"].append("⚠ Try scanning during daytime when PV is generating for better detection")
 
+    fill_register_map(detection)
     return detection
 
 
-def _export_registers_to_csv(hass, connection_type: str, host: str, port: int, device: str, baudrate: int, slave_id: int, offgrid_mode: bool = False, enabled_groups: set = None, coordinator=None, block_size: int = 125) -> dict:
+def _export_registers_to_csv(hass, connection_type: str, host: str, port: int, device: str, baudrate: int, slave_id: int, offgrid_mode: bool = False, enabled_groups: set = None, coordinator=None, block_size: int = 125, scan_delay_ms: int = 250) -> dict:
     """
     Export all registers to CSV file with auto-detection (blocking).
 
@@ -2119,6 +2463,63 @@ def _export_registers_to_csv(hass, connection_type: str, host: str, port: int, d
         "non_zero": 0,
         "responding_ranges": 0,
     }
+
+    # Pace the scan the way the poller paces itself.
+    #
+    # The scanner uses a raw pymodbus client, so GrowattModbus._enforce_read_interval()
+    # never runs and nothing throttles it. A user whose gateway needs settling time
+    # between requests would see their entities updating normally while every scan came
+    # back almost empty — the scan was hammering a link the poller was carefully spacing
+    # (#360).
+    #
+    # Taken from the entry's own modbus_delay when a device was selected, because that
+    # value is already tuned to what this gateway tolerates.
+    #
+    # Resolved by the caller from `entry.options` rather than here from the coordinator:
+    # the coordinator does not exist while the entry is disabled, which is precisely the
+    # state the documented scan procedure asks users to put it in (#360).
+    _scan_delay_ms = max(0, int(scan_delay_ms))
+    _scan_delay_s = _scan_delay_ms / 1000.0
+    _LOGGER.info("Register scan pacing: %d ms between reads", _scan_delay_ms)
+
+    # Take exclusive control of the gateway for the duration of the scan (Issue #360).
+    #
+    # Every TCP entry owns a SharedModbusConnection holding a persistent socket. The scanner
+    # opens its OWN client, so without this the gateway sees two concurrent sessions from HA
+    # (plus any third-party controller on the same bus). Cheap RS485-to-TCP adapters accept a
+    # very small number of sessions and mis-route or drop responses when exceeded — the
+    # symptom is every range in the scan failing with BrokenPipeError while the coordinator
+    # simultaneously goes unavailable.
+    #
+    # Holding the hub lock blocks coordinator polling, and reset() closes its socket, so only
+    # the scanner's connection exists while the scan runs. The lock is released in the finally
+    # below and the coordinator reconnects on its next poll.
+    _hub = None
+    _hub_locked = False
+    if connection_type == "tcp":
+        try:
+            _hub = (hass.data.get(DOMAIN, {}).get("_connections", {}) or {}).get(f"{host}:{port}")
+        except Exception:  # pragma: no cover — defensive; never block a scan on lookup
+            _hub = None
+
+    if _hub is not None:
+        _LOGGER.info(
+            "Pausing coordinator polling on %s:%s for the duration of the scan "
+            "(gateways typically allow only one session)", host, port
+        )
+        # Generous timeout: a poll in flight on a slow gateway can take tens of seconds.
+        _hub_locked = _hub._lock.acquire(timeout=60)
+        if not _hub_locked:
+            result["error"] = (
+                f"Could not pause polling on {host}:{port} within 60s — a poll appears to be "
+                f"stuck. Reload the integration and retry the scan."
+            )
+            return result
+        try:
+            # Drop the coordinator's socket so the scanner's is the only connection.
+            _hub.reset("register scan starting")
+        except Exception as err:
+            _LOGGER.debug("Hub reset before scan failed (continuing): %s", err)
 
     try:
         # Connect with appropriate client type
@@ -2166,27 +2567,25 @@ def _export_registers_to_csv(hass, connection_type: str, host: str, port: int, d
         if coordinator is not None:
             _LOGGER.info("Using pre-resolved coordinator from config entry — entity values will be included")
         else:
-            if hass.data.get(DOMAIN):
-                for entry_id, coord in hass.data[DOMAIN].items():
-                    if not coord or not hasattr(coord, 'entry'):
-                        continue
+            # _all_coordinators() yields only real coordinators, so the previous
+            # hasattr() guard against hitting the "_connections" registry is gone.
+            for entry_id, coord in _all_coordinators(hass):
+                entry_data = coord.entry.data
 
-                    entry_data = coord.entry.data
-
-                    # Match based on connection type
-                    if connection_type == "tcp":
-                        if (entry_data.get("connection_type") == "tcp" and
-                            entry_data.get("host") == host and
-                            entry_data.get("port", 502) == port):
-                            coordinator = coord
-                            _LOGGER.info(f"Auto-detected coordinator for {host}:{port} - entity values will be included")
-                            break
-                    else:  # serial
-                        if (entry_data.get("connection_type") == "serial" and
-                            entry_data.get("device") == device):
-                            coordinator = coord
-                            _LOGGER.info(f"Auto-detected coordinator for {device} - entity values will be included")
-                            break
+                # Match based on connection type
+                if connection_type == "tcp":
+                    if (entry_data.get("connection_type") == "tcp" and
+                        entry_data.get("host") == host and
+                        entry_data.get("port", 502) == port):
+                        coordinator = coord
+                        _LOGGER.info(f"Auto-detected coordinator for {host}:{port} - entity values will be included")
+                        break
+                else:  # serial
+                    if (entry_data.get("connection_type") == "serial" and
+                        entry_data.get("device") == device):
+                        coordinator = coord
+                        _LOGGER.info(f"Auto-detected coordinator for {device} - entity values will be included")
+                        break
 
             if not coordinator:
                 _LOGGER.info("No matching coordinator found - entity values will not be included in CSV")
@@ -2230,7 +2629,7 @@ def _export_registers_to_csv(hass, connection_type: str, host: str, port: int, d
         # SKIP VPP registers if OffGrid mode to prevent SPF power resets!
         # Always read firmware version (registers 9-11) - safe for all inverters
         _LOGGER.info("Reading firmware version (holding registers 9-11)...")
-        fw_registers = _read_registers_chunked(client, 9, 3, slave_id, chunk_size=3, register_type='holding')
+        fw_registers = _read_registers_chunked(client, 9, 3, slave_id, chunk_size=3, register_type='holding', delay_s=_scan_delay_s)
         if fw_registers:
             all_register_data.update(fw_registers)
 
@@ -2238,15 +2637,15 @@ def _export_registers_to_csv(hass, connection_type: str, host: str, port: int, d
             # Read V1.39 identification registers: holding 43 (DTC) and 3099 (DSP firmware code).
             # Legacy grid-tied inverters (MIN TL-X etc.) carry DTC at holding 43 rather than 30000.
             _LOGGER.info("Reading V1.39 identification registers (holding 43, 3099)...")
-            v139_dtc = _read_registers_chunked(client, 43, 1, slave_id, chunk_size=1, register_type='holding')
+            v139_dtc = _read_registers_chunked(client, 43, 1, slave_id, chunk_size=1, register_type='holding', delay_s=_scan_delay_s)
             if v139_dtc:
                 all_register_data.update(v139_dtc)
-            v139_dsp = _read_registers_chunked(client, 3099, 1, slave_id, chunk_size=1, register_type='holding')
+            v139_dsp = _read_registers_chunked(client, 3099, 1, slave_id, chunk_size=1, register_type='holding', delay_s=_scan_delay_s)
             if v139_dsp:
                 all_register_data.update(v139_dsp)
 
             _LOGGER.info("Reading identification registers (DTC code, protocol version)...")
-            id_registers = _read_registers_chunked(client, 30000, 100, slave_id, chunk_size=50, register_type='holding')
+            id_registers = _read_registers_chunked(client, 30000, 100, slave_id, chunk_size=50, register_type='holding', delay_s=_scan_delay_s)
             if id_registers:
                 all_register_data.update(id_registers)
                 dtc_found = 30000 in id_registers and id_registers[30000]['status'] == 'success' and id_registers[30000]['value']
@@ -2261,7 +2660,7 @@ def _export_registers_to_csv(hass, connection_type: str, host: str, port: int, d
                     # short pause before concluding there is no VPP DTC.
                     _LOGGER.info("  VPP DTC returned zero — retrying after 500 ms...")
                     time.sleep(0.5)
-                    id_registers_retry = _read_registers_chunked(client, 30000, 100, slave_id, chunk_size=50, register_type='holding')
+                    id_registers_retry = _read_registers_chunked(client, 30000, 100, slave_id, chunk_size=50, register_type='holding', delay_s=_scan_delay_s)
                     if id_registers_retry:
                         all_register_data.update(id_registers_retry)
                         dtc_found = 30000 in id_registers_retry and id_registers_retry[30000]['status'] == 'success' and id_registers_retry[30000]['value']
@@ -2280,7 +2679,7 @@ def _export_registers_to_csv(hass, connection_type: str, host: str, port: int, d
             if _leg_dtc_entry and _leg_dtc_entry.get('status') == 'success' and not _leg_dtc_entry.get('value'):
                 _LOGGER.info("  Legacy DTC (holding 43) returned zero — retrying after 1 s...")
                 time.sleep(1.0)
-                v139_dtc_retry = _read_registers_chunked(client, 43, 1, slave_id, chunk_size=1, register_type='holding')
+                v139_dtc_retry = _read_registers_chunked(client, 43, 1, slave_id, chunk_size=1, register_type='holding', delay_s=_scan_delay_s)
                 if v139_dtc_retry:
                     all_register_data.update(v139_dtc_retry)
         else:
@@ -2303,7 +2702,7 @@ def _export_registers_to_csv(hass, connection_type: str, host: str, port: int, d
 
             _LOGGER.info(f"Scanning {range_name} ({reg_type}, block_size={block_size})...")
 
-            registers = _read_registers_chunked(client, start, count, slave_id, chunk_size=block_size, register_type=reg_type)
+            registers = _read_registers_chunked(client, start, count, slave_id, chunk_size=block_size, register_type=reg_type, delay_s=_scan_delay_s)
 
             if registers:
                 # Holding ranges go into a separate dict so they don't overwrite
@@ -2337,7 +2736,7 @@ def _export_registers_to_csv(hass, connection_type: str, host: str, port: int, d
 
                 _LOGGER.info(f"Scanning {range_name}...")
 
-                registers = _read_registers_chunked(client, start, count, slave_id, chunk_size=block_size, register_type='holding')
+                registers = _read_registers_chunked(client, start, count, slave_id, chunk_size=block_size, register_type='holding', delay_s=_scan_delay_s)
 
                 if registers:
                     all_register_data.update(registers)
@@ -2355,19 +2754,19 @@ def _export_registers_to_csv(hass, connection_type: str, host: str, port: int, d
         # and these reads are reliable. This avoids using the coordinator's client
         # (which races with the coordinator's own polling thread).
         _LOGGER.info("Re-reading identification registers (connection now settled)...")
-        _settled_fw = _read_registers_chunked(client, 9, 3, slave_id, chunk_size=3, register_type='holding')
+        _settled_fw = _read_registers_chunked(client, 9, 3, slave_id, chunk_size=3, register_type='holding', delay_s=_scan_delay_s)
         if _settled_fw:
             for _addr, _val in _settled_fw.items():
                 if _val.get('status') == 'success' and _val.get('value') is not None:
                     all_register_data[_addr] = _val
 
-        _settled_dtc43 = _read_registers_chunked(client, 43, 1, slave_id, chunk_size=1, register_type='holding')
+        _settled_dtc43 = _read_registers_chunked(client, 43, 1, slave_id, chunk_size=1, register_type='holding', delay_s=_scan_delay_s)
         if _settled_dtc43:
             _e43 = _settled_dtc43.get(43)
             if _e43 and _e43.get('status') == 'success':
                 all_register_data[43] = _e43
 
-        _settled_dsp = _read_registers_chunked(client, 3099, 1, slave_id, chunk_size=1, register_type='holding')
+        _settled_dsp = _read_registers_chunked(client, 3099, 1, slave_id, chunk_size=1, register_type='holding', delay_s=_scan_delay_s)
         if _settled_dsp:
             _edsp = _settled_dsp.get(3099)
             if _edsp and _edsp.get('status') == 'success':
@@ -2377,7 +2776,7 @@ def _export_registers_to_csv(hass, connection_type: str, host: str, port: int, d
         # that means the device doesn't support VPP registers at all).
         _vpp_prev = all_register_data.get(30000)
         if _vpp_prev and _vpp_prev.get('status') == 'success' and not _vpp_prev.get('value'):
-            _settled_vpp = _read_registers_chunked(client, 30000, 1, slave_id, chunk_size=1, register_type='holding')
+            _settled_vpp = _read_registers_chunked(client, 30000, 1, slave_id, chunk_size=1, register_type='holding', delay_s=_scan_delay_s)
             if _settled_vpp:
                 _evpp = _settled_vpp.get(30000)
                 if _evpp and _evpp.get('status') == 'success' and _evpp.get('value'):
@@ -2405,6 +2804,7 @@ def _export_registers_to_csv(hass, connection_type: str, host: str, port: int, d
             writer.writerow(["Connection Type", connection_type.upper()])
             writer.writerow(["Slave ID", slave_id])
             writer.writerow(["Block Size", block_size, "registers per Modbus request"])
+            writer.writerow(["Read Pacing", _scan_delay_ms, "ms between reads (from modbus_delay)"])
 
             # Add currently selected/configured profile (if coordinator found)
             if selected_profile_key and selected_profile_name:
@@ -2884,3 +3284,14 @@ def _export_registers_to_csv(hass, connection_type: str, host: str, port: int, d
         _LOGGER.error(f"Universal scan failed: {e}")
         result["error"] = str(e)
         return result
+
+    finally:
+        # Hand the gateway back to the coordinator. Must run on every exit path — an
+        # unreleased hub lock would stall polling until the integration was reloaded.
+        if _hub_locked:
+            try:
+                _hub.reset("register scan finished")
+            except Exception as err:
+                _LOGGER.debug("Hub reset after scan failed (non-critical): %s", err)
+            _hub._lock.release()
+            _LOGGER.info("Resumed coordinator polling on %s:%s after scan", host, port)

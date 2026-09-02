@@ -1,6 +1,17 @@
-# VPP Protocol
+# VPP Protocol (V2.03)
 
-> **Source documents:** Growatt VPP Communication Protocol of Inverter V2.01 / V2.03
+!!! info "This page is current to V2.03"
+
+    The integration labels profiles and the protocol-variant option **"VPP V2.01"**, and
+    that name is kept for compatibility with existing configurations. The register
+    information here is **not** limited to V2.01 - it is taken from the V2.03 specification
+    dated 2025.9.1 and includes the V2.03 additions, such as register 30209 (automatic
+    on/off-grid switch) and the bypass value on register 30101.
+
+    If a distributor hands you "V2.03" documentation, it is the same document we work from.
+
+> **Source documents:** Growatt VPP Communication Protocol of Inverter V2.03, with V2.01
+> for comparison
 > (`GI-BK-E060_GROWATT.VPP.COMMUNICATION.PROTOCOL.OF.INVERTER_V2.03.xlsx`,
 > `growatt_vpp_protocol_v2.01_registers.csv`)
 >
@@ -29,32 +40,66 @@
 The DTC (Device Type Code) is stored at holding register 30000 and uniquely identifies
 the inverter model. The integration reads this at startup for automatic model detection.
 
-| DTC Code | Model |
-| --- | --- |
-| 3502 | SPH 3000-6000TL BL |
-| 3503 | SPH 3000-6000TL HU |
-| 3504 | SPH 3000-6000TL HUB |
-| 3601 | SPH 4000-10000TL3 BH-UP |
-| 3701 | SPA 1000-3000TL BL |
-| 3715 | SPA 3000-6000TL AU |
-| 3716 | SPA 3000-6000TL AUB |
-| 3725 | SPA 4000-10000TL3 BH-UP |
-| 3735 | SPA 3000-6000TL BL |
-| 5001 | MID 17–25KTL3-X / MID 20–30KTL3-X2 |
-| 5002 | MID 33–36KTL3-X(Pro.E) / MOD 3–15KTL3-X |
-| 5003 | MAC 30–70KTL3-X |
-| 5100 | MIN 2500-6000TL-XH/XH(P) |
-| 5200 | MIC/MIN 2500-6000TL-X/X2 |
-| 5201 | MIN 7000-10000TL-X/X2 |
-| 5400 | MOD-XH / MID-XH |
-| 5600 | WIS 100K-AM; WIT 50–100K-H/HE/HU/A/AE/AU; WIT 50–100K-H/HE/HU/A/AE/AU-US; WIT 28–55K-H/HE/HU/A/AE/AU-US L2 |
-| 5601 | WIT 29.9–50K-XHU (commercial hybrid with battery — confirmed via hardware scan Issue #338) |
-| 5800 | WIS 210K |
-| 5801 | WIS 215K-AM |
+This table is generated from `DTC_REGISTRY` in `auto_detection.py`, the single source of
+truth, and is checked against it by the test suite.
 
-| 5603 | WIT 4–15KTL3 (residential three-phase hybrid) — confirmed via live register read by community contributor (Issue #335); absent from V2.03 spec DTC table but follows V2.03 protocol structure |
+**Profile mapping** is a separate question from the DTC itself. The code is read from the
+device and identifies the model reliably; whether the profile it selects is *correct* for
+that model has, for most entries, never been verified against hardware. See
+[DTC Debugging](../troubleshooting/dtc-debugging.md) for what that means in practice.
 
-> **WIT residential models (4–15KTL3):** The VPP V2.03 spec (dated 2025.9.1) does **not** include the WIT 4–15KTL3 residential series in its DTC table. Only commercial WIT (50K–100K) models appear. DTC 5603 has been confirmed via live hardware register read (register 30000 = 5603 on a WIT 15KTL3) and protocol version register 30099 = 203 (V2.03), confirming the residential range follows V2.03 register structure despite the omission from the spec's device table.
+<div class="dtc-table" markdown>
+
+| DTC | Model | Profile to select | Mapping |
+| --- | --- | --- | --- |
+| 3501 | SPH 3000-6000TL BL | SPH (3-6kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 3502 | SPH 3000-6000TL BL-UP | SPH (3-6kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
+| 3503 | SPH 3000-6000TL HU | SPH (3-6kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 3504 | SPH 3000-6000TL HUB | SPH (3-6kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
+| 3601 | SPH-TL3 4-10kW | SPH-TL3 (3-10kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
+| 3701 | SPA 1000-3000TL BL | SPH (3-6kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 3715 | SPA 3000-6000TL AU | SPH (3-6kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 3716 | SPA 3000-6000TL AUB | SPH (3-6kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 3725 | SPA-TL3 4-10kW | SPA-TL3 (AC Storage, 3-Phase) 4-10kW | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
+| 3735 | SPA 3000TL BL-UP | SPH (3-6kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 5001 | MID 17-25KTL3-X; MID 20-30KTL3-X2; MID 25-30KTL3-X2 Pro/X2 Pro.E; MID 33-50KTL3-X2/X2 Pro/X2 Pro.E; MID 30-40KTL3-X; MID 33-36KTL3-X(Pro.E); MID 3-33KTL3-X3 | MID (15-25kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
+| 5002 | MOD 3-15KTL3-X; MOD 3-15KTL3-X2(Pro); MOD 12-20KTL3-X2; MOD 12-20KTL3-X2(E); MOD 3-33KTL3-X3 | MID (15-25kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
+| 5003 | MAC 30-70KTL3-X; MAC 15-36KTL3-XL; MAC 50-70KTL3-X2; MAC 30-36KTL3-XL2 | MID (15-25kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 5000 | MAX 50-100KTL3 LV/MV | MID (15-25kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 5500 | MAX 175-253KTL3-X HV | MID (15-25kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 5501 | MAX 80-150KTL3-X LV/MV; MAX 100-150KYL3-X2 LV/MV | MID (15-25kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 5502 | MAX 320-350KTL3-X | MID (15-25kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 5100 | MIN 2500-6000TL-XH/XH2/XHE/XA | TL-XH (3-10kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
+| 5200 | MIC 600-3300TL-X/X2/X2(Pro); MIN 2500-6000TL-X/X2/X2(Pro)/X2(Pro.E) | MIN (3-6kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 5201 | MIN 7-10KTL-X/X2/X2(E) | MIN (7-10kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
+| 5400 | MOD 3-10KTL3-XH/BP; MID 11-30KTL3-XH; MID 8-15KTL3-XHL/JP | MOD Hybrid (6-15kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
+| 5401 | MOD 3-15KTL3-HU; MID 33-50KTL3-HU | MOD Hybrid (6-15kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
+| 5600 | WIS 100K-AM; WIT 50-100K-H/HE/HU/A/AE/AU (incl. -US); WIT 28-55K-H/HE/HU/A/AE/AU-US L2 | WIT (29.9-50kW XHU) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 5601 | WIT 29.9-50K-XHU | WIT (29.9-50kW XHU) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
+| 5800 | WIS 210K | MID (15-25kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 5801 | WIS 215K-AM | MID (15-25kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+
+</div>
+
+!!! note "SPA owners"
+    Every SPA code above resolves to an **SPH** profile, which is why the profile column
+    reads that way. SPH profiles include PV string sensors, and SPA hardware has no solar
+    DC inputs — so those entities will exist and read zero permanently. A dedicated SPA
+    profile is in progress ([#360](https://github.com/0xAHA/Growatt_ModbusTCP/issues/360)).
+
+### Not in the spec table
+
+<div class="dtc-table" markdown>
+
+| DTC | Model | Profile to select | Mapping |
+| --- | --- | --- | --- |
+| 5603 | WIT 4-15kW Hybrid | WIT (4-15kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
+
+</div>
+
+> **WIT residential models (4-15KTL3):** The VPP V2.03 spec (dated 2025.9.1) does **not** include the WIT 4-15KTL3 residential series in its DTC table — only commercial WIT (50K-100K) models appear. DTC 5603 was confirmed by a live register read (register 30000 = 5603 on a WIT 15KTL3, Issue #335) with protocol version register 30099 = 203, so the residential range follows V2.03 register structure despite being omitted from the spec's device table.
+
+**Non-VPP models** are not listed here. Legacy V1.39 devices (MIC 2500-5500MTL-S, TL3-S, SPH/SPM 8000-10000TL-HU), off-grid SPF (3400-3403) and SPE (64541) carry their DTC at holding register **43** rather than 30000. They appear in the [full DTC reference](../troubleshooting/dtc-debugging.md).
 
 ---
 
@@ -176,6 +221,93 @@ the inverter model. The integration reads this at startup for automatic model de
 | 30499 | Battery max discharge current | RW | UINT16 | 0.1A | 1 | Lead-acid only, [0,2000], Default: 1500 |
 | 30500 | Safety Information | RW | UINT16 | - | 500 | See GROWATT INVERTER VPP COMMUNICATION PROTOCOL & SAFETY PARAMETERS |
 | 32000 | Reserve | RW | UINT16 | - | 100 | - |
+
+---
+
+## Field-established registers (not in any public document)
+
+Everything above is transcribed from Growatt's protocol documents. The registers below are
+not: they appear in no public revision we have, and were established by measurement on real
+hardware. They are recorded here because the alternative is losing them in an issue thread.
+
+Treat them as narrower evidence than the tables above — one machine, one firmware line —
+and say so in anything derived from them.
+
+### MOD TL3-XH peak shaving / demand management (holding 3307–3312)
+
+`protocol-v139.md` carries no holding-register semantics above 3282; Modbus RTU Protocol II
+V1.24 declares the TL-XH ranges to 3374 but its tables stop around 3280. This is consistent
+with Growatt's own position that peak shaving on the MOD 3-10KTL3-XH needs a firmware
+upgrade obtained from them — a later addition, documented in a revision that is not public.
+
+Established on a MOD 10KTL3-XH (DN1.0, DTC 5400) by changing each value in the Growatt web
+portal and reading the register back, with peak shaving disabled throughout so the changes
+were inert ([#372](https://github.com/0xAHA/Growatt_ModbusTCP/issues/372)).
+
+| Address | Meaning | Cloud field | Scale | How established |
+| --- | --- | --- | --- | --- |
+| 3307 | Import limit | `uw_demand_mgt_downstrm_power_limit` | 0.1 kW | Portal 7.5 → 7.0 kW, register 75 → 70 |
+| 3308 | Export limit | `uw_demand_mgt_revse_power_limit` | 0.1 kW | Portal 7.5 → 7.0 kW, register 75 → 70 |
+| 3310 | Peak shaving reserved SOC | `ub_peak_shaving_backup_soc` | 1 % | Portal 50 → 45, register 50 → 45 |
+| 3311 | AC charging max power limit | `uw_ac_charging_max_power_limit` | 0.1 kW | Elimination; write verified |
+| 3312 | Grid charging stop SOC | `ub_ac_charging_stop_soc` | 1 % | Reverse: wrote 85 over Modbus, cloud reported 85 ~12 min later |
+
+**3309, 3313 and 3314 are not mapped.** 3314 reads 10, which coincides with two other
+discharge-stop SOCs, and is settable nowhere — so it could not be confirmed in either
+direction. Value correlation alone is not sufficient here: 100 occurs in six cloud settings
+and seventeen registers.
+
+**3312 is distinct from 3048.** 3048 is the general charge stop; 3312 caps charging from
+the grid specifically, and the lower of the two wins. Growatt exposes 3312 in neither the
+app nor the portal, which is how it silently capped one system's grid charging at 55 % for
+two days while the general stop read 100 %.
+
+### VPP remote power control on MOD TL3-XH
+
+Remote power control works on this family, contrary to the assumption behind the WIT-only
+gate in the integration. Three findings from measurement
+([#373](https://github.com/0xAHA/Growatt_ModbusTCP/issues/373)) that any implementation
+needs:
+
+1. **The commanded power (30409) is a target, not a limit — and it overrides
+   `allow_grid_charge` (3049).** At 100 % with insufficient PV the inverter climbed toward
+   the setpoint and drew from the grid while 3049 was 0. At 5/10/20 % only downward
+   limiting is visible, which gives a misleading impression of a cap.
+
+    The often-quoted 912 W is **a single sample five seconds in, from a run an abort
+    threshold stopped immediately** — charge power was still climbing, 2592 → 4767 W in
+    those five seconds. Treat it as a lower bound on what this does, not a characteristic
+    value.
+
+2. **The duration is not reliable in either direction.** With 30408 = 2 minutes the
+   constraint released at ~128 s. With 30408 = 5 minutes it had **not** released at 390 s
+   and only did so when 30407 and 30100 were written back to 0 by hand. In both runs
+   30407, 30409 and 30100 stayed set throughout.
+
+    Two consequences. Active state cannot be inferred from the register values — that
+    holds either way. And **an implementation must clear the registers itself**; the timer
+    is not a safety net that will release the inverter on its own.
+
+3. **30407 alone does nothing** — 30100 (control authority) must also be set. This is
+   presumably why the capability was assumed absent on non-WIT families.
+
+**On the transfer function.** Three charge points fit a line — 77.6 W per percentage
+point, offset −86 W, full scale ≈7.25 kW on a 15 kWh battery — and predicted a fourth
+within 2 %. A fifth measurement does **not** fit: a repeat of the 20 % point produced
+**0 W** rather than ~1466 W, with the battery at zero and the PV surplus going to the grid
+instead. Conditions differed on two axes at once (PV 4.9 → 3.0 kW, house load low → 1.9 kW,
+SoC ~60 → 83 %), and which of them matters has not been tested.
+
+So the linear fit describes some regime, not the device. **A clamp that assumes commanded
+power is delivered will meet the case where it is not.** The discharge side (−10 % → 832 W,
+−20 % → 1569 W) is two points fitted to two parameters and therefore has no residual by
+construction — indicative only.
+
+**30474 mirrors the last commanded setpoint.** It retains the last command after remote
+control is disabled — confirmed ten hours later still reading −33, raw 65503, with
+30100/30407/30409 all zero — and a direct write is accepted and ignored, the echo returning
+the written value while the read-back keeps the old one. An earlier report that it returns
+to 100 on its own has since failed to reproduce and should not be relied on.
 
 ---
 

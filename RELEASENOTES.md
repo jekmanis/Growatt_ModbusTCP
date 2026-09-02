@@ -4,6 +4,2176 @@
 
 ---
 
+## Unreleased
+
+Staged for the next release. **Not yet published** — v1.8.14 is the current stable.
+
+- **Your inverter now tells you if it is on the wrong profile.** Detection ran once during
+  setup and was never revisited, so a single timed-out read at that moment could leave an
+  inverter on a profile that maps fewer registers than it supports - with nothing to say so.
+  The device type code is now re-checked against a working connection, and a mismatch
+  raises a repair notice suggesting the better profile. **Nothing is changed automatically.**
+  Off-grid models are excluded from the check entirely, because reading those registers can
+  power-cycle an SPF. (#405, #228)
+- **WIT: battery power no longer reads ten times too high.** The scale is chosen at runtime
+  by comparing the power register against voltage x current, and on some units several
+  registers claim to be battery current while disagreeing wildly - one inverter offered
+  -0.1 A, 6.3 A and -4.3 A at the same instant. The largest was used, the wrong scale
+  matched it, and the choice stuck for the session, giving 40 kW readings on a 6.5 kW
+  battery. When the current registers disagree, no scale is now inferred and the
+  documented one is used. Reported by @sebastianries. (#406)
+- **SPF: the impossible-PV-zero message no longer repeats in the log.** The suppression
+  warns once per restart and logs further occurrences at debug. It stays a warning the first
+  time, because knowing your inverter reports 0 W PV while producing over a kilowatt is
+  worth one line - but the fault can recur on every poll, and it appears in Home Assistant's
+  error log, so repeating it says the integration is broken rather than the inverter.
+  Raised by @dinkalin-ux. (#384)
+- **A setting re-entered after it failed to apply is no longer skipped.** The check that
+  avoids rewriting a register that already holds the requested value compared against
+  cached data, up to a poll interval old. So if something else changed the register — the
+  Growatt cloud, another controller — and you set it again to the value you wanted, the
+  write could be dropped as redundant when it was not. It now reads the register first.
+  Follow-up to #402.
+
+---
+
+## v1.8.14
+
+Issues: #396 #401 #402
+
+**Recommended for everyone.** Promotes v1.8.10-v1.8.13 to stable and adds two fixes that
+protect your inverter's settings.
+
+- **Writable settings are now numeric input boxes, not sliders.** Home Assistant writes on
+  every step of a slider drag, so setting a battery voltage threshold wrote each value it
+  passed through - one reporter aiming for 48.0 V left his inverter on 49.6 V, confirmed on
+  the LCD. Enter the value and press Enter, and exactly one write is sent. Reported by
+  @horiace. (#402)
+- **A write is no longer repeated when the inverter is slow to commit.** The read-back
+  check used to re-write on a mismatch, up to three times. On hardware that commits slowly
+  it reads back the previous value, which is indistinguishable from a reversion, so ordinary
+  writes were tripled. The write is now sent once and the register polled until it settles.
+  These registers are likely EEPROM-backed, so this matters beyond the wrong values. (#402)
+- **A daily energy counter dipping below zero no longer reads as 429,496,728 kWh.** Around
+  the midnight reset the register can go briefly negative, and read as unsigned that became
+  a spike large enough to flatten every other reading in your history. Such values are now
+  withheld, leaving a short gap that recovers on the next poll. Applies to every 32-bit
+  counter, not only the one reported. Reported by @gionci and @Vict20. (#401)
+- **Sync TOU Schedule now refuses models it does not support**, instead of writing to
+  registers that do not exist on them. It applies to WIT inverters only. (#396)
+- Documentation: the clock sync guidance no longer suggests a drift threshold that would
+  stop a weekly automation writing at all. (#393)
+
+---
+
+## v1.8.13 (pre-release)
+
+Issues: #397
+
+> **Pre-release for testing.** v1.8.9 remains the stable release.
+
+- **SPH 8000-10000TL-HU: battery current was reading ten times too high.** That profile
+  declared a 0.1 A scale for the BMS current register where the other four SPH maps use
+  0.01. The Growatt ESS Protocol - which V1.39 names as the reference for this whole
+  register block - documents it in units of 10 mA, so 0.01 is correct. **Expect this sensor
+  to drop by a factor of ten on upgrade**; the new value is the right one. No HU owner has
+  measured it, so please report if it now looks wrong.
+- Documentation: a new **ESS Protocol** page records the units, scales and bit meanings for
+  the BMS block at registers 1082-1124, which V1.39 documents by name only. The source PDF
+  is now checked in.
+
+---
+
+## v1.8.12 (pre-release)
+
+Issues: #397 #398
+
+> **Pre-release for testing.** v1.8.9 remains the stable release.
+
+- **Serial: the whole poll now holds the bus, not each transaction.** v1.8.10 stopped a read
+  and a write running at the same instant but left the gap between register blocks open, so
+  a write landing there ran its own connect/disconnect and closed the port out from under
+  the poll. `[Errno 9] Bad file descriptor` and `[Errno 11] Could not exclusively lock port`
+  both returned as soon as a reporter drove writes hard. Reported by @rinuskroon. (#398)
+- **SPH: battery current now reads.** `SPH_3000_6000`, `SPH_7000_10000` and both V2.01
+  variants had no register mapped for it at all, so the entity showed 0.00 A permanently
+  while the BMS held a real value. Confirmed on an SPH3600 with a clamp DC ammeter -
+  register 1088 read 1640 against a measured 16.4 A. Reported by @Vict20. (#397)
+
+---
+
+## v1.8.11 (pre-release)
+
+Issues: #397 #399 #400
+
+> **Pre-release for testing.** v1.8.9 remains the stable release. Includes everything in
+> v1.8.10.
+
+- **PV3 and PV4 daily energy no longer vanish overnight.** Those two sensors were created
+  only while their own value was above zero, so a restart during darkness left them absent
+  until the first watt-hour of the morning, while PV1 and PV2 sat at 0.0 as normal. They
+  now key off the lifetime counter, which still hides them on hardware that has no such
+  string. Raised by @as-wallpen. (#399)
+- **Set Battery Mode (VPP) now refuses models it does not support.** The action is written
+  for WIT and WIS, and its HOLD mode depends on register behaviour those models have. On a
+  MIN TL-XH it was offered anyway and HOLD charged the battery toward a stuck SOC limit -
+  the opposite of standby - importing from the grid to do it. It now returns a clear error
+  naming the missing registers. Reported by @GoncaloRibeiro11. (#400)
+- **A write that is accepted but ignored now says what may have happened.** The warning
+  named only a cloud override; some firmware silently discards out-of-range SOC limits,
+  which sends people looking at the wrong thing. (#400)
+- **Battery temperature is corrected on firmware that reports whole degrees.** One SPH3600
+  reports 25 where the protocol specifies tenths, which showed as 2.5 C. The documented
+  scale is unchanged and still used everywhere it is correct; the correction applies only
+  to readings a working battery could not hold, and stops for good once a device proves it
+  follows the spec. Reported by @Vict20. (#397)
+
+---
+
+## v1.8.10 (pre-release)
+
+Issues: #395 #398
+
+> **Pre-release for testing.** v1.8.9 remains the stable release.
+
+- **Legacy SPH profiles now read grid import and export energy.** `SPH_3000_6000` and
+  `SPH_7000_10000` had no grid energy register mapped at all, so Import/Export Energy Today
+  and Total had nothing behind them and published a value that never moved - one reporter
+  saw a lifetime export of 0.1 kWh, another 3.4 kWh. The V2.01 variants of these profiles
+  were unaffected. **Expect these four sensors to jump to their real values on upgrade.**
+  Confirmed on an SPH 5000 against ShinePhone by @ian-mcarthur-oxford. (#395)
+- **Serial connections no longer fail intermittently on concurrent read and write.** A
+  coordinator poll and a control write could use the same serial client at once; when one
+  reconnected after a timeout, the other was left with a closed handle and the write failed
+  with `[Errno 9] Bad file descriptor` - about ten times a day for someone running TOU
+  automations on a timer. Bus access is now serialised per client. Reported by
+  @rinuskroon. (#398)
+- This is a lock, not a return of the shared serial connection withdrawn in v1.7.5. Nothing
+  opens the port twice; the client still owns its own socket.
+
+---
+
+## v1.8.9
+
+Issues: #399 #393
+
+**Update if you are on v1.8.6, v1.8.7 or v1.8.8.**
+
+- **Conditional sensors were not being created.** Sensor setup aborted partway through, so
+  every sensor whose creation depends on a value - PV energy totals, PV3 counters, Backup
+  Box entities, and others by profile - was never created and read `unavailable` no matter
+  how many times it was enabled, reloaded or restarted. Sensors without such a condition
+  were unaffected, which is why the fault looked selective. Reported by @as-wallpen. (#399)
+- **Automations triggering on an affected entity could not fire**, and nothing surfaced it:
+  no repair, no log entry, no warning on the automation. Worth checking any automation that
+  triggers on a Backup Box entity.
+- Clock sync now compensates for its own write latency, so the inverter clock lands on the
+  requested time rather than about 1.5 s behind it, and `drift_seconds` measures the
+  inverter rather than partly measuring us. Reported by @Vict20. (#393)
+
+---
+
+## v1.8.8
+
+Issues: #353 #361 #376 #377 #378 #379 #381 #383 #384 #385 #386 #389 #390 #392 #393
+
+The first stable release since v1.6.2, consolidating 15 pre-releases.
+
+## Read this before upgrading
+
+Four changes are visible immediately. None needs action, but they will look like faults if they arrive unannounced.
+
+**Sensors now go `unknown` instead of `0` when a read fails.** Previously a dropped Modbus frame published 0 for every register behind it, putting a vertical drop in the graph that could never afterwards be told apart from a real measurement. You will now see a gap instead. Genuine zeros are still recorded. This applies to every profile and to 69 sensors - solar, AC, grid, load, temperatures and every energy counter. If you have templates doing `| float` over these, check them.
+
+**SPH: AC Charge Energy Total steps down.** It was reporting the battery charge counter, which includes solar - one reporter saw 13,820.7 kWh where the true grid-to-battery figure was 7,099.8 kWh. The new, lower value is the correct one and matches "EAC Total" on the Growatt app's raw device page.
+
+**Three entities are removed automatically:**
+
+| Entity | Why | Use instead |
+|---|---|---|
+| SPH Warning Code | That register holds an energy value on these models, so it only ever reported 0 | - |
+| AC Discharge Energy Total (grid-tied only) | No such register exists in the protocol for them; it could latch a stray reading permanently, in one case 21,069,824 kWh on a 12 kWh battery | Battery Discharge Total |
+
+Off-grid models (SPF, SPE) genuinely have the discharge register and keep the sensor.
+
+**SPH time-slot entities are renamed.** The Grid First slots showed as "Period 7/8/9" but are slots **1, 2 and 3** in the Growatt app and the protocol. Entity IDs are unchanged, so automations and dashboards keep working - only the displayed names move.
+
+---
+
+## New
+
+### Inverter clock
+
+The inverter runs its own RTC and it drifts. Time-of-use windows fire against **that** clock, not Home Assistant's, so a window set for 13:00 starts whenever the inverter believes it is 13:00. One SPH was two minutes out.
+
+- **`growatt_modbus.sync_inverter_time`** sets it from Home Assistant's local time and returns the drift it corrected. `min_drift_seconds` skips the write when the clock is already close enough, so a scheduled automation costs nothing on the runs that find nothing to fix.
+- **Inverter Clock** sensor - the inverter's time as readable local text, with `timestamp`, `drift_seconds` and `drift_minutes` attributes.
+- **Inverter Clock Sync** button - the same write, on press.
+
+Both entities are **disabled by default** and sit together under Diagnostic on the inverter device. The sensor adds one register read per poll and reads nothing at all until you enable it; the button writes six holding registers per press. Neither is offered on off-grid (SPF/SPE) profiles, where the year encoding differs and register 51 means something else.
+
+Confirmed working on MIN TL-X. Requested and researched by @Vict20. (#393)
+
+### Configuration
+
+- **Connection settings can be changed after setup.** USB/serial port, baud rate, host and TCP port are editable from Configure. Previously the only route was deleting the entry, which loses entity IDs and with them automations, dashboards and statistics history. Requested by @dartyukh-afk. (#383)
+- **A wrong protocol variant can be corrected without deleting the integration.** Ten inverter families exist as two register maps chosen by auto-detection, and a wrong choice was unrecoverable. Configure now has a **Protocol variant** field (Auto / Legacy V1.39 / VPP V2.01) and names the register map currently loaded. Leaving it on Auto changes nothing. (#385)
+- **The serial port picker offers `/dev/serial/by-id/` and `/dev/serial/by-path/` paths**, labelled by what they follow. `by-id` needs the adapter to have a serial number, which CH340 chips - most cheap USB-RS485 adapters - do not have, so `by-path` is the right choice there. (#383, #384)
+
+### Entities
+
+- **SPF Bulk and Float Charge Voltage** controls, 48.0-58.4 V, on a self-defined battery type. Disabled by default: an in-range but wrong value affects your battery rather than a reading. Requested by @dinkalin-ux. (#384)
+- **SPF 3000-6000 ES Plus: Max Charge Current**, 10-100 A across solar and utility. Unavailable when Battery Type is Lithium, which the inverter does not allow. Reported by @dinkalin-ux. (#376)
+- **SPH: AC Charge Energy Today**, from the corrected register block. (#390)
+- **PV3 Energy Today and Total** on three-string systems. (#381)
+
+---
+
+## Fixes
+
+### Data integrity
+
+- **No sensor publishes a zero for a reading it could not take.** Derived values - total solar power, per-phase power calculated from voltage and current - inherit the read state of their inputs, so they go unknown too rather than quietly summing missing data. Battery charge and discharge power no longer both read 0 W on a failed read, which was indistinguishable from an idle battery. Reported by @dinkalin-ux. (#384)
+- **SPF: a PV reading of zero that the inverter's own registers contradict is reported as unknown.** Some SPF units intermittently report 0 in their PV registers while still producing - the read succeeds, the registers are simply wrong. One poll showed 1,907 W of AC output with 329 W from the battery, no grid and no generator, and PV reading zero. Only applies when every other supply reads zero and the shortfall exceeds 200 W, so night-time and battery-only readings are untouched. Reported by @dinkalin-ux. (#384)
+- **SPF battery direction is no longer thrown off by those false zeros.** The sign correction compares PV against load, and a false zero made it conclude the battery was discharging when it was charging.
+
+### Register mappings
+
+- **SPH 3-6kW and 7-10kW report battery charge and discharge energy.** These published a constant 0 because the registers were never mapped. Load consumption energy arrives at the same time. Reported by @igotyou, confirmed against ShinePhone. (#377)
+- **SPH V2.01 profiles read battery energy on hardware without VPP support.** A V1.39 inverter on a V2.01 profile never reads the 31000 range, so Battery Charge/Discharge Today and Total sat at 0.0 while voltage and SOC worked. Reported by @igotyou. (#377)
+- **Three-string MOD, MID and SPH 7-10kW no longer under-report daily solar.** PV3 had no energy counter, and the daily figure is the sum of the per-string counters - so a whole string was missing. On a MID 25KTL3-XH that was 17.6 kWh against the portal's 29.5. Reported by @as-wallpen, registers derived and confirmed with @KevlarD-67. (#381)
+- **MIN TL-XH2 reports inverter temperature.** That model answers Illegal Function across the base register range, where every other profile reads it, so it had no temperature source. It now uses VPP register 31114. Reported by @Richardmarkink. (#361)
+- SPH V2.01 profiles had registers 1052-1055 labelled as grid import, which is battery discharge energy. No entity changes. (#378)
+
+### Writes
+
+- **WIT grid charging works on models that reject Write Single Register.** Register 30410 accepts only FC 0x10 on some WIT hardware; the refusal was logged and stepped over, so every other register in the mode sequence succeeded and grid charging silently never engaged. It now falls back to FC 0x10, and reports a real failure when neither function code works. Reported by @jekmanis. (#353)
+- **Setting a control to the value it already has no longer writes to the inverter.** These registers are believed to be EEPROM-backed with a finite write budget. A scheduler recomputing time slots on a timer was writing every slot on every run, including the ones already correct. Raised by @dinkalin-ux and @KevlarD-67. (#384, #392)
+- **Every write failure reports the device's own reason** instead of "returned error". The Modbus exception code distinguishes a register that does not exist from a value that was rejected, and it was being discarded.
+
+### Connection and diagnostics
+
+- **A serial port that cannot be opened explains itself**, instead of a bare `Failed to connect` with the real reason buried in a pymodbus line above it.
+- **The register scanner falls back to single-register reads when a gateway refuses blocks.** It read 125 registers per request and never tried smaller, so a bandwidth-limited bridge - LoRa gateways especially - produced a scan that looked like a dead device. Reported by @Henxidou001. (#389)
+- **Register scans name the register map instead of reporting UNKNOWN.** Diagnostic output only. (#379)
+- **Changing connection settings no longer logs a blocking-call warning.** Opening the options page on a serial setup enumerated ports on the event loop, which Home Assistant reports with a traceback asking you to file a bug. (#384)
+- **SPF: routine battery-direction corrections no longer appear as errors.** In status 12 the SPF reports an unreliable sign, so direction is resolved from the power balance - normal operation that can fire a dozen times on a sunny day. It was logged at warning level, which put it in the error log under "originated from a custom integration". Now debug. Reported by @dinkalin-ux. (#384)
+- **Stopped using a device registry attribute Home Assistant deprecated in 2026.8**, which would otherwise write warnings naming this integration into your log.
+
+---
+
+## Documentation
+
+- **PV Energy Total vs Energy Total on hybrids.** The two descriptions contradicted each other. On a hybrid, Energy Total counts battery discharge including energy the battery took from the grid, so it is normally the larger. Raised by @Vict20. (#381)
+- **The EEPROM guidance is labelled as inference.** Growatt marks a few VPP registers "Not storage" and says nothing about the rest; treating the rest as non-volatile is our caution, not a documented limit. Raised by @KevlarD-67. (#392)
+- **Choosing a stable serial path** - why `by-path` suits CH340 adapters and `/dev/ttyUSBn` numbering cannot be relied on.
+- **New Actions Reference** covering all nine actions with YAML examples.
+- Register 30476 (WIT priority mode) is no longer described as read-only; the TOU Default Mode control writes it. (#353)
+
+---
+
+## Note on v1.7.0-v1.7.4
+
+Those pre-releases added a shared serial connection that broke serial polling and were withdrawn; v1.7.5 reverted it. They were never offered as a stable release, so if you are upgrading from v1.6.2 you were never exposed. Everything else from that range is carried forward.
+
+---
+
+Thanks to @dinkalin-ux, @Vict20, @KevlarD-67, @igotyou, @as-wallpen, @jekmanis, @Richardmarkink, @Henxidou001, @dartyukh-afk and @Wojak129 for the reports, scans and hardware confirmations behind this release.
+
+---
+
+## v1.8.7 (pre-release)
+
+Issues: #393
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **Inverter Clock now shows the time.** It was published as a timestamp sensor, which Home
+  Assistant renders as relative time - a counter ticking up every second, indistinguishable
+  from a "last updated" field. The state is now the inverter's wall-clock time, e.g.
+  `2026-08-26 14:32:05`. The parseable form moves to a `timestamp` attribute alongside
+  `drift_seconds` and `drift_minutes`. Affects anyone who enabled the sensor in v1.8.6.
+
+---
+
+## v1.8.6 (pre-release)
+
+Issues: #393
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **New entity: Inverter Clock.** Shows the inverter's own real-time clock as readable
+  local time, with `timestamp`, `drift_seconds` and `drift_minutes` attributes so you can
+  alert on drift. Time-of-use windows fire against this clock rather than Home Assistant's.
+- **New entity: Inverter Clock Sync.** A button that sets the inverter's clock on press -
+  the same write as the `sync_inverter_time` action, without the options.
+- **Both are disabled by default** and sit together under Diagnostic on the inverter
+  device. Enable them in the entity settings. The sensor adds one register read per poll
+  and reads nothing at all until enabled; the button writes six holding registers per
+  press. Neither is offered on off-grid (SPF/SPE) profiles.
+- **Clock sync confirmed working on MIN TL-X.** The action no longer asks for reports or
+  logs a notice on every run.
+- The clock drift notification now points at the button and the action rather than telling
+  you to use the ShinePhone app.
+
+---
+
+## v1.8.5 (pre-release)
+
+Issues: #384
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **SPF: routine battery-direction corrections no longer appear as errors.** In status 12
+  (PV Charge + Discharge) the SPF reports an unreliable sign on battery power, so the
+  integration resolves the direction from the power balance instead. That is normal
+  operation and can fire a dozen times on a sunny day, but it was logged at warning level,
+  which put it in Home Assistant's error log under "originated from a custom integration".
+  It now logs at debug. The correction itself is unchanged. Reported by @dinkalin-ux. (#384)
+- Corrections that flag a genuine contradiction between the reported sign and the inverter's
+  own status (#174) still log at warning, as they should.
+
+---
+
+## v1.8.4 (pre-release)
+
+Issues: #393
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **Clock sync now writes the year the way the inverter expects it.** Register 45 takes a
+  **two-digit** year and reports back four — write `26`, read `2026`. That asymmetry appears
+  in neither protocol document, and it is why every earlier build was rejected: they all sent
+  the full year. Established from a published ESP32 implementation for an SPH5000 and an
+  ESPHome forum finding, after both a MIN TL-X and an SPH refused everything else.
+  Investigated and sourced by @Vict20. (#393)
+- **Each field is now written on its own rather than as a block**, matching that reference —
+  both models refused a multi-register write across this range, while the RTC registers
+  accept single writes even on hardware that generally does not.
+- **The year is still written first**, so a refusal leaves the clock untouched rather than
+  half-set, and the clock is read back afterwards with a warning if it does not match.
+
+---
+
+## v1.8.3 (pre-release)
+
+Issues: #393
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+>
+> **Replaces v1.8.0-v1.8.2, which were withdrawn.** Those could leave a MIN TL-X holding the
+> wrong year.
+
+- **New action: Sync Inverter Clock — experimental.** The inverter keeps its own real-time
+  clock and it drifts, and time period schedules run against that clock rather than Home
+  Assistant's, so a window set for 13:00 starts whenever the drifted clock reaches 13:00.
+  `growatt_modbus.sync_inverter_time` sets it and reports the drift corrected. (#393)
+- **It changes nothing unless the whole clock can be set.** The year is written first and
+  read back; if the inverter refuses it, or accepts it and ignores it, nothing else is
+  written and your clock is left exactly as it was. This matters — an earlier build wrote the
+  year last, five fields landed, and the inverter reset its clock to the year 2000 rather
+  than keep a date it considered inconsistent.
+- **Known not to work on MIN TL-X.** That model rejects a four-digit year, silently discards
+  a two-digit one, and does not support single-register writes at all. Set the time from the
+  Growatt app on those.
+- **Not attempted on off-grid (SPF/SPE)**, where the year encoding differs and register 51
+  means something else entirely.
+- **No model has yet been confirmed accepting a full clock write**, so the action says so in
+  the UI and in the log every time it runs. If you try it, please report the outcome on
+  [#393](https://github.com/0xAHA/Growatt_ModbusTCP/issues/393) either way.
+- **Every write failure now reports the device's own reason** instead of "returned error" —
+  the Modbus exception code distinguishes a register that does not exist from a value that
+  was rejected, and we were discarding it.
+
+---
+
+## v1.8.2 (pre-release, withdrawn)
+
+Issues: #393
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **Clock sync now handles models that store the year as two digits.** A MIN TL-X accepted
+  every clock field except the year, refusing `2026` outright. Growatt uses both conventions
+  for that register — the off-grid protocol documents an offset from 2000 — so a refused
+  four-digit year is now retried as two. Reading handles both as well, otherwise a stored
+  `26` decoded as the year 26 AD and the reported drift was two millennia. (#393)
+- **A partial clock write now says so**, naming both the registers that were refused and the
+  ones that were updated. The single-register fallback cannot be atomic, so knowing the clock
+  is part-set rather than untouched matters.
+
+---
+
+## v1.8.1 (pre-release, withdrawn)
+
+Issues: #393
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **Sync Inverter Clock now works on models that refuse a block write.** Some firmware
+  rejects writing registers 45-51 as one transaction even though the registers themselves
+  are writable, and the action failed outright with "Unknown error". It now retries one
+  register at a time, and a refused day-of-week field no longer costs you the clock —
+  schedules do not use it. (#393)
+- **Clock errors now explain themselves** instead of surfacing as "Unknown error", and the
+  log names the specific register a model refuses.
+
+---
+
+## v1.8.0 (pre-release, withdrawn)
+
+Issues: #393
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **New action: Sync Inverter Clock.** The inverter keeps its own real-time clock, and it
+  drifts — one SPH was two minutes out, which made a 13:00 export window start at 13:02.
+  Time period schedules run against the inverter's clock, not Home Assistant's, so that
+  drift moves your schedules. `growatt_modbus.sync_inverter_time` sets it from Home
+  Assistant's local time and reports the drift it corrected. Requested by @Vict20. (#393)
+- **`min_drift_seconds` skips the write when the clock is already close enough**, so a
+  scheduled automation costs nothing on the runs that find nothing to fix. Leave it at 0 for
+  a manual one-off.
+- **Not available on SPF/SPE.** The off-grid protocol stores the year as an offset from 2000
+  and uses register 51 for something other than the weekday, so the standard layout would
+  set the year wrongly and overwrite an unrelated register. The action refuses rather than
+  guessing; a register scan covering 45-51 from an off-grid model is what is needed to add
+  it.
+
+---
+
+## v1.7.7 (pre-release)
+
+Issues: #381, #384, #392
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **SPF: a PV reading of zero that the inverter's own registers contradict is now reported as
+  unknown instead of 0.** Some SPF units intermittently report 0 in their PV registers while
+  still producing — the Modbus read succeeds, the registers are simply wrong. One reporter's
+  poll showed 1,907 W of AC output with only 329 W from the battery, no grid and no
+  generator, and PV reading zero. The real figure cannot be recovered, but a gap in the graph
+  is honest where a zero is a fabricated measurement that stays in your statistics forever.
+  Only applies when every other supply reads zero and the shortfall exceeds 200 W, so genuine
+  night-time and battery-only readings are untouched. Reported by @dinkalin-ux. (#384)
+- **Battery direction is no longer thrown off by those false zeros.** The SPF sign correction
+  compares PV against load; a PV reading of 0 against a real load made it conclude the
+  battery must be discharging when it was not.
+- **Time period controls no longer write when the value has not changed.** A scheduler that
+  recomputes time slots on a timer was writing every slot on every run, including the ones
+  that were already correct. These registers are believed to be held in non-volatile memory
+  with a finite write budget. Raised by @KevlarD-67. (#392)
+- **Documentation: PV Energy Total vs Energy Total on hybrids.** The two sensor descriptions
+  contradicted each other — one said Energy Total would be higher, the other said lower. On a
+  hybrid, Energy Total counts battery discharge including energy the battery took from the
+  grid, so it is normally the larger of the two. Raised by @Vict20. (#381)
+- **Documentation: the EEPROM guidance is now labelled as inference.** Growatt marks a few
+  VPP registers "Not storage" and says nothing about the rest; treating the rest as
+  non-volatile is our caution, not a documented limit. Raised by @KevlarD-67. (#392)
+- **Internal: stopped using a device registry attribute Home Assistant deprecated in 2026.8**,
+  which would otherwise start writing warnings naming this integration into your log.
+
+---
+
+## v1.7.6 (pre-release)
+
+Issues: #390
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **SPH: AC Charge Energy Total now reports grid-to-battery energy, not total battery
+  charge.** It was showing the battery charge counter, which includes energy from your
+  panels — one reporter saw 13,820.7 kWh where the true grid figure was 7,099.8 kWh.
+  **Expect this sensor to step down on upgrade**; the new value is the correct one, and it
+  matches the "EAC Total" field on the Growatt app's raw device page. Confirmed on hardware
+  by @Vict20. (#390)
+- **SPH gains AC Charge Energy Today**, from the same corrected register block.
+- **SPH loses its Warning Code sensor.** On these models that register holds an energy value,
+  not a fault code, so the sensor has only ever reported 0. It is removed automatically.
+- **AC Discharge Energy Total is removed from grid-tied models.** No such register exists in
+  the protocol for them — the sensor had nothing behind it and could latch a stray reading
+  permanently, in one case showing 21,069,824 kWh on a 12 kWh battery. Off-grid models
+  (SPF, SPE) genuinely have this register and keep the sensor. Use **Battery Discharge
+  Total** instead. (#390)
+
+---
+
+## v1.7.5 (pre-release)
+
+Issues: #384
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+>
+> **If you use a USB-RS485 adapter and installed any of v1.7.0-v1.7.4, update.** Those
+> versions could not read from a serial inverter at all. They have been withdrawn.
+
+- **Serial connections work again.** v1.7.0 introduced a shared connection for serial
+  entries. It opened the port, while the polling client — which was never given the shared
+  connection — opened the same port a second time. A serial port can only be held once, so
+  every read failed with `Could not exclusively lock port` and the inverter went offline.
+  This affected **every** serial user, not only those with two inverters. The serial shared
+  connection has been removed and behaviour is back to v1.6.6. Reported by @dinkalin-ux with
+  the logs that identified it. (#384)
+- **A serial port that cannot be opened now explains itself**, instead of appearing as a bare
+  `Failed to connect` with the real reason buried in a line above it.
+
+Everything else from v1.7.0-v1.7.4 is unaffected and carried forward: the register scanner's
+single-register fallback, `/dev/serial/by-path/` paths in the port list, and the sensor
+changes from v1.6.6-v1.6.9.
+
+---
+
+## v1.7.4 (pre-release, withdrawn)
+
+Issues: #384
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **The serial port list now offers `/dev/serial/by-path/` paths as well as `/dev/serial/by-id/`.**
+  by-id needs the adapter to have a serial number, and CH340 chips — most cheap USB-RS485
+  adapters — do not have one, so two identical adapters produce by-id names that cannot tell
+  them apart. by-path names the USB socket instead and is unambiguous. Both are listed and
+  labelled by what they follow, so you can pick the one that suits your hardware instead of
+  typing it by hand. Raised by @dinkalin-ux. (#384)
+
+---
+
+## v1.7.3 (pre-release, withdrawn)
+
+Issues: #384
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+>
+> **Fixes a serial regression introduced in v1.7.0.** If you are on v1.7.0-v1.7.2 with a
+> USB-RS485 adapter, update.
+
+- **Serial ports are released between polls again.** v1.7.0 held the port open for the
+  lifetime of the entry. A serial port is exclusive, so on some setups the second config
+  entry could never open it and reported `Could not exclusively lock port` on every poll,
+  taking that inverter permanently offline. Reopening costs about 2 ms. Reported by
+  @dinkalin-ux. (#384)
+- **A serial port that cannot be opened now says why.** Previously this surfaced only as
+  `Failed to connect`, with the real reason buried in a pymodbus line above it. The warning
+  now names the likely cause and the command that confirms it.
+- **Documentation: choosing a stable serial path.** CH340 adapters — the most common cheap
+  USB-RS485 type — have no serial number, so `/dev/serial/by-id/` cannot tell two of them
+  apart and `/dev/ttyUSBn` numbering swaps between reboots. `by-path` is the right choice
+  for those. This makes it easy to configure two entries that unknowingly point at the same
+  adapter.
+
+---
+
+## v1.7.2 (pre-release, withdrawn)
+
+Issues: #384
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **Serial connection sharing now recognises the same adapter under different path names.**
+  One USB adapter answers to `/dev/ttyUSB2`, `/dev/serial/by-id/...` and
+  `/dev/serial/by-path/...` at once, and the setup wizard recommends the by-id form — so two
+  entries can name one physical port differently. v1.7.0 keyed on the configured path, gave
+  them separate connections and let them collide on the same bus, which is the exact problem
+  it was meant to prevent. Paths are now resolved before matching. **Only affects setups with
+  two or more entries on one adapter.** (#384)
+
+---
+
+## v1.7.1 (pre-release, withdrawn)
+
+Issues: #389
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **The register scanner now falls back to single-register reads when a gateway refuses
+  blocks.** It read 125 registers per request and never tried anything smaller, so a
+  bandwidth-limited bridge — LoRa gateways especially — returned an error for every register
+  and produced a scan that looked like a dead device. It now detects this on the first failed
+  block, drops to one register per request for the rest of the scan and says so in the log.
+  Slower, but it returns data instead of nothing. Reported by @Henxidou001. (#389)
+
+---
+
+## v1.7.0 (pre-release, withdrawn)
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **Multiple inverters on one USB-RS485 adapter now share a single connection.** Until now
+  each entry opened its own serial client on the same adapter and paced only itself, so two
+  pollers interleaved their frames on one bus with nothing coordinating them — which shows up
+  as random, unexplained read failures on both inverters. Serial entries on the same device
+  path are now serialised behind one lock, the same way TCP entries on the same host:port
+  already were. **Only affects setups with two or more entries on one adapter**; single-entry
+  setups are unchanged, and TCP is untouched.
+
+---
+
+## v1.6.9 (pre-release)
+
+Issues: #384
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **No sensor publishes a zero for a reading it could not take.** v1.6.6 fixed this for the
+  twelve PV sensors; the same defect remained in 57 others, including AC power, AC voltage,
+  grid voltage, load power, temperatures and every energy counter. All of them now go
+  *unknown* for that poll, leaving a gap in history rather than a zero that cannot afterwards
+  be told apart from a real measurement. Genuine zeros are still recorded. Applies to every
+  profile. Reported by @dinkalin-ux. (#384)
+- **Battery charge and discharge power no longer both read 0 W on a failed read**, which was
+  indistinguishable from an idle battery. Derived values — total solar power, per-phase power
+  calculated from voltage and current — now inherit the read state of their inputs.
+- **Changing connection settings no longer logs a blocking-call warning.** Opening the
+  options page on a serial setup enumerated serial ports on the event loop, which Home
+  Assistant reports with a traceback asking you to file a bug. Cosmetic, but noisy. Reported
+  by @dinkalin-ux. (#384)
+
+---
+
+## v1.6.8 (pre-release)
+
+Issues: #384
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **Total Solar Power now goes unknown on a failed read, instead of zero.** v1.6.6 stopped
+  the per-string PV sensors publishing a zero when their block could not be read, but the
+  total is calculated from those strings and was still publishing 0 W - so the headline solar
+  sensor, and the energy-flow cards that read it, kept showing the drop the earlier fix was
+  meant to remove. Applies to every profile. Per-string power on models that report only
+  voltage and current (MIN TL-XH2) is corrected the same way. (#384)
+
+---
+
+## v1.6.7 (pre-release)
+
+Issues: #386
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **SPH time-slot entities are now named after the slot the inverter actually uses.** The
+  three Grid First slots displayed as "Grid First Period 7/8/9" but are slots **1, 2 and 3**
+  in the Growatt app and in the protocol, and the Battery First slots displayed as "AC Charge
+  Time Period" with no indication of which app group they belonged to. Entity IDs are
+  unchanged, so automations keep working - only the displayed names are corrected. Reported
+  by @Vict20. (#386)
+
+---
+
+## v1.6.6 (pre-release)
+
+Issues: #361, #384, #385
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **A failed read no longer publishes a solar reading of zero.** When a Modbus block read
+  failed, the registers behind it were reported as 0 rather than as missing - so a single
+  dropped frame put a vertical drop to 0 W in the solar graph, recovering on the next poll,
+  with no error anywhere. PV voltage, current and power now go *unknown* for that poll
+  instead, leaving a gap in history rather than a zero that cannot afterwards be told apart
+  from a real measurement. A genuine zero is still recorded. Reported by @dinkalin-ux. (#384)
+- **MIN TL-XH2 now reports inverter temperature.** That model answers Illegal Function
+  across the base register range, which is where every other profile reads this from, so it
+  had no temperature source at all. It now uses VPP register 31114. Reported by
+  @Richardmarkink. (#361)
+- **Setting a control to the value it already has no longer writes to the inverter.** These
+  registers are held in EEPROM, which has a finite number of write cycles. Nothing polls or
+  writes on its own, but an automation re-applying the same value on a schedule used to burn
+  a cycle every run for no effect. Raised by @dinkalin-ux. (#384)
+- **A wrong protocol variant can now be corrected without deleting the integration.** Ten
+  inverter families exist as two register maps, chosen by auto-detection at setup. When that
+  choice was wrong there was no way back - the profile list shows one name for both, and
+  re-selecting it resolved through the same setting that was already wrong. The Configure
+  page now has a **Protocol variant** field (Auto / Legacy V1.39 / VPP V2.01), and names the
+  register map currently loaded. Leaving it on Auto changes nothing. (#385)
+
+---
+
+## v1.6.5 (pre-release)
+
+Issues: #353
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **WIT grid charging now works on models that reject Write Single Register.** Register
+  30410 (VPP AC charge enable) accepts only FC 0x10 on some WIT hardware. The write was
+  attempted with FC 0x06, and a refusal was logged as a warning and stepped over - so every
+  other register in the mode sequence succeeded and grid charging silently never engaged.
+  It now falls back to FC 0x10 when FC 0x06 is refused, and reports a real failure when
+  neither works. Reported by @jekmanis. (#353)
+- Documentation: register 30476 (WIT priority mode) is no longer described as read-only. It
+  is writable on some models - the integration's TOU Default Mode control writes it - and
+  the guide now says so rather than telling people not to try. (#353)
+
+---
+
+## v1.6.4 (pre-release)
+
+Issues: #377, #383, #384
+
+> **Pre-release for testing.** v1.6.2 remains the stable release.
+
+- **SPH V2.01 profiles now read battery energy on hardware without VPP support.** "SPH
+  (3-6kW)" resolves to the V2.01 variant on many entries, and a V1.39 inverter on that
+  profile never reads the 31000 range - so Battery Charge/Discharge Today and Total showed a
+  permanent 0.0 while voltage and SOC worked. Reported by @igotyou. (#377)
+- **Two new SPF controls, disabled by default: Bulk and Float Charge Voltage.** 48.0-58.4 V,
+  available only on a self-defined battery type. Created disabled because an in-range but
+  wrong value affects your battery rather than a reading - enable them under the
+  integration's entities list if you want them. Requested by @dinkalin-ux. (#384)
+
+- **SPH V2.01 profiles now read battery energy on hardware without VPP support.** "SPH
+  (3-6kW)" resolves to the V2.01 variant on many entries, and a V1.39 inverter on that
+  profile never reads the 31000 range - so Battery Charge/Discharge Today and Total showed a
+  permanent 0.0 while voltage and SOC worked. The 1000-range registers now carry the name
+  the integration looks for, with the VPP block as the fallback. Reported by @igotyou. (#377)
+- **Connection settings can be changed after setup.** The USB/serial port, baud rate, host
+  and TCP port are now editable from the integration's Configure page. Previously the only
+  way to change them was to delete the entry and add it again, which loses entity IDs and
+  with them automations, dashboards and statistics history. Requested by @dartyukh-afk. (#383)
+- **The serial port picker now offers `/dev/serial/by-id/` paths and marks them as stable.**
+  These are tied to the adapter's own serial number, so they survive a reboot; `/dev/ttyUSB0`
+  is assigned in plug order and can move to a different device when more than one USB serial
+  adapter is attached. (#383)
+
+---
+
+## v1.6.3 (pre-release)
+
+Issues: #376, #377, #378, #379, #381
+
+> **Pre-release for testing.** v1.6.2 remains the stable release and is unaffected by
+> everything below. Most of this is SPH and SPF work that does not touch the write-path
+> changes in v1.6.2.
+
+- **SPH 3-6kW and 7-10kW now report battery charge and discharge energy.** Charge/Discharge
+  Today and Total published a constant 0 on these profiles because the registers were never
+  mapped. Load consumption energy arrives at the same time. Reported by @igotyou, confirmed
+  against ShinePhone. (#377)
+- **New control on SPF 3000-6000 ES Plus: Max Charge Current.** The total charging current
+  across solar and utility, 10-100 A. It is unavailable when Battery Type is Lithium, which
+  is a state the inverter does not allow it to be set in. Reported by @dinkalin-ux, range
+  taken from the SPF 6000ES Plus manual. (#376)
+- **Three-string MOD, MID and SPH 7-10kW systems no longer under-report daily solar.** PV3
+  had no energy counter in the register map, and the daily solar figure is the sum of the
+  per-string counters — so a whole string was missing from it. On a MID 25KTL3-XH that was
+  17.6 kWh against the portal's 29.5. PV3 Energy Today and Total also start reporting.
+  Reported by @as-wallpen, register addresses derived and confirmed with @KevlarD-67. (#381)
+- **Register scans now name the register map instead of reporting UNKNOWN.** Affected any
+  device identified by DTC, which is most of them. Diagnostic output only — no change to how
+  the integration runs. (#379)
+- SPH V2.01 profiles had registers 1052-1055 labelled as grid import, which is battery
+  discharge energy; grid import was already mapped correctly elsewhere in the same profiles.
+  No entity changes. (#378)
+
+---
+
+## v1.6.2
+
+Issues: #331, #375, #380
+
+> **First stable release of the 1.6 line.** v1.6.0 and v1.6.1 were pre-releases, so if you
+> are coming from v1.5.5 you are getting all three at once — their notes are below and
+> worth reading, particularly if you have a MOD or MID TL3-XH.
+
+- **Writes now recover from a dropped socket, as reads already did.** On a gateway or
+  datalogger that closes idle connections, the first write after a drop failed and the
+  control silently did not take effect, while the first read after a drop retried and
+  succeeded. Reported by @alanmk. (#375)
+- **WIT Mode (VPP) now applies as one operation.** Setting Hold, Charge or Discharge writes
+  six to eight registers, and a poll could previously land between them — leaving the
+  inverter with control authority granted but no power setpoint, or a schedule with no
+  period count. The sequence now holds the connection from first write to last, so it
+  either applies completely or fails without starting. Reported by @Wojak129, and
+  diagnosed from @rine77's description of the symptom. (#331)
+- **Peak-shaving limits stay unavailable until they are configured.** On MOD and MID
+  TL3-XH, Import Limit, Export Limit and AC Charge Max Power previously showed 3000 kW or
+  6553.5 kW on systems where peak shaving had never been set up in the portal. An
+  unavailable entity here now means "not configured", not a connection problem. Reserve SOC
+  is unaffected and still always shown. Reported by @as-wallpen. (#380)
+
+Two limits are unchanged and now documented in the [WIT guide](https://0xaha.github.io/Growatt_ModbusTCP/controls/wit-guide/):
+a write can still wait behind a running poll, and Mode (VPP) reports the last command sent
+rather than reading the inverter back.
+
+Also in this release: the MOD TL3-XH profile note on grid import now records that
+`power_to_user` (3041/3042) does track sustained grid import on that model, corrected
+against 637 logged samples from @KevlarD-67. Documentation only — no entity changes. (#373)
+
+---
+
+## v1.6.1 (pre-release)
+
+Issues: #374
+
+> **Fixes a defect in the v1.6.0 pre-release.** If you installed v1.6.0 on a MOD or MID
+> TL3-XH, please take this one — v1.5.5 remains the stable release and was never affected.
+
+- **Five writable VPP controls appeared on MOD TL3-XH in v1.6.0 and should not have.**
+  Control Authority, Remote Power Control, Remote Duration, Remote Charge/Discharge Power
+  and VPP AC Charge Enable were created as operable entities, including a −100…+100 %
+  power slider. v1.6.0 marked those registers read-only in the profile, but nothing read
+  that flag.
+
+  They are removed on upgrade. Nothing was written to them and they were all at their safe
+  values; the exposure is what is being fixed.
+
+- **A profile marking a register read-only now withholds the control.** Previously `access`
+  was documentation only. This also removes one pre-existing control — SPE Grid Compliance
+  Region (register 117), which the profile already described as firmware-determined with
+  writes rejected.
+
+- The four VPP diagnostic sensors, the peak-shaving sensors and the Grid Charge Stopped SOC
+  control from v1.6.0 are unaffected and stay.
+
+Reported by @KevlarD-67, with the mechanism traced to the exact line.
+
+---
+
+## v1.6.0 (pre-release)
+
+Issues: #371, #372, #373 — all on MOD/MID TL3-XH
+
+> **This is a pre-release, for testing.** Everything below was measured on a single
+> MOD 10KTL3-XH running DN1.0 firmware. The peak-shaving registers appear in no public
+> Growatt protocol document, so they rest on that one machine alone. If you run a MOD or
+> MID TL3-XH, confirming these values match your Growatt portal would be genuinely useful —
+> please comment on [#372](https://github.com/0xAHA/Growatt_ModbusTCP/issues/372).
+>
+> HACS will not offer this unless you enable beta versions on the integration.
+
+- **Two MOD controls that never worked have been removed.** Charge Power Rate (1090) and
+  AC Charge Enable (1092) reject writes outright on this hardware — the whole holding block
+  1000-1124 is unimplemented. Use **Charge Power Rate (3047)** and **Allow Grid Charge
+  (3049)** instead, both confirmed working. The old entities are removed on upgrade rather
+  than left behind as unavailable; **check any automations that referenced them.**
+- **New control: Grid Charge Stopped SOC.** Caps charging from the grid specifically,
+  separate from Charge Stopped SOC which applies to any source — the lower of the two wins.
+  Growatt exposes it in neither the app nor the portal, and on the reporting system it
+  silently held grid charging at 55% for two days while the general limit read 100%.
+- **New diagnostic sensors: Import Limit, Export Limit, Peak Shaving Reserve SOC, AC Charge
+  Max Power.** Peak-shaving settings configured in the Growatt portal, previously invisible.
+- **VPP remote power control state is now visible on MOD** (disabled by default): Control
+  Authority, Remote Power Control, Commanded Power and Last Setpoint. Read-only for now —
+  the commanded power is a target rather than a cap and will import from the grid to reach
+  it even with grid charging disabled, so writable controls need a guard first.
+- Controls dropped from a profile are now removed from Home Assistant rather than lingering
+  as unavailable, matching the behaviour sensors have had since v1.5.4.
+
+All three issues were reported by @KevlarD-67 with hardware measurements — A/B writes on one
+connection, portal round-trips, and full before/after register snapshots.
+
+---
+
+## v1.5.5
+
+Issues: #360, #370
+
+- **VPP control entities no longer freeze after a single failed read.** Control Authority,
+  VPP Export Limit and Remote Power Control (registers 30100, 30200-30201, 30407-30410)
+  were skipped for the rest of the session after one unanswered read, so the entity kept
+  reporting its last value indefinitely. They now retry every 5 minutes, matching the
+  behaviour already used for the VPP input ranges. Affects WIT and other VPP-capable
+  models. Diagnosed by @Svetlonos76.
+- **New block size option: 5 registers.** For gateways that reject 10-register reads but
+  manage smaller ones — previously the only working choice was 1 register, which on a
+  large profile means ~216 reads per poll. Settings → Devices & Services → Growatt Modbus
+  → Configure → Max Register Block Size. Found by @Xybertecnic.
+- **A repair notice now appears if your configured inverter model no longer exists.**
+  Previously it fell back to a MIN 7-10kW profile silently, and most sensors would be
+  missing or stuck at zero with nothing to explain why. Mainly affects anyone who has
+  hand-edited a profile file, which an update then replaces.
+- The register scanner now offers the same block sizes as the integration (125, 50, 25,
+  10, 5, 1), so a scan can reproduce what the poller is doing.
+- Diagnostics now report suppressed VPP holding blocks alongside suppressed input ranges.
+
+---
+
+## v1.5.4
+
+Issues: #360, #362
+
+- **Removed sensors now disappear instead of showing `unavailable`.** If v1.5.3 left you
+  with a DC-DC Temperature entity stuck as unavailable, upgrading clears it.
+- Stale entities are now cleared based on the active profile, so sensors dropped in future
+  releases tidy up after themselves.
+
+---
+
+## v1.5.3
+
+Issues: #360, #362
+
+**Coming from v1.5.1?** v1.5.2 was a pre-release, so you get its changes too — see below.
+
+- **DC-DC Temperature no longer appears on models that don't have the sensor.** It was
+  reporting 0.0 °C on MIN, SPH, SPH-TL3, WIT and TL-XH. MOD, MID, SPF and SPE keep theirs —
+  those are real readings.
+- **SPH-TL3 and SPA-TL3 gain IPM and Boost temperature** (registers 94/95). Both were
+  present but unmapped, so both read 0.0 °C.
+- **SPA-TL3 regains Energy Today and Energy Total** — confirmed on hardware, not the solar
+  generation figures they were mistaken for.
+
+---
+
+## v1.5.2
+
+Issues: #360, #362
+
+- **Scanning a disabled integration now keeps your tuned settings.** Select your inverter
+  under **Config entry** rather than typing the host and port, and the scan inherits your
+  slave ID, Modbus delay and block size. Typing the connection by hand still starts from
+  defaults, which a sensitive gateway may not tolerate. Reported by @Xybertecnic.
+- **New profile: SPA-TL3 (AC Storage, 3-Phase) 4-10kW**, selected automatically by
+  DTC 3725. Both SPA options now state their phase count, so the choice no longer depends
+  on knowing which register range your model serves.
+  - If your SPA-TL3 was auto-detected onto SPH-TL3, its PV entities disappear on
+    upgrade. They only ever reported zero.
+- **`Charge Stopped SOC (Battery First)` renamed to `Charge Stopped SOC`.** Register 3048
+  also governs charging under Load Priority, so the old name suggested it could be ignored
+  outside Battery First. Entity IDs are unchanged. Measured and reported by @as-wallpen.
+- **SPA gains AC current, output power, inverter status, AC energy and temperatures** from
+  the 2000-2124 range. These come from the protocol and have not yet been read on a device —
+  a scan from a single-phase SPA would confirm them. AC voltage and frequency keep their
+  existing measured registers. Three-phase SPA-TL3 is unaffected.
+- **The "settings are being reverted" notice** now points at Growatt's cloud pushing
+  settings down — remote control or a schedule set in the ShinePhone app — rather than a
+  connected dongle on its own.
+- **New: `tools/protocol_coverage.py`**, which reports registers the protocol documents
+  that no profile maps. Also corrects the range summary, which listed 2000-2124 as SPH
+  rather than SPA.
+
+---
+
+## v1.5.1
+
+Issues: #360
+
+- **Fix: the register scanner returned almost nothing on slower gateways.**
+  The scanner uses its own Modbus client, separate from the one that does the polling —
+  and unlike the poller it never paused between reads. It sent requests as fast as the
+  socket accepted them.
+
+  On an adapter that needs settling time between requests, that meant nearly every read in
+  the scan failed. The resulting CSV looked like a dead inverter, on a system whose sensors
+  were updating perfectly well a moment earlier. One user got two consecutive scans back
+  with a handful of usable rows out of more than a thousand.
+
+  The scan now paces itself using the same **Modbus delay** already configured for your
+  inverter, since that value is tuned to what your gateway tolerates. The pacing used is
+  recorded in the scan file so it is visible in any report.
+
+  Scans on slow links will take noticeably longer than before. That is the fix working —
+  the previous speed was the cause of the empty results.
+
+  Reported by @Xybertecnic, whose scans kept coming back empty while the integration itself
+  ran fine — a contradiction that turned out to be entirely our doing.
+
+---
+
+## v1.5.0
+
+Issues: #360, #362, #367
+
+> ### Some control entities are renamed
+>
+> Twelve number, select and time entities gain the sub-device they belong to in their
+> displayed name — **"Growatt Battery Work Mode"** rather than "Growatt Work Mode".
+>
+> **Nothing breaks.** Entity IDs live in Home Assistant's registry and do not change, so
+> automations, scripts, template sensors and dashboard cards keep working exactly as they
+> are. Only the label shown in the UI moves. If you search for a control by name and don't
+> recognise it, look for the sub-device word.
+>
+> This also fixes WIT inverters showing **"Growatt Growatt TOU Period 1 Start"** — the
+> device name was being applied twice.
+
+### Problems now surfaced in the UI instead of the log
+
+Two conditions used to leave users running a degraded setup with no way to know. Both now
+appear under **Settings → Repairs**.
+
+- **Settings being reverted.** Local changes that the inverter silently discards — usually
+  a ShineWiFi dongle restoring cloud settings, sometimes a prerequisite that isn't enabled.
+  Previously a notification that scrolled away; a repair persists until the cause is fixed.
+
+- **An RS485 gateway returning mismatched responses.** Some adapters answer a request with
+  a complete, valid response to an *earlier* one. Since v1.3.7 these are discarded, so your
+  data stays correct — but the reads are lost and the only evidence was a log line. One
+  reporter's gateway was doing this on roughly one poll in three and only found out by
+  reading logs. Raised once per session at 5% or more across at least 200 reads, with the
+  gateway address and rate, linking [the gateway guide](docs/troubleshooting/rs485-gateways.md).
+
+### Sensor names can now be translated
+
+All 169 sensor names moved out of Python and into the translation files. The integration
+already shipped 22 languages, but they only covered the setup and options screens — sensor
+names were hardcoded English regardless of your Home Assistant language. Other languages
+can now be contributed without touching code.
+
+English text is unchanged, and a test asserts that by comparing every string against the
+original definitions.
+
+### Model identification
+
+- **DTC 5001 and 5002 corrected.** `MID 33-36KTL3-X(Pro.E)` and `MID 3-33KTL3-X3` were
+  documented under 5002; they belong to 5001. In Growatt's table those two rows fall at the
+  top of the next page under a merged cell, so they read as 5002 unless you check where the
+  merge begins. The corrected split is also the sensible one — 5001 is every MID model,
+  5002 every MOD.
+
+- **The MAX / MAX-X family was missing** from the published protocol page along with DTC
+  3501 and 5401, and `3735` was named "SPA 3000-6000TL BL" where the specification says
+  "SPA 3000TL BL-UP". That page held its own copy of the table, a fourth alongside two code
+  modules and the troubleshooting page. All four now derive from one registry, three of them
+  enforced by tests.
+
+### Internal
+
+- **Every entity now shares one base class.** Twenty classes each carried their own unique
+  ID, device assignment and naming flag, and the copies had drifted into two conventions at
+  once. Consolidating them is what exposed the naming inconsistency above.
+
+- **Contributor documentation** gained twelve verification rules drawn from real defects —
+  check the protocol documents before inferring a register, state which register space you
+  mean, and treat "Read OK" as evidence the address responded rather than that the value
+  means anything.
+
+---
+
+## v1.4.1
+
+Issues: #362
+
+Fixes a v1.4.0 regression and two older bugs it exposed. Reported by @as-wallpen, who
+noticed the symptom rather than the absence.
+
+- **Fix: MOD / MID Battery Temperature reported 0.0 °C instead of disappearing.**
+  v1.4.0 identified register 3176 as the DC-DC converter stage and removed it as a
+  battery reading, but the sensor kept being created and fell back to its default. The
+  result was worse than the bug being fixed: a dashboard showed a battery sitting at
+  freezing rather than a sensor that no longer existed.
+
+  The sensor's condition is `hasattr(data, 'battery_temp')`, which reads like "only if
+  the profile provides it" — but `battery_temp` is a dataclass field with a `0.0`
+  default, so the attribute always exists and the gate can never fail. It is now excluded
+  from the MOD/MID sensor sets, which is the only filter that actually applies.
+
+- **Fix: entity cleanup never ran, at all.** Three cleanup blocks were gated on
+  `coordinator.data.serial_number` being populated during setup. That check can never
+  pass: `async_config_entry_first_refresh()` deliberately does not contact the inverter
+  (#262) — it seeds an empty placeholder and defers the real poll to a background task
+  that runs after setup returns. So every removal was dead code, and had been since that
+  change. Two of the three predate v1.4.0.
+
+  The profile-based cleanups need no live data — whether a register is in the profile is
+  a static fact — so they now run unconditionally. The two VPP cleanups genuinely do need
+  a live read, and now run once on the first poll that reaches the inverter.
+
+  If you are on MOD/MID, the stale **Battery Temperature**, **Charge Stopped SOC** and
+  **Discharge Stopped SOC** entities will be removed on next startup.
+
+- **Fix: the profile-based cleanup read the wrong dictionary.** It looked for
+  `holding_registers` on the profile metadata, where the register map is only a name.
+  Resolved through `REGISTER_MAPS` now.
+
+- **Testing: 31 sensor conditions were found to be decorative.** A `hasattr()` gate is
+  only meaningful for attributes set dynamically; against a dataclass field it always
+  passes. Most are harmless, because the profiles listing them also define the register —
+  but they are now enumerated, and a test fails if a new one appears or an existing one
+  silently stops being one. Adding a gate that cannot fail is now a deliberate act.
+
+---
+
+## v1.4.0
+
+Issues: #360, #362, #367
+
+Includes everything from the v1.3.7 pre-release.
+
+> ### ⚠️ MOD / MID owners: three entity changes
+>
+> - **Battery Temperature is removed.** Register 3176 turned out to be `Bdc1Temp1` — the
+>   DC-DC converter stage inside the inverter, not the battery. It now appears as
+>   **DC-DC Temperature**. There is no replacement: on these systems the BMS does not
+>   publish a cell temperature over Modbus.
+> - **Charge Stopped SOC / Discharge Stopped SOC are removed.** Registers 1071 and 1091
+>   accept writes and silently ignore them on this hardware. Use **Charge Stopped SOC
+>   (Battery First)** and **Discharge Stopped SOC**, which are confirmed working.
+> - **"Grid First Discharge Stopped SOC" is now "Discharge Stopped SOC"** — the entity ID
+>   is unchanged, so automations keep working.
+>
+> The old entities are removed from the registry automatically on startup.
+
+### Data integrity
+
+- **Malformed Modbus responses are no longer written to the register cache** *(from
+  v1.3.7)*. Register blocks are stored positionally, so a short response — or a stale
+  frame belonging to a different request — had its words written onto registers they
+  never belonged to. The result was a plausible-looking wrong number: @tdalejandro
+  decoded their own corrupt readings and found the ASCII `"32ST"`, four characters of the
+  inverter's serial number, published as **85,893,614.8 W** of AC power. The non-shared
+  read path had checked response length since v1.3.5, but a hub is created for *every*
+  TCP entry, so that guard only ever covered serial/RTU users.
+
+  On a marginal gateway this converts polls that were silently producing wrong values
+  into polls that visibly fail, so your failure count may go **up**. That is the fix
+  working.
+
+  **The guard checks `!= count`, not `< count`, and that turns out to be the whole
+  fix.** Every mismatch measured in the field came back **longer** than requested —
+  31 of them, 30 returning exactly 125 registers whatever was asked for. A length check
+  for *short* responses would have caught **none of them**. The failure is not a
+  truncated frame: it is a complete, valid response to an *earlier* request being
+  replayed to the current one. @tdalejandro proposed the `!=` and then measured the data
+  that showed it was doing all the work.
+
+- **Which gateways are affected.** Two independent setups now bracket this. A Waveshare
+  RS485 TO POE ETH (B) doing genuine Modbus-TCP-to-RTU translation showed **zero**
+  mismatches and 26 days of clean statistics from *before* the guard existed — so on good
+  hardware there was never anything to catch. A ShineWiFi-class serial bridge mismatches
+  roughly one poll in three. A persistent socket is not the cause: the clean setup uses
+  the same shared connection and the same 60 s interval. See
+  [RS485 gateways](docs/troubleshooting/rs485-gateways.md).
+
+- **The adaptive backoff never engaged on TCP connections** *(from v1.3.7)*. The shared
+  path returned before reaching the failure counters.
+
+### Detection
+
+- **MIN inverters were being detected as MIC.** DTC 5200 covers both families in
+  Growatt's own table, so a probe of registers 59-62 decides between them — and it
+  accepted any non-zero value as plausible daily energy. A MIN 5000TL-X2 matched on the
+  first test and ran on the MIC profile with 23 entities instead of 41, while a valid
+  register was rejected every poll for looking implausible as a daily total. Reported and
+  diagnosed by @tdalejandro.
+
+- **Unconfirmed profile mappings now say so.** Every DTC entry records whether its
+  mapping has been verified against real hardware. Previously any known DTC reported
+  "Very High" confidence, which conflated two different things: the DTC identifies the
+  *model* reliably, but the *profile* behind it may never have been tested. An SPA owner
+  was told Very High while running an SPH profile that gave PV entities to a device with
+  no solar inputs. Unconfirmed mappings now warn in the log and are marked in the
+  register scanner and the [DTC documentation](docs/troubleshooting/dtc-debugging.md).
+
+- **Added the MAX / MAX-X family** (DTC 5000, 5500, 5501, 5502), which was missing
+  entirely. Checked against Growatt VPP 2.03 Table 3-1.
+
+### New data
+
+- **SPA and SPH-TL3 gain BMS sensors**: State of Health, cycle count, BMS status and BMS
+  error (registers 1083/1085/1095/1096). These are documented V1.39 registers that were
+  simply never implemented for these profiles. **SOH is register 1096** — not 31218, as
+  previously stated on #360.
+
+- **The register scanner now covers 2000-2124.** The storage protocol gives SPA a second
+  input block there that SPH does not have, and no scan had ever included it.
+
+### Fixes
+
+- **Options no longer lost when saving.** The options flow replaced the stored dict with
+  whatever the form submitted, so any setting without a UI field — `inter_slave_delay` —
+  reverted to its default whenever any other option was changed.
+
+- **Register 3136 was defined twice in the MIN TL-XH profile.** Python keeps the last
+  value silently, so a temperature mapping had never existed at runtime. A test now
+  parses the profile sources to catch duplicate register addresses, which cannot be seen
+  after import.
+
+### Confirmed on hardware
+
+The integration-quality work from v1.3.0-v1.3.2 — the `runtime_data` migration, the
+shared entity base class, the diagnostics platform and `PARALLEL_UPDATES` — shipped as
+pre-releases because there was no way to verify it locally. A MID 25KTL3-XH owner ran the
+full checklist on a direct v1.3.0 → v1.3.7 upgrade ([#367](https://github.com/0xAHA/Growatt_ModbusTCP/issues/367)):
+
+- **89 of 89 sensors populated**, none unavailable, plus 9 number and 21 select entities
+- **Writes verified** — discharge rate 100 → 99 → 100, `verified_state` on both, value read
+  back in the same poll cycle, no reversion under `PARALLEL_UPDATES = 1`
+- **Register scanner** — 2300 registers across 17 ranges, 523 non-zero, zero read errors
+- **Diagnostics download** — 7235 bytes across client / coordinator / data / entry /
+  shared_connection
+- **Entity history intact**, which was the real risk in the entity refactor: `energy_total`
+  runs unbroken from 139.3 kWh on 9 July to 2512.7 kWh, monotonic, with no reset at the
+  upgrade point. The `unique_id`s really are byte-identical.
+
+One upgrade note from that report: Home Assistant returned 502 for roughly two minutes
+after restart on a large instance (~1100 entities) before coming back cleanly. Probably
+unrelated to this integration, but worth knowing before anyone reaches for a rollback too
+early.
+
+### Not changed, deliberately
+
+- **No plausibility bound on decoded values.** It was proposed as a second line of
+  defence, but after 48 hours on the response-length guard @tdalejandro measured zero
+  impossible values and recommended against the extra complexity. A stale frame that
+  happens to match the requested length would still slip through — that residual is now
+  accepted knowingly rather than unknowingly.
+
+- **`battery_temp` on MIN TL-XH.** The same register 3176 is very likely the DC-DC stage
+  there too, but no TL-XH owner has compared it against their BMS, and changing it on
+  another model's evidence is what this release exists to avoid.
+
+---
+
+## v1.3.7 (pre-release)
+
+Issues: #367
+
+> **Pre-release.** This changes what happens when a Modbus read comes back malformed —
+> from "use it anyway" to "discard it". On a marginal RS485 gateway that will convert
+> polls that were *silently producing wrong values* into polls that visibly fail. That is
+> the correct trade, but the failure count in your log may go **up**. That is the fix
+> working, not a new fault.
+
+- **Fix: malformed responses were written into the register cache on all TCP setups.**
+  Register blocks are stored positionally — the first returned word is assumed to be the
+  block's start address. When a response came back short, or was a stale frame belonging
+  to a different request, its words were still written sequentially from the start
+  address, landing on registers they never belonged to.
+
+  The result was not a missing sensor but a *plausible-looking wrong number*. @tdalejandro
+  decoded their own corrupt readings and found `0x33325354` — the ASCII `"32ST"`, four
+  characters of the inverter's serial number — published as **85,893,614.8 W** of AC
+  power, and the firmware version string published as PV2 power. Because
+  `total_increasing` energy sensors are affected too, those values entered long-term
+  statistics.
+
+  The non-shared read path has validated response length since v1.3.5. The shared hub did
+  not — and since a hub is created for **every** TCP entry, not only ones genuinely
+  sharing a gateway, that guard in practice only ever protected serial/RTU users. The
+  exposed group was everyone on TCP.
+
+  Diagnosed by @tdalejandro, including the proposed fix, which is what shipped.
+
+- **A response *longer* than requested is now rejected too.**
+  The existing guard tested `< count`. An over-long response is an equally strong sign of
+  a misaligned or stale frame and costs nothing to catch, so the check is `!= count`.
+
+- **Fix: the adaptive backoff never engaged on TCP connections.**
+  The shared path returned before reaching the read-failure counters, so
+  `_consecutive_read_failures` never moved for any TCP entry and the slow-poll backoff
+  after repeated failures could not trigger. Found while fixing the above — the same
+  guard-on-one-path-only pattern.
+
+- **A detected misalignment now drains the receive buffer.**
+  A misaligned stream stays misaligned, which is why the corrupt values repeated
+  byte-for-byte instead of varying. Draining on detection gives the next read a clean
+  start rather than inheriting the same offset.
+
+- **Testing:** 15 new tests covering the guard, including the reporter's exact
+  serial-number frame. Verified by disabling the guard and confirming they fail.
+
+---
+
+## v1.3.6
+
+Issues: #367
+
+**Update promptly if you set the Max Register Block Size option on v1.3.5.**
+
+- **Fix: saving the block-size option took every entity unavailable on some setups.**
+  v1.3.5 changed the options flow to store the block size as a label (`"25 registers"`)
+  and updated the parsing in the shared-connection path only. The other fetch path still
+  called `int()` on it, which raised `ValueError` on every poll. That includes
+  **"Auto (recommended)"** — a truthy string, so it never hit the fallback either.
+
+  The error was caught by the retry loop rather than crashing Home Assistant, so the
+  visible symptom was every sensor going unavailable with `Error during data fetch` in
+  the log. It triggered on *any* options save, because the field is required.
+
+  Affected: entries **not** using a shared connection — serial/RTU, or TCP entries that
+  don't share a host:port with another entry. Shared-connection setups were unaffected.
+
+  Reported by @tdalejandro, who diffed the two call sites and identified the exact cause.
+
+- **Internal: the two fetch paths no longer duplicate their option handling.**
+  The blocks were byte-identical apart from the two lines above, which is how they drifted
+  out of sync in the first place. Both now call one `_apply_client_options()`.
+
+- **Testing: replaced the test that should have caught this.**
+  The old one asserted `resolve_block_size(stored_value) == 25` — it called the helper on
+  its own output, proving only that the helper worked, and stayed green throughout. It now
+  drives the coordinator and checks what actually reaches the client, across every offered
+  block-size label.
+
+---
+
+## v1.3.5
+
+Issues: #360, #367
+
+- **Fix: the "Max Register Block Size" option could never be saved.**
+  Reported as two different symptoms: @Xybertecnic saw a dropdown with **nothing
+  selected** that failed when changed, and @tdalejandro found the option had **zero
+  effect** on read behaviour. Same cause.
+
+  The selector shipped in v1.2.0 as `vol.In({0: "Auto", 25: "25 registers", ...})` — a
+  dict keyed by integers, with `default=0`. It is now a list of string labels with a
+  label default, matching every other selector in the same form.
+
+  **The read path was always wired correctly.** `_block_size_override` reaches the
+  decoder exactly as intended; the option simply never got as far as being stored. That
+  is why the code inspection I offered on #367 looked right and the behaviour was still
+  wrong.
+
+  Existing entries do not need migrating — the resolver accepts both the label form and
+  any integer a previous version managed to persist.
+
+  **If you set this option on v1.2.0-v1.3.4, please set it again.** It almost certainly
+  did not take effect.
+
+- **On the exact mechanism:** two explanations fit — integer dict keys not round-tripping
+  through the frontend, or `default=0` being falsy so the field rendered unselected and a
+  Required field with no value refused to submit. I could not distinguish them without a
+  running Home Assistant, and the fix addresses both. Worth stating plainly rather than
+  asserting a cause I could not verify.
+
+  Notably `config_flow.py` also has an integer-keyed **baudrate** selector that has
+  shipped for many releases and appears to work — which is what makes the first
+  explanation doubtful. It is deliberately left alone.
+
+- **21 new tests** covering the option resolver and the selector's shape, including
+  integers from the broken versions and junk values falling back to Auto rather than
+  raising.
+
+---
+
+## v1.3.4
+
+Issues: #367
+
+- **Fix: a truncated read could fabricate physically impossible values and write them into
+  long-term statistics.**
+  Reported by @tdalejandro with unusually good evidence — `pv1_power` published as
+  **65,536,000 W**, `pv2_power` as **109,544,683 W**, and the same values recurring
+  byte-for-byte 14 hours apart. That repetition is what identified the cause.
+
+  Decoded as 32-bit pairs, two of the three impossible values had a low word of *exactly
+  zero*. The decoder was substituting `0` for a pair register missing from the read cache,
+  so a truncated block that captured the high word and not the low word decoded as
+  `high << 16` — a high word of 10000 becoming 65,536,000 W.
+
+  The protocol leaves no ambiguity here: `UINT32`/`INT32` are defined as "high word first,
+  low word last", and every 32-bit entry in the register table declares a length of 2. A
+  32-bit value always occupies both registers, so a missing partner cannot mean zero — it
+  means the read did not complete. The decoder now returns no value in that case.
+
+  This is protocol-level rather than profile-specific, so it applies to every 32-bit
+  register across every profile.
+
+  **What changes for you:** nothing, unless your gateway is truncating responses. Values
+  that previously appeared as millions of watts will now read 0 for that poll instead.
+  Still not ideal, but it no longer corrupts Energy Dashboard history — which is
+  permanent, and has to be repaired by hand.
+
+- **Note:** if you already have corrupted hourly statistics, Developer Tools → Statistics
+  can correct the affected means without touching the database.
+
+- **Known remaining:** five call sites in the WIT battery-power path use the same
+  substitution. They are not fixed here because in that code `pair_addr` may legitimately
+  be `None` — meaning the profile genuinely has no high word — which is a different case
+  from "the register exists but wasn't read". Separating those safely needs a WIT owner to
+  verify, given that path's history in #247 and #323.
+
+---
+
+## v1.3.3
+
+Issues: #361
+
+- **Fix: four wrong register mappings in the MIN TL-XH2 profile.**
+  Checked against the Growatt VPP protocol specification and a field scan from
+  @Richardmarkink. Three of the four were inherited from the first-generation MIN TL-XH
+  profile rather than introduced by me, but all four shipped in v1.2.1.
+
+  | Register | Was | Actually |
+  |---|---|---|
+  | 31204/31205 | charge power (W) | **cumulative charge energy (kWh)** |
+  | 31208/31209 | discharge power (W) | **cumulative discharge energy (kWh)** |
+  | 31215 | battery current, single INT16 | **INT32 spanning 31215-31216** |
+  | 31222 | battery temperature | reserved — temperature is at **31223** |
+
+  The energy ones are unambiguous once the values are read as kWh: the field scan gives
+  4.0 and 5.3 kWh daily, 37.9 and 29.2 kWh cumulative, on a system with 72.7 kWh of
+  lifetime generation. As watts — 37.9 W, 29.2 W — they are nonsense.
+
+  The current one is the same defect reported for WIT in **#247**, where −27.4 A appeared
+  as −0.1 A. Reading an INT32 as INT16 returns only the high word, which is ~0 for any
+  normal current. Verified here: battery power 2012 W over 403.7 V is 4.98 A, and 31216
+  reads 49 → 4.9 A.
+
+- **Known gap: battery temperature may still read 0 on TL-XH2.** The specification puts it
+  at 31223, which is what this release uses — but that register reads 0 on the MIN
+  4200TL-XH2, while 31224 ("reserved for maximum battery temperature") reads 36.5 °C.
+  Mapping the reserved register on a hunch is how the earlier mistakes happened, so it is
+  left alone pending a comparison against the app.
+
+- **PV generation energy counters are not exposed over VPP at all.** The VPP input
+  register table ends at 31599 and contains only *battery* energy — there is no Etotal or
+  Etoday. That is why a scan taken while the inverter displayed 72.7 kWh / 7.5 kWh matched
+  no register. Those sensors cannot be provided for VPP-only hardware from this range.
+
+---
+
+## v1.3.2
+
+> ⚠️ **Pre-release.** Changes how every sensor entity is constructed. Please confirm the
+> integration loads and your sensors still have values before this is promoted.
+
+Completes the `common-modules` Bronze rule. **No user-facing behaviour changes intended.**
+
+- **New `GrowattEntity` base class.**
+  Every entity repeated the same three things: storing the config entry, composing a
+  unique ID as `{entry_id}_{key}`, and returning `coordinator.get_device_info(...)`.
+  That last one existed **22 times**, differing only in how the device type was derived.
+
+  Migrated so far: the sensor platform (one class, ~200 entity instances) and the binary
+  sensor. The 20 control classes in `number.py`, `select.py` and `time.py` are unchanged
+  and still inherit `CoordinatorEntity` directly — mixed inheritance is safe, and
+  splitting the migration keeps any failure diagnosable.
+
+  **Unique IDs are unchanged.** Each migrated class passes the same key it used before,
+  so the composed ID is byte-identical. That matters — `unique_id` is the anchor the
+  v0.6.7 entity-ID migration relies on, and changing it would orphan every entity.
+
+- **`available` is deliberately not shared.** Only the sensor platform overrides it,
+  gating on `coordinator.is_online` as well as `last_update_success` so sensors go
+  unavailable rather than holding stale values (#357). Controls should stay settable
+  while a read is failing, so `CoordinatorEntity`'s default is right for them.
+
+### What to check
+
+1. The integration loads and sensors have values.
+2. Entity IDs and history are intact — if unique IDs had changed, entities would appear
+   as new and lose their history. Spot-check one long-running energy sensor.
+
+---
+
+## v1.3.1
+
+> ⚠️ **Pre-release. Please confirm the integration loads before this is promoted.**
+> These are internal plumbing changes that could not be verified locally — Home Assistant
+> is not installed in the development environment, so `py_compile` and the 188-unit
+> test suite are the only automated checks that ran. Neither can tell you whether the
+> integration still *starts*.
+
+Phase 3 of the quality plan. **No user-facing behaviour changes intended** — no sensor,
+entity ID, option or value should differ.
+
+- **Per-entry state moved to `runtime_data`.**
+  The coordinator now lives on the config entry itself rather than in the shared
+  `hass.data[DOMAIN]` dictionary. That dictionary held two unrelated things — the
+  coordinators *and* the cross-entry shared-connection registry — which is why code that
+  walked it needed a defensive "skip anything that isn't a coordinator" check.
+
+  `hass.data[DOMAIN]` now holds only `_connections`, which is genuinely cross-entry and
+  correctly belongs there. Two new helpers in `diagnostic.py` resolve coordinators for the
+  service handlers, which receive an entry id rather than an entry.
+
+  Closes the `runtime-data` and part of the `common-modules` Bronze rules.
+
+- **`PARALLEL_UPDATES` declared on every platform.**
+  `0` for sensor and binary_sensor: they read from one coordinator poll, so throttling them
+  achieves nothing. **`1` for number, select and time** — those *write*, and an RS485 bus
+  cannot carry concurrent transactions. That constraint is why `SharedModbusConnection`
+  holds a lock at all; declaring it stops HA issuing overlapping calls that would only
+  queue on that lock.
+
+### What to check after installing
+
+1. The integration loads and the inverter device appears.
+2. Your sensors have values.
+3. Controls (numbers, selects, time) still write successfully.
+4. The Universal Register Scanner service still runs — its coordinator lookup changed.
+5. Download Diagnostics still produces a file.
+
+If anything fails, roll back to v1.3.0 and say so on the issue tracker — a failure here
+affects everyone, not one profile.
+
+---
+
+## v1.3.0 — Integration Quality Improvements
+
+No user-facing behaviour changes. This release adds a diagnostics download and a test
+suite covering the logic that has caused the most regressions.
+
+- **New: Download Diagnostics**
+
+  *Settings → Devices & Services → Growatt Modbus → ⋮ → Download diagnostics*
+
+  One click produces a JSON file with the config entry and options, the selected
+  profile and register map, coordinator health (online state, consecutive failures,
+  whether slow-poll mode is active), client state (backoff, block size, suppressed
+  ranges), shared-connection state, and the current decoded values. Host, device path
+  and serial number are redacted automatically.
+
+  This does **not** replace the Universal Register Scanner. They answer different
+  questions: diagnostics reports what the integration currently *thinks*, and works
+  even when every read is failing; the scanner probes what the hardware actually
+  responds to, including registers outside the selected profile. Ask for diagnostics
+  first, and a scan when register discovery is needed.
+
+- **New: 188-test suite**, run in CI on every push and pull request.
+
+  Every case corresponds to a bug that reached users:
+
+  | Area | Guards against |
+  |---|---|
+  | Register decoding | v1.2.1 AC power reported as 429,496,471 W — a signed 32-bit value read unsigned (#361) |
+  | | Missing registers decoding as `0` instead of `None`, which made a dead link look like a healthy inverter (#357) |
+  | Range selection | The three separate ways "is this range fatal on failure?" has been wrong — #357, #361, #364 |
+  | Status codes | SPH rendering "Unknown (6)" after being moved off the hybrid table without field confirmation (#363) |
+  | | MOD/WIT/TL-XH showing "Self-Test" during normal operation (#348) |
+  | Profile registry | Profiles selectable by auto-detection but unrenderable in the options flow, which locked users out of every setting (#360, #361) |
+  | | Asymmetric 32-bit pairs and duplicate register names |
+  | Connection recovery | The transport-vs-protocol distinction and per-poll budget from PR #365 (#364) |
+
+  Home Assistant is not a test dependency — the protocol layer is HA-free, and the
+  suite runs in well under a second.
+
+- **Recorded, not fixed: four pre-existing profile issues** found by the new tests.
+  They are allowlisted with explanations so they cannot grow silently, but changing
+  which register feeds a sensor alters what users see and needs a field report first.
+
+  The one worth attention: on **SPH/SPM HU**, the BMS registers at 1086-1089
+  (`battery_soc`, `battery_voltage`, `battery_temp`) share names with the base
+  profile's 1013/1014/1040. Register lookup returns the first match and the base
+  block is spread first, so the BMS values — described in the profile as the *actual*
+  battery state of charge, and the reason the HU profile exists — appear to be
+  unreachable. **If you run an SPH/SPM HU, please check whether your battery SOC and
+  voltage match your BMS**, and open an issue either way.
+
+---
+
+## v1.2.3
+
+Issues: #361
+
+- **Fix: MIN TL-XH2 active power was exposed as AC Power instead of Grid Power:**
+  Register 31100/31101 is **Active Power** (INT32, 0.1 W, positive = export / negative =
+  import) per the VPP 2.03 specification. On a **hybrid** that is *net grid exchange*, not
+  raw inverter output — the firmware already subtracts battery and load. This is the same
+  distinction `mid.py` documents from the #242 scan: the "use Meter Power instead" caveat
+  applies only to grid-tied MID models with no battery.
+
+  v1.2.1 shipped it as `ac_power`, so the value appeared under **AC Power** when it belongs
+  under **Grid Power**. Now mapped to `power_to_grid`, and `GRID_SENSORS` added to the
+  profile so grid import/export entities are created.
+
+  **What changes for you:** the AC Power entity for this profile is replaced by Grid Power
+  import/export. A negative reading means importing — @Richardmarkink's −258.6 W was
+  258.6 W drawn from the grid while PV charged the battery, which is correct and now
+  labelled correctly.
+
+- **Added: reactive power (31102/31103)** as `ac_reactive_power`, in VAR.
+
+  Worth noting for other profiles: `mic.py` and `min.py` currently label this same pair
+  `ac_power_*_vpp` with `maps_to: 'ac_power'` and a VA unit. That is wrong — it is reactive
+  power in VAR, not apparent or active power. `mid.py` already has it right. The mislabel is
+  latent for most users (those profiles read AC power from their base or 3000 range and only
+  fall back to VPP if that fails), so it is left unchanged here rather than altered without
+  field confirmation — but if your AC Power looks wrong on a MIC or MIN and the legacy ranges
+  are failing, that is why.
+
+---
+
+## v1.2.2
+
+Issues: #364, #361  |  PR: #365
+
+- **Fix: silent connection loss on a single block no longer leaves sensors stuck at zero
+  (PR #365 by @roman0803):**
+  Since v1.1.8 a failed base-range block on a hybrid profile returns partial data rather
+  than `None`. That is correct for permanently dead ranges, but it also meant the
+  reset-and-retry recovery from #354 never fired for a *transiently* failed block — that
+  check only triggers when the whole poll comes back empty, and a partially-successful poll
+  looks like a normal success.
+
+  The result: PV and AC sensors intermittently stuck at `0.0`, sometimes for many polls,
+  while grid and battery sensors from other ranges kept updating. No entity went
+  unavailable, so it read as "no sun" rather than a connection fault.
+
+  Block reads now distinguish two structurally different failures:
+
+  | Failure | Surfaces as | Action |
+  |---|---|---|
+  | Transport — socket dropped, frame corruption | raised exception | reset connection, retry once |
+  | Protocol — Illegal Function/Address | `isError()` | return no data, **no reset** |
+
+  That distinction matters: several profiles legitimately probe ranges their hardware
+  rejects on every poll (#360, #361), so resetting on a protocol refusal would be a
+  permanent tax rather than a recovery. A per-poll budget caps recoveries at two, so a
+  genuinely dead gateway cannot turn one poll into a chain of TCP reconnects.
+
+  Field-tested 24h+ across a version upgrade and two HA restarts, cross-checked against an
+  independent reading of the same inverter.
+
+- **Fix: MIN TL-XH2 AC Power reported 429,496,471 W (#361):**
+  The 31100/31101 pair was shipped unsigned in v1.2.1, so a negative reading surfaced as its
+  two's-complement value read as unsigned. Now marked signed.
+
+  **This mapping is still unconfirmed.** It was inferred from magnitude, and the V2.01
+  specification places AC power at 31102/31103 instead. The signed value now agrees with the
+  AC current reading, but if your AC Power disagrees with the Growatt portal, please say so
+  on #361.
+
+- **Fix: per-string PV power sensors read 0 when the profile has no power register (#361):**
+  MIN TL-XH2 reports per-string voltage and current plus a single combined total, with no
+  per-string power registers. PV1/PV2/PV3 Power therefore sat at 0 while their own voltage
+  and current sensors showed live values — which reads as a fault rather than a gap in the
+  register map.
+
+  Per-string power is now derived from voltage × current whenever the profile defines no
+  power register for that string. A real register always takes precedence, so no existing
+  profile changes behaviour.
+
+---
+
+## v1.2.1
+
+Issues: #361
+
+- **New profile: MIN TL-XH2 (3-10kW)** — for second-generation TL-XH inverters.
+
+  The TL-XH2 serves **only** the VPP ranges. Legacy 0-124, storage 1000-1124 and the whole
+  3000+ block all return `Illegal Function`. The existing MIN TL-XH profile is therefore
+  structurally wrong for this hardware: it sources PV and battery from 3000-range addresses
+  that don't exist, so those entities stay empty even when the inverter is responding
+  normally.
+
+  Select **MIN TL-XH2 (3-10kW)** manually via *Configure → Inverter Series*. It shares
+  DTC 5100 with the first generation, so auto-detection cannot tell them apart — if your
+  logs show `Illegal Function` on the 3000-range registers, this is your profile.
+
+  **Every mapping was verified against the Growatt portal** by @Richardmarkink on a MIN
+  4200TL-XH2, rather than inferred from the V2.01 specification:
+
+  | Register | Confirmed against |
+  |---|---|
+  | 31011 / 31013 | portal MPPT1 6.3 A, MPPT2 6.7 A |
+  | 31109 | portal grid current L1 8.3 A |
+  | 31214 / 31217 | app battery voltage and SOC |
+  | 31058/31059 | total PV power — two scans an order of magnitude apart, 773.5 W vs 747 W computed and 2854.7 W vs 2843 W computed |
+
+  Two things that would have been wrong had this been built from the shared V2.01 blocks:
+
+  - **The PV block does not match `VPP_V201_PV2_INPUT`.** That block defines 31012/31013 as
+    PV1 *power* high/low; on TL-XH2 they are PV2 voltage and current. Unpacking it would
+    have reported PV2 voltage as PV1 power — a plausible-looking value that would have been
+    silently wrong. The PV registers are defined inline for that reason.
+  - **The battery registers are deliberately unsuffixed.** The first-gen profile names them
+    `battery_soc_vpp` and similar to stop them being used as fallbacks for its 3000-range
+    equivalents. TL-XH2 has no 3000 range, so these *are* the battery sensors — keeping the
+    suffixes would have left every battery entity empty.
+
+  PV3 (31014/31015) is included even though it reads zero on the 4200, which is a two-string
+  model. The 7-10 kW variants have three strings, and omitting it would silently lose a
+  string on every larger unit.
+
+---
+
+## v1.2.0
+
+Issues: #360
+
+- **New: "Max Register Block Size" option — for gateways that truncate large reads:**
+  Some RS485-to-TCP gateways cannot deliver a large Modbus response intact. At 9600 baud a
+  125-register response is 253 bytes — roughly **265 ms** of continuous serial data — and a
+  gateway whose serial response window is shorter forwards a truncated frame. The client
+  then decodes garbage and the byte stream stays misaligned for every subsequent read.
+
+  The symptoms are distinctive once you know them:
+  - `ModbusIOException: Unable to decode request` in the log, in bulk
+  - `request ask for id=1 but received 0` (or other nonsense unit IDs)
+  - entities unavailable or stuck at zero, while the same inverter works fine from other
+    software that happens to read smaller blocks
+
+  Diagnosed on @Xybertecnic's SPA 10000TL3 BH-UP behind a PUSR gateway at 9600 baud, where
+  the measurements were unambiguous:
+
+  | Block size | Result |
+  |---|---|
+  | 125 (default) | every range "No response", 1593 decode errors |
+  | 25 | still failing — 1040 decode errors |
+  | **1** | **storage range returns 59 registers**, decode errors down to 112 |
+
+  **Settings → Devices & Services → Growatt Modbus → Configure → Max Register Block Size**
+  Options are Auto (default, unchanged behaviour), 50, 25, 10, or 1 register.
+
+  This is deliberately an option rather than a profile setting: the limit is a property of
+  your RS485 link, not of the inverter model. The same SPA on a faster or better-behaved
+  gateway has no such constraint, and baking a low value into the profile would slow down
+  everyone on that model to fix one person's cabling.
+
+  Lower values mean more requests per poll and a slower cycle — use the highest value that
+  works. `1` is the most compatible and the slowest.
+
+- **Confirmed: the SPA profile's register map is correct.** Once reads got through intact,
+  the existing mapping produced sensible values — battery 424.6 V, SOC 84 %, temperature
+  32 °C, work mode 6. No profile change was needed; the data was always there.
+
+---
+
+## v1.1.10
+
+Issues: #361
+
+- **Fix: "Unknown error" when saving options, on an entry that failed to reload:**
+  Reported by @Richardmarkink. Changing a setting saved the change, then failed the form
+  with a bare `Unknown error` — leaving the user to retry a save that had already applied.
+
+  The options flow reloads the integration after saving. That reload was unguarded, and
+  `async_reload()` raises `OperationNotAllowed` when the entry is in a non-recoverable state
+  such as `FAILED_UNLOAD` — which happens when a poll is wedged on an unresponsive gateway
+  and holds the connection past the unload timeout. The exception propagated to the UI.
+
+  The reload is a convenience, not part of saving: settings are already persisted before it
+  runs. It is now wrapped, and a failure logs a warning explaining that the settings are
+  saved and will apply after a manual reload or restart.
+
+---
+
+## v1.1.9
+
+Issues: #361
+
+- **Fix: auto-detected TL-XH inverters were locked out of the options flow entirely:**
+  Reported by @Richardmarkink. Opening **Configure** to change something unrelated — scan
+  interval, for example — failed to save with:
+
+  > value must be one of ['MIC (0.6-3.3kW)', … 'WIT (4-15kW)']
+
+  Auto-detection assigns `tl_xh_3000_10000_v201` for DTC 5100, but that profile had **no
+  entry in `PROFILE_DISPLAY_NAMES`**. The options form resolves the stored profile to a
+  display name to pre-select it; with no entry, the lookup fell through to the profile's
+  technical `name`, which isn't a valid dropdown key — so validation rejected the form
+  before any change could be saved. Every option was unreachable.
+
+  Four profiles were affected, all reachable via auto-detection:
+  `tl_xh_3000_10000`, `tl_xh_us_3000_10000`, `tl_xh_3000_10000_v201`,
+  `tl_xh_us_3000_10000_v201`.
+
+  Two new dropdown entries cover them — **TL-XH (3-10kW)** and **TL-XH US (3-10kW)**.
+
+- **Two guards so this cannot recur silently.** This was the same defect as the missing SPA
+  entry in v1.1.6, so an audit of all 32 profiles now runs at import and logs a warning for
+  any that no dropdown entry can reach (currently none). Separately, the options flow now
+  detects an unrenderable default and falls back to a valid one with a warning, rather than
+  presenting a form that cannot be saved. Your configured profile is not changed by that
+  fallback — only the value the form pre-selects.
+
+- **Note for MIN TL-XH2 owners — why solar still reads zero.** The `MIN TL-XH (V2.01)`
+  profile does not include the VPP PV register block (`31010-31017`), so PV is sourced from
+  the 3000-range registers your hardware does not serve. Battery works because that
+  profile's battery cluster is read from `31200+`, which does respond. This is not fixed by
+  a setting — it needs the dedicated TL-XH2 profile tracked in #361.
+
+---
+
+## v1.1.8
+
+Issues: #361
+
+- **Fix: a dead base range aborted the poll even when the profile had other working ranges:**
+  Completes the fix started in v1.1.5. That release stopped the 3000 range from aborting a
+  poll when a VPP range was also available — but left the identical flaw in the base range,
+  which sits earlier in the read sequence. So on VPP-only hardware the poll still died before
+  reaching anything useful.
+
+  Reported by @Richardmarkink on a MIN 4200TL-XH2, who selected the MIN TL-XH (V2.01) profile
+  as suggested and still saw every entity unavailable.
+
+  That profile has 104 input registers, 101 of them at 3000+/31000+. But three legacy
+  stragglers — 91 and 92 (fallback PV energy) and 97 (boost temperature) — put registers below
+  875, so `has_base_range` was true. Base-range failure was unconditionally fatal, so the poll
+  returned `None` after failing to read 0-97 and never reached the 31000 block that works.
+
+  A base-range failure is now only fatal when the base range is the profile's **only** source
+  of input data. Profiles where that holds — MIC, MID-X, WIT, TL3-S and similar — are
+  unchanged and still fail fast. Where other ranges exist, the failure is logged as a warning
+  and the poll continues. The empty-cache guard from v1.1.1 still catches "every range failed".
+
+  **Trade-off worth knowing:** a profile with a genuinely dead base range but a working storage
+  or 3000 range will now publish partial data instead of going unavailable — real values for
+  the ranges that responded, zeros for the ones that did not. This matches how the storage,
+  3000, 8000 and 31000 ranges have always behaved; the base range was the sole exception.
+
+- **Note for MIN TL-XH2 owners:** this release should get you PV, AC, grid and status data via
+  the MIN TL-XH (V2.01) profile. **Battery sensors will still read zero.** That profile sources
+  battery values from 3000-range registers (3169/3170/3171/3176) which your hardware does not
+  serve, while its VPP equivalents at 31214/31217/31220 are deliberately suffix-blocked from
+  fallback. A dedicated TL-XH2 profile is in progress — see #361.
+
+---
+
+## v1.1.7
+
+Issues: #363
+
+- **Fix: SPH status showing "Unknown (6)" — v1.1.3 regression:**
+  Reported by @darimar on an SPH-4600 (V2.01), who had to roll back to v1.1.0.
+
+  v1.1.3 moved SPH and SPH-TL3 off the hybrid status table along with MOD-XH, WIT and
+  TL-XH. That was correct for those three — all field-confirmed against ShinePhone — but
+  **SPH and SPH-TL3 had no field confirmation at all.** They were changed purely on the
+  strength of their register `desc` strings, which claim `0=Waiting, 1=Normal, 3=Fault`.
+
+  Those `desc` strings are wrong for SPH. The standard table has **no entry for 6**, so an
+  SPH reporting that state rendered as `Unknown (6)` — the hardware is plainly emitting
+  hybrid-range values (6 = "Bat On-Grid", a normal state for a hybrid running off battery
+  while grid-connected).
+
+  SPH and SPH-TL3 are restored to the hybrid table. The three field-confirmed families keep
+  the v1.1.3 behaviour:
+
+  | Family | Table | Basis |
+  |---|---|---|
+  | SPH ×5, SPH-TL3 ×2 | **hybrid** (restored) | #363 — value 6 cannot be represented otherwise |
+  | MOD-XH | standard | confirmed by @Husplace |
+  | WIT | standard | confirmed by @Fyntiker |
+  | MIN TL-XH | standard | confirmed by @uspino2 |
+  | SPA | hybrid | no `inverter_status` register; falls back to reg 1000 |
+  | SPF, SPE | spf | reg 0 carries SPF semantics |
+
+  If you rolled back because of this, v1.1.7 is safe to update to.
+
+  **Note on method:** a profile's `desc` string is documentation, not evidence — several are
+  inherited boilerplate never checked against hardware. Status-table changes now require a
+  user to report the raw register value alongside what ShinePhone shows. That requirement is
+  recorded in `const.py` so this isn't repeated.
+
+---
+
+## v1.1.6
+
+Issues: #360
+
+- **Fix: the SPA profile could not be selected at all:**
+  The SPA (AC-coupled storage) profile has existed since #249 with a full register map, but
+  it was never added to `PROFILE_DISPLAY_NAMES` — the dictionary that populates the profile
+  dropdown. It was therefore unreachable through the UI, and SPA owners had no way to select
+  it. Reported by @Xybertecnic, who correctly spotted that the option they expected wasn't
+  there.
+
+  **SPA (AC Storage) 3-6kW** now appears in the Inverter Series dropdown.
+
+- **Fix: running the Universal Register Scanner knocked the integration offline:**
+  Every TCP entry owns a `SharedModbusConnection` holding a persistent socket, but the
+  scanner opened its **own** client. The gateway therefore saw two concurrent sessions from
+  Home Assistant — plus any third-party controller on the same bus. Cheap RS485-to-TCP
+  adapters accept very few sessions and drop or mis-route responses when exceeded.
+
+  The symptom was distinctive and misleading: every range in the scan fails with
+  `BrokenPipeError`, the resulting CSV reports "No response" for everything, and all entities
+  go unavailable at the same moment — which reads like the inverter not supporting any
+  registers, when in fact the connection was simply being fought over.
+
+  The scanner now takes the hub lock for the duration of the scan and closes the
+  coordinator's socket first, so exactly one connection to the gateway exists while it runs.
+  Polling resumes automatically afterwards. If a poll is genuinely stuck, the scan now fails
+  with a clear message after 60 s instead of producing a CSV full of phantom failures.
+
+  **If you have previously submitted a scan showing everything as "No response", it is worth
+  re-running it on this version** — the earlier result may say more about connection
+  contention than about your inverter.
+
+---
+
+## v1.1.5
+
+Issues: #361
+
+- **Fix: VPP-only inverters aborted the poll before reading the range that works
+  (regression in v1.1.1):**
+  Surfaced by @Richardmarkink on a MIN 4200TL-XH2 with an APX HV2.0 battery. A register
+  scan showed the legacy ranges (0-124, 1000-1124, all of 3000+) returning *Illegal
+  Function* while the VPP ranges — 30000-30499 holding and 31000-31199 input — returned
+  live data.
+
+  v1.1.1 treated the 3000 range as a profile's sole data source whenever the profile had
+  no base range, and made a total failure there abort the poll. That is correct for plain
+  MIN/MOD profiles, but V2.01 profiles carry **both** 3000+ and 31000+. On hardware that
+  serves only the VPP range, the poll aborted before ever reaching 31000+ — so a profile
+  that would otherwise have produced partial data produced nothing.
+
+  Before v1.1.1 the 3000 failure was suppressed and 31000+ was still read. This restores
+  that fall-through while keeping the v1.1.1 behaviour where it belongs:
+
+  ```python
+  _3000_is_primary = not has_base_range and not has_31000_range
+  ```
+
+  The 3000 range is only the sole source when the profile has neither a base range nor a
+  VPP range. The empty-cache guard added in v1.1.1 remains the safety net for "every range
+  failed", so nothing can publish zeros as valid data.
+
+  Plain MIN/MOD profiles define no 31000 range, so they are unaffected and still fail fast
+  — the #357 fix is preserved.
+
+- **Note for MIN TL-XH2 owners:** auto-detection maps DTC 5100 to the
+  `tl_xh_3000_10000_v201` profile, which includes legacy base registers your hardware does
+  not serve — the poll fails and every entity goes unavailable. As a workaround, select
+  **MIN TL-XH 3000-10000 (V2.01)** manually; it reads the 3000+ and 31000+ ranges without
+  the base range, so PV, AC, grid, load and status should populate. Battery data will not:
+  the VPP battery range (31200+) does not respond on this hardware, and where it actually
+  lives is still unknown. A dedicated TL-XH2 profile is tracked in #361.
+
+---
+
+## v1.1.4
+
+Issues: #358
+
+- **Fix: false "Write reversion detected" warnings when a write lands mid-poll:**
+  Reported with a full root-cause analysis by @alanmk (SPH 3600 driven by Predbat, which
+  writes every 5 minutes). Any controller that writes on a fixed cadence eventually collides
+  with an in-flight poll and trips this.
+
+  `_fetch_data()` assembles its snapshot over several seconds. A write landing during that
+  window is not reflected in the snapshot, so the detector compared the tracked value
+  against registers read *before* the write and reported the pre-write value as a
+  "reversion". Worse, the entry was popped on that first mismatch, so the write was never
+  re-checked and could never be vindicated — a guaranteed false alarm, plus the
+  once-per-session persistent notification.
+
+  The signature was distinctive: every false warning reported an age of 0–2 seconds, and the
+  "reverted to" value was always the previous locally-written value. HA recorder history
+  confirmed the writes had actually held.
+
+  Three changes:
+  - **Poll timestamping.** `_async_update_data()` now records `poll_start` before the reads
+    begin. Any tracked write newer than that is left pending and evaluated on the next poll,
+    which genuinely post-dates it.
+  - **Debounce.** A write must mismatch on two consecutive polls before being reported. A
+    real cloud or firmware revert persists; a timing artefact vanishes on the next poll.
+  - **Expiry raised and scaled.** The old flat 120 s could not confirm a genuine reversion
+    even at the 60 s default, since confirmation can now need three cycles. It is now
+    `max(240 s, 4 × scan interval)`, so slow-polling setups get their reversions confirmed
+    rather than silently expired. Based on the configured interval, not the temporary
+    offline slow-poll interval.
+
+  Genuine cloud overrides are still detected — they persist across polls and are reported on
+  the second mismatch, with an accurate age.
+
+---
+
+## v1.1.3
+
+Issues: #348
+
+- **Fix: status reported as "Self-Test" instead of "Normal" on SPH, SPH-TL3, MOD-XH and WIT:**
+  Completes the fix started in v1.0.4 (MOD X) and v1.1.2 (MIN TL-XH). Field-confirmed by
+  @Fyntiker (WIT 8k-HU) and @Husplace (MOD 6000TL3-HU EU), both showing *Self-Test* in Home
+  Assistant while ShinePhone reported *Normal*.
+
+  `HYBRID_STATUS_CODES` never described the register the `status` sensor actually renders.
+  The sensor shows `data.status`, populated from the register named `inverter_status` —
+  address 0 on every hybrid family, 3000 on MIN TL-XH V201 — and every one of those profiles
+  documents it as `0=Waiting, 1=Normal, 3=Fault`. The hybrid table describes two *different*
+  registers that never reach `data.status`:
+
+  | Register | Name | Goes to |
+  |---|---|---|
+  | 31000 | `equipment_status` | `data.equipment_status` |
+  | 1000 | `system_work_mode` | not read as status (except SPA — see below) |
+
+  So value `1` — plainly *Normal* — was decoded through the hybrid table as *Self-Test*. The
+  code family was being chosen by inverter **type** rather than by which register the value
+  came from.
+
+  `PROFILE_STATUS_MAP` is now near-empty by design. Profiles are only listed when their
+  status genuinely does not come from reg 0/3000 with standard semantics:
+
+  | Profile | Table | Why |
+  |---|---|---|
+  | `SPA_3000_6000_TL_BL` | `hybrid` | Defines no `inverter_status`; falls back to min_addr = reg 1000 (`system_work_mode`), which really is the hybrid register |
+  | `SPF_3000_6000_ES_PLUS` | `spf` | Reg 0 carries SPF semantics |
+  | `SPE_8000_12000_ES` | `spf` | **Changed from `hybrid`** — SPE inherits SPF's input registers wholesale, so reg 0 is SPF semantics, not hybrid |
+  | everything else | standard | Reg 0/3000, standard semantics |
+
+- **Fix: SPE status codes were being decoded with the hybrid table:**
+  Found while tracing the above. `SPE_8000_12000_ES` inherits `SPF_3000_6000_ES_PLUS`'s
+  `input_registers` (including `inverter_status` at reg 0 with SPF meanings) but was mapped
+  to `hybrid`. An SPE in PV Charge (value 5) displayed as *PV On-Grid*; Discharge (2) showed
+  as *Reserved*. Now uses the SPF table.
+
+- **Added `5 = Standby` to `STATUS_CODES`:**
+  WIT and SPH-TL3 both document this state on register 0. Without it those families would
+  have rendered `Unknown (5)` after moving off the hybrid table. Harmless for families that
+  never emit it.
+
+  If you have an SPH, MOD-XH, WIT or SPE, your status sensor should now match what ShinePhone
+  reports. Please open an issue if it doesn't.
+
+---
+
+## v1.1.2
+
+Issues: #348
+
+- **Fix: MIN TL-XH status reported as "Self-Test" instead of "Normal":**
+  A normally-operating MIN TL-XH showed its status as *Self-Test*. Reported by @uspino2
+  (MIN 6000TL-XH) — the same root cause as the MOD5000TL3-X report earlier in #348, which
+  was fixed for MOD only in v1.0.4.
+
+  There are two separate status registers with different meanings:
+
+  | Register | Name | Semantics |
+  |---|---|---|
+  | 0 (or 3000 on V201 profiles) | `inverter_status` | 0=Waiting, **1=Normal**, 3=Fault |
+  | 31000 | `equipment_status` | 0=Waiting, **1=Self-Test**, 5=PV On-Grid, … |
+
+  The `status` sensor renders `inverter_status`, but chose its decode table from
+  `PROFILE_STATUS_MAP` based on inverter *type* rather than on which register the value
+  actually came from. All TL-XH profiles were listed as `hybrid`, so value `1` — plainly
+  documented as *Normal* in each profile's own register definition — was decoded through
+  the hybrid table as *Self-Test*.
+
+  Fix: removed the five MIN TL-XH profiles from `PROFILE_STATUS_MAP` so they use the
+  standard codes their registers actually carry (`TL_XH_3000_10000`,
+  `TL_XH_US_3000_10000`, `TL_XH_3000_10000_V201`, `TL_XH_US_3000_10000_V201`,
+  `MIN_TL_XH_3000_10000_V201`).
+
+  **Known remaining issue:** the same mismatch exists for every other profile still mapped
+  to `hybrid` — SPH, SPH-TL3, MOD-XH and WIT all read `inverter_status` from register 0
+  with standard semantics documented. Those are deliberately left unchanged for now: there
+  are no field reports for them, and WIT/SPH-TL3 document an extra `5=Standby` state that
+  the standard table doesn't contain, so switching them blind would replace one wrong label
+  with another. If your SPH/MOD-XH/WIT status looks wrong, please open an issue with what
+  ShinePhone reports alongside it — that's the field data needed to fix it properly. The
+  correct long-term fix is to select the code table by register provenance, mirroring how
+  `grid_connection_status` already gates on `equipment_status_valid`.
+
+---
+
+## v1.1.1
+
+Issues: #343
+
+- **Fix: MIN/MOD inverters stuck reporting all zeros until manual reload (regression in v1.0.10):**
+  On profiles whose input registers live entirely in the 3000 range — every MIN and
+  MOD-family profile — a single failed read of that block put it into the 5-minute
+  "optional range" suppression window introduced in v1.0.10 (#351). Because the 3000 range
+  is the *only* input range on these profiles, suppression left the register cache empty
+  and every value decoded to 0. `read_all_data()` returned that zeroed result instead of
+  `None`, so the coordinator treated the poll as successful: entities stayed *available*
+  showing 0, the failure counter never incremented, and no reconnect or adaptive backoff
+  ever ran. The state re-armed every 300 s and persisted indefinitely — only reloading the
+  integration recovered it. Most visible as the overnight Waiting → Normal transition not
+  being picked up in the morning.
+
+  Three changes:
+  - Retry suppression is no longer applied when the 3000 range is a profile's primary
+    (only) input range. Multi-inverter setups keep the anti-log-flood behaviour.
+  - A total failure of a primary range now returns `None`, so the coordinator marks the
+    inverter offline and runs its reconnect/backoff path.
+  - Added a universal guard: an empty register cache after all reads reports the poll as
+    failed rather than publishing zeros as valid data.
+
+  **Behaviour change:** on a genuine communication failure, sensors now go *unavailable*
+  rather than reading 0. This is the correct Home Assistant semantic — the statistics
+  engine ignores unavailable states but records 0 as a real measurement, which previously
+  polluted energy history with false zeros.
+
+- **Fix: MOD charge/discharge SOC controls on DO1.0 firmware (#343):**
+  Added holding registers 3048 (`batt_first_charge_stopped_soc`) and 3067
+  (`grid_first_discharge_stopped_soc`) to the MOD 6000-15000TL3-XH profile. Registers
+  1091 and 1071 are dead on DO1.0 firmware — writes are accepted but have no effect,
+  and the whole 1060-1099 range reads back zeros. The 3000-range equivalents work
+  correctly. Confirmed by @Rohde2026 and @TimOsth.
+
+- Per-block "Successfully read N registers" logging moved from INFO to DEBUG. It fired on
+  every register block of every poll, burying genuine warnings in the HA log.
+
+---
+
+## v1.1.0
+
+Issues: #322
+
+- **New: SPE 8000-12000 ES grid-tie export sensors:**
+  Added grid export energy sensors for the SPE 8000-12000 ES single-phase hybrid inverter:
+  - **Energy to Grid Today** — input reg 45, single 16-bit register, 0.1 kWh resolution
+    (confirmed per Off-Grid Protocol V0.26; prior implementation incorrectly used a 32-bit pair)
+  - **Energy to Grid Total** — input regs 46/47, 32-bit pair, 0.1 kWh resolution
+
+- **New: SPE 8000-12000 ES grid-tie export controls:**
+  Full grid-tie export control suite for the SPE 8000-12000 ES, validated via field data
+  from nicauswu (Issue #322). All controls are SPE-only (gated by `only_profiles` guard).
+
+  **Select controls:**
+  | Control | Register | Options |
+  |---|---|---|
+  | PV Energy Priority (SUB Mode) | 116 | BLU / LBU / LUB |
+  | Grid Export Enable | 115 | Disabled / Enabled |
+  | Battery Export Enable | 118 | Disabled / Enabled |
+  | Grid Compliance Region | 117 | Asia / Europe / South America / South Africa / South Africa (Alt) |
+
+  **Number controls:**
+  | Control | Register | Range | Unit |
+  |---|---|---|---|
+  | Grid Export Power Limit | 119 | 0–12 | kW |
+  | Max Battery Export Current | 120 | 0–280 | A |
+  | Battery Export Stop Voltage | 121 | 42–54 | V |
+  | Battery Export Resume Voltage | 122 | 44–56 | V |
+  | Min Battery SOC to Export | 123 | 5–90 | % |
+  | Battery SOC Resume Export | 124 | 15–100 | % |
+
+  **Corrections based on field validation:**
+  - Output priority labels corrected to LCD acronyms: BLU (Battery-Load-Utility),
+    LBU (Load-Battery-Utility), LUB (Load-Utility-Battery)
+  - Grid compliance region (reg 117) expanded to include value 7 (South Africa Alt)
+    which appears on some hardware. This register is firmware-determined and writes
+    may be rejected by the inverter.
+  - Max battery export current capped at 280 A (hardware limit confirmed on SPE 12000ES;
+    protocol spec states 0–400 A)
+
+- **Fix: profile-specific writable register filtering:**
+  Register 123 is `export_limit_power` on SPH/XH but `export_min_soc` on SPE. A new
+  `only_profiles` / `not_profiles` filter on `WRITABLE_REGISTERS` entries prevents
+  cross-profile contamination. The filter is applied in both `number.py` and `select.py`.
+
+---
+
+## v1.0.14
+
+Issues: #355  |  PR: #354
+
+- **Fix: shared TCP connection never recovers from silent connection drop (#354):**
+  Since v1.0.8, all TCP entries route through `SharedModbusConnection`. On a silent drop
+  (Wi-Fi blip, NAT timeout, dongle power cycle — no FIN/RST delivered), pymodbus's sync
+  client never clears its socket object, so `is_socket_open()` kept returning True and
+  `ensure_connected()` reused the dead socket indefinitely. The pre-shared-mode path
+  self-healed because it disconnected and reconnected on every poll; shared mode had no
+  equivalent recovery path. Fix (contributed by jekmanis/PR #354):
+  - `SharedModbusConnection.reset()` force-closes the socket so the next
+    `ensure_connected()` opens a real new connection including stale-buffer flush.
+  - `_fetch_data_shared()` now calls `reset()` + reconnect + one retry when a poll
+    returns no data; if the retry also fails, calls `reset()` again so the next scheduled
+    poll starts from a clean socket.
+  - Write methods (`write_register`/`write_registers`) now call `disconnect()` on
+    transport-level exceptions so writes also self-heal via `ensure_connected()`.
+
+- **New: Insulation resistance, DC injection and leakage current sensors (#355):**
+  Three safety-diagnostic registers (3087-3091 in the V1.39/VPP 3000-range) are now
+  exposed as disabled-by-default diagnostic sensors on all profiles that have them:
+  MIN (grid-tied V2.01), MIN TL-XH, MOD 6000-15000TL3-XH, MID 11-30KTL3-XH.
+  | Sensor | Register | Scale | Unit | Notes |
+  |---|---|---|---|---|
+  | Insulation Resistance | 3087 | 1 | kΩ | PV string isolation to earth |
+  | DC Injection Current | 3088 | 0.1 | mA | R-phase (only phase on single-phase models) |
+  | DC Injection Current (S-Phase) | 3089 | 0.1 | mA | Three-phase models only |
+  | DC Injection Current (T-Phase) | 3090 | 0.1 | mA | Three-phase models only |
+  | Leakage Current | 3091 | 1 | mA | GFCI / residual current |
+
+  All five are disabled by default and marked diagnostic. Enable via
+  Settings → Devices & Services → Growatt Modbus → your device → the sensor.
+  Particularly useful for correlating RCD / GFCI nuisance trips with the live leakage
+  current and insulation resistance values the inverter already measures internally.
+
+---
+
 ## v1.0.13
 
 Issues: #352
@@ -77,42 +2247,6 @@ Issues: #351
   Every failed read logged a WARNING every ~70 seconds. Fix: the 3000-range block now uses
   the same skip-on-failure caching as the VPP 31000+ blocks — the first failure logs a
   WARNING once, then the block is skipped silently for 5 minutes before retrying.
-
----
-
-## v1.1.0
-
-Issues: #322
-
-- **New: SPE 8000-12000 ES grid-tie export sensors (#322):**
-  Added grid export energy sensors for the SPE 8000-12000 ES single-phase hybrid inverter:
-  - **Energy to Grid Today** — input reg 45, single 16-bit register, 0.1 kWh resolution
-    (confirmed per Off-Grid Protocol V0.26; prior implementation incorrectly used a 32-bit pair)
-  - **Energy to Grid Total** — input regs 46/47, 32-bit pair, 0.1 kWh resolution
-
-- **New: SPE 8000-12000 ES grid-tie controls (#322):**
-  Added ten writable holding registers for SPE grid-tied export configuration:
-  | Register | Name | Description |
-  |----------|------|-------------|
-  | 115 | Grid Export Enable | Enable/disable grid feed |
-  | 116 | Output Priority | Charge First / Load First / Feed First |
-  | 117 | Feed Range | Grid compliance region (Asia/Europe/S.America/S.Africa) |
-  | 118 | Battery Export Enable | Enable battery-to-grid export |
-  | 119 | Export Power Limit | Max export power (0–12 kW) |
-  | 120 | Battery Export Max Current | Max battery current for export (0–400 A) |
-  | 121 | Battery Feed Voltage Loss | Voltage at which export stops (42–54V) |
-  | 122 | Battery Feed Voltage Back | Voltage to resume export (44–56V) |
-  | 123 | Export Min SOC | Minimum SOC to allow export (5–90%) |
-  | 124 | Export Back SOC | SOC to resume export after stopping (15–100%) |
-
-  All controls are SPE-specific and will not appear on other profiles.
-  Valid ranges are taken from Off-Grid Protocol V0.26; some differ from nicauswu's original
-  implementation (regs 120, 123, 124) and are pending field validation.
-
-- **Fix: profile-specific writable register filtering (#322):**
-  Register 123 is `export_limit_power` on SPH/XH but `export_min_soc` on SPE. A new
-  `only_profiles` / `not_profiles` filter on `WRITABLE_REGISTERS` entries prevents
-  cross-profile contamination. The filter is applied in both `number.py` and `select.py`.
 
 ---
 

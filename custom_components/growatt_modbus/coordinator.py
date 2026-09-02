@@ -7,9 +7,10 @@ from typing import Any, Dict
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT, CONF_NAME
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.event import async_track_time_change
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.storage import Store
 
 from .const import (
@@ -20,6 +21,7 @@ from .const import (
     CONF_DEVICE_PATH,
     CONF_BAUDRATE,
     CONF_INVERT_BATTERY_POWER,
+    CONF_INVERTER_SERIES,
     CONF_DEVICE_STRUCTURE_VERSION,
     CURRENT_DEVICE_STRUCTURE_VERSION,
     get_sensor_type,
@@ -34,16 +36,23 @@ from .const import (
     DEFAULT_INTER_SLAVE_DELAY_MS,
 )
 
-from .const import REGISTER_MAPS
+from .const import REGISTER_MAPS, resolve_block_size
 
 from .growatt_modbus import (
     GrowattModbus,
     GrowattData,
     SharedModbusConnection,
+    ModbusWriteError,
     optional_read_limits,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Floor for how long a tracked write stays pending verification (Issue #358).
+# Must cover: one poll skipped for pre-dating the write, plus two consecutive mismatching
+# polls to satisfy the debounce — three cycles at the default 60 s scan interval.
+# The effective value scales with the configured interval; see _check_for_cloud_overrides.
+_WRITE_CHECK_EXPIRY_S = 240
 
 # Device identification (serial / firmware / inverter type / protocol / clock) is a
 # ONE-SHOT.  It used to be gated on ``not self._serial_number``, which is not a
@@ -122,6 +131,16 @@ def test_connection(config: dict) -> dict:
     except Exception as err:
         _LOGGER.exception("Connection test failed")
         return {"success": False, "error": str(err)}
+
+
+# Typed config entry. `entry.runtime_data` holds this integration's coordinator,
+# replacing the shared hass.data[DOMAIN][entry_id] dict.
+#
+# The shared-connection registry stays in hass.data because it is genuinely
+# cross-entry — several entries on the same host:port share one hub — and
+# runtime_data is per-entry by definition. With the coordinators moved out,
+# hass.data[DOMAIN] now holds only "_connections", so the two are no longer mixed.
+type GrowattConfigEntry = ConfigEntry["GrowattModbusCoordinator"]
 
 
 class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
@@ -234,9 +253,14 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         self._midnight_grace_expires: datetime | None = None
 
         # Cloud override detection: tracks recently written register values
-        # Format: {register_address: (expected_value, write_timestamp, control_name)}
-        self._pending_write_checks: dict[int, tuple[int, float, str]] = {}
+        # Format: {register_address: (expected_value, write_timestamp, control_name, mismatch_count)}
+        # mismatch_count debounces the check — see _check_for_cloud_overrides (Issue #358).
+        self._pending_write_checks: dict[int, tuple[int, float, str, int]] = {}
         self._cloud_override_notified: bool = False  # Only notify once per session
+
+        # Gateway health: raised once per session when the RS485 adapter is answering a
+        # meaningful share of requests with the wrong frame (#367).
+        self._gateway_issue_raised: bool = False
 
         # WIT: saves register 122 (export_limit_mode) before disabling control authority (30100=0).
         # Disabling 30100 transiently resets reg 122 to 0; on older firmware it may not auto-restore.
@@ -245,6 +269,119 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         # Clock drift check: populated by _check_inverter_clock() (runs in executor) and
         # delivered as a persistent notification by _async_update_data() on the event loop.
         self._pending_clock_notification: dict | None = None
+
+        # Inverter RTC, refreshed each poll for the Inverter Clock sensor. That sensor is
+        # disabled by default and an extra holding-register read per poll is not free on a
+        # gateway that needs small blocks, so nothing is read until something asks.
+        self._inverter_clock: datetime | None = None
+        self._clock_poll_wanted: bool = False
+
+        # Profile re-check (#405). Detection runs once, in the config flow, and is never
+        # revisited - so one failed read of register 30000 at setup strands an inverter
+        # on a lesser profile permanently, with nothing telling the owner. Checked once
+        # per session against a live connection instead.
+        self._profile_recheck_done: bool = False
+        self._pending_profile_issue: dict | None = None
+
+    @property
+    def inverter_clock(self) -> datetime | None:
+        """The inverter's real-time clock as of the last poll, naive local time.
+
+        None until the Inverter Clock sensor enables polling, and None again whenever the
+        registers cannot be read or do not form a valid date.
+        """
+        return self._inverter_clock
+
+    def enable_clock_polling(self) -> None:
+        """Start refreshing the inverter clock on each poll.
+
+        Called by the Inverter Clock sensor when it is added. There is no matching
+        disable: entity removal does not reliably reach us, and one extra read until the
+        next reload is not worth the bookkeeping.
+        """
+        self._clock_poll_wanted = True
+
+    def _recheck_profile_against_dtc(self) -> None:
+        """Re-read the device type code and check it agrees with the profile in use.
+
+        Auto-detection runs once, during the config flow, and is never revisited. A single
+        failed read of register 30000 at that moment - on a gateway that times out under
+        load, say - assigns a lesser profile for good, and nothing tells the owner. One
+        reporter spent weeks hunting a grid power register by hand when his own DTC already
+        named a profile that mapped it (#405, #228).
+
+        Runs once per session, in the executor, on a connection that is demonstrably
+        working. Raises a repair issue; never switches anything. Changing someone's
+        register map unasked would alter their entities, and a false positive would do real
+        damage.
+        """
+        if self._profile_recheck_done:
+            return
+
+        # NEVER read VPP registers on an off-grid profile.
+        #
+        # auto_detection.py carries the warning in capitals: reading 30000+ causes POWER
+        # RESETS on SPF inverters. This check exists to be helpful and must not be able to
+        # switch somebody's inverter off to do it. Off-grid profiles keep their own DTC at
+        # input 44 / holding 43 and are simply not eligible here.
+        if self._client.register_map.get('offgrid_protocol', False):
+            self._profile_recheck_done = True
+            return
+
+        try:
+            regs = self._client.read_holding_registers(30000, 1)
+        except Exception as err:
+            _LOGGER.debug("Profile re-check: could not read DTC: %s", err)
+            return
+
+        # A silent register means "no information", never "wrong profile". Left unmarked
+        # so a later poll can try again - the whole point is that one failed read should
+        # not decide anything permanently.
+        if not regs or len(regs) < 1:
+            return
+
+        self._profile_recheck_done = True
+        dtc = int(regs[0])
+
+        from .auto_detection import detect_profile_from_dtc, DTC_REGISTRY
+        suggested = detect_profile_from_dtc(dtc)
+        if not suggested:
+            _LOGGER.debug("Profile re-check: DTC %s is not in the registry", dtc)
+            return
+
+        configured = self.config_entry.data.get(CONF_INVERTER_SERIES, "")
+        if suggested == configured:
+            _LOGGER.debug("Profile re-check: DTC %s agrees with the profile in use", dtc)
+            return
+
+        entry = DTC_REGISTRY.get(dtc)
+        _LOGGER.warning(
+            "Profile mismatch: this inverter reports DTC %s (%s), which indicates profile "
+            "'%s', but '%s' is configured. The configured profile may be missing registers "
+            "your inverter supports. Nothing has been changed (#405).",
+            dtc, entry.model if entry else "unknown", suggested, configured,
+        )
+        self._pending_profile_issue = {
+            "dtc": str(dtc),
+            "model": entry.model if entry else "unknown",
+            "suggested": suggested,
+            "configured": configured or "unknown",
+        }
+
+    def _refresh_inverter_clock(self) -> None:
+        """Read the inverter RTC into _inverter_clock. Runs in the executor.
+
+        Called from both fetch paths. There are two of them and they have diverged before
+        - v1.3.5 fixed block-size parsing in the shared path only - so this lives in one
+        method that both reach rather than being written out twice.
+        """
+        if not self._clock_poll_wanted:
+            return
+        try:
+            self._inverter_clock = self._client.read_inverter_time()
+        except Exception as err:
+            _LOGGER.debug("Could not read inverter clock this poll: %s", err)
+            self._inverter_clock = None
 
     @property
     def has_real_data(self) -> bool:
@@ -268,24 +405,60 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         _check_for_cloud_overrides() compares the tracked value against the fresh data.
         """
         import time as _time
-        self._pending_write_checks[register] = (expected_value, _time.time(), control_name)
+        self._pending_write_checks[register] = (expected_value, _time.time(), control_name, 0)
 
-    async def _check_for_cloud_overrides(self, data) -> None:
-        """Check if any recently written register values have been overridden by the cloud."""
+    async def _check_for_cloud_overrides(self, data, poll_start: float | None = None) -> None:
+        """Check if any recently written register values have been overridden by the cloud.
+
+        Two guards prevent false positives (Issue #358):
+
+        1. Snapshot staleness. `data` is assembled over several seconds by _fetch_data().
+           A write that lands mid-poll is not reflected in that snapshot, so comparing
+           against it reports the *pre-write* value as a "reversion". Any write newer than
+           poll_start is therefore left pending and evaluated on the next poll, which
+           genuinely post-dates it.
+
+        2. Debounce. A real cloud/firmware revert persists; a timing artefact does not.
+           An entry must mismatch on two consecutive polls before it is reported.
+
+        Without these, a controller writing on a fixed cadence (e.g. Predbat every 5 min)
+        eventually collides with an in-flight poll and produces a spurious warning whose
+        reported age is ~0 s — and because the entry was popped on first mismatch, the
+        write was never re-checked and never vindicated.
+        """
         if not self._pending_write_checks:
             return
 
         import time as _time
         current_time = _time.time()
         to_remove = []
+        to_update = {}
         overridden_controls = []
 
-        for register, (expected_value, write_time, control_name) in self._pending_write_checks.items():
+        for register, entry in self._pending_write_checks.items():
+            expected_value, write_time, control_name, mismatch_count = entry
             age = current_time - write_time
 
-            # Expire entries older than 120 seconds (roughly 2 poll cycles)
-            if age > 120:
+            # Expire stale entries. Must allow for: one poll skipped as pre-dating the
+            # write, then two consecutive mismatching polls to satisfy the debounce —
+            # three cycles. Scaled to the configured interval so slow pollers still get
+            # their reversions confirmed rather than silently expired; the old flat 120 s
+            # could not confirm a genuine reversion even at the 60 s default.
+            # Uses the *normal* interval, not self.update_interval, so the temporary
+            # offline slow-poll interval doesn't inflate this.
+            if age > max(_WRITE_CHECK_EXPIRY_S,
+                         4 * self._normal_update_interval.total_seconds()):
                 to_remove.append(register)
+                continue
+
+            # Guard 1: this snapshot's registers were read before the write landed.
+            # Leave the entry pending; the next poll will evaluate it fairly.
+            if poll_start is not None and write_time >= poll_start:
+                _LOGGER.debug(
+                    "Write check for '%s' deferred — write landed mid-poll "
+                    "(write_time %.3f >= poll_start %.3f); will verify on next poll",
+                    control_name, write_time, poll_start,
+                )
                 continue
 
             # Get current value from the freshly polled data
@@ -296,14 +469,24 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             if int(current_value) == expected_value:
                 # Write stuck — remove from tracking
                 to_remove.append(register)
+            elif mismatch_count == 0:
+                # Guard 2: first mismatch. Could still be a timing artefact — keep the
+                # entry and require the next poll to agree before reporting.
+                _LOGGER.debug(
+                    "Write check for '%s': expected %d but read %d (%.0fs after write) — "
+                    "awaiting confirmation on next poll before reporting",
+                    control_name, expected_value, int(current_value), age,
+                )
+                to_update[register] = (expected_value, write_time, control_name, 1)
             else:
-                # Value reverted — cloud override detected
+                # Mismatched on two consecutive polls — treat as a genuine reversion.
                 overridden_controls.append((control_name, expected_value, int(current_value), age))
                 to_remove.append(register)
 
         # Clean up tracked entries
         for reg in to_remove:
             self._pending_write_checks.pop(reg, None)
+        self._pending_write_checks.update(to_update)
 
         # Report overrides
         if overridden_controls:
@@ -322,30 +505,81 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 affected = ", ".join(
                     c[0].replace('_', ' ').title() for c in overridden_controls
                 )
+                # A repair issue rather than a persistent notification: it is translatable,
+                # dismissible, survives a restart, and appears under Settings → Repairs
+                # where users look for "something is wrong". A notification is a toast that
+                # scrolls away, which is a poor fit for a condition that persists until the
+                # user changes something on the inverter or the dongle.
                 try:
-                    await self.hass.services.async_call(
-                        "persistent_notification",
-                        "create",
-                        {
-                            "title": "Growatt: Write Reversion Detected",
-                            "message": (
-                                f"Local Modbus writes to **{affected}** were reverted shortly after being set.\n\n"
-                                f"**Common causes:**\n"
-                                f"- **ShineWiFi / ShineLink dongle** connected: the Growatt cloud server "
-                                f"may be restoring its own settings. Disconnect the dongle or disable "
-                                f"remote control in the ShinePhone/Growatt app.\n"
-                                f"- **Inverter firmware rejecting the value**: check that any prerequisite "
-                                f"settings are enabled (e.g. *Allow Grid Charge* must be Enabled before "
-                                f"MOD TOU schedules will persist).\n"
-                                f"- **Register read-only on this firmware**: the register may not be "
-                                f"writable on your specific model or firmware version — check the logs "
-                                f"for details and open an issue if the register should be writable."
-                            ),
-                            "notification_id": "growatt_cloud_override",
-                        },
+                    ir.async_create_issue(
+                        self.hass,
+                        DOMAIN,
+                        f"write_reversion_{self.config_entry.entry_id}",
+                        is_fixable=False,
+                        severity=ir.IssueSeverity.WARNING,
+                        translation_key="write_reversion",
+                        translation_placeholders={"controls": affected},
+                        learn_more_url=(
+                            "https://github.com/0xAHA/Growatt_ModbusTCP/blob/main/"
+                            "docs/troubleshooting/raising-an-issue.md"
+                        ),
                     )
                 except Exception as err:
-                    _LOGGER.debug("Could not create persistent notification: %s", err)
+                    _LOGGER.debug("Could not create repair issue: %s", err)
+
+    # A gateway is flagged once it has answered enough requests to judge, and is getting
+    # a meaningful share of them wrong. Both thresholds matter: a handful of bad frames
+    # during a reboot is normal, and 2 failures out of 3 reads says nothing.
+    _GATEWAY_MIN_SAMPLE = 200
+    _GATEWAY_BAD_FRACTION = 0.05
+
+    @callback
+    def _check_gateway_health(self) -> None:
+        """Raise a repair issue if the RS485 gateway is replaying stale frames.
+
+        Since v1.3.7 these frames are detected and discarded, so the data stays correct —
+        but the reads are still lost, and the only evidence is a log line. One reporter's
+        gateway was answering roughly one poll in three with a complete response to an
+        *earlier* request, and found out by reading logs (#367). Nobody else would.
+        """
+        hub = self._hub
+        if hub is None or self._gateway_issue_raised:
+            return
+
+        bad = getattr(hub, "malformed_reads", 0)
+        good = getattr(hub, "good_reads", 0)
+        total = bad + good
+        if total < self._GATEWAY_MIN_SAMPLE or not bad:
+            return
+        if bad / total < self._GATEWAY_BAD_FRACTION:
+            return
+
+        self._gateway_issue_raised = True
+        _LOGGER.warning(
+            "RS485 gateway at %s:%s answered %d of %d requests with a frame that did not "
+            "match the request (%.0f%%). Data is protected — these are discarded — but "
+            "the reads are lost. See docs/troubleshooting/rs485-gateways.md",
+            hub.host, hub.port, bad, total, 100 * bad / total,
+        )
+        try:
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                f"gateway_malformed_frames_{self.config_entry.entry_id}",
+                is_fixable=False,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key="gateway_malformed_frames",
+                translation_placeholders={
+                    "gateway": f"{hub.host}:{hub.port}",
+                    "percent": f"{100 * bad / total:.0f}",
+                },
+                learn_more_url=(
+                    "https://github.com/0xAHA/Growatt_ModbusTCP/blob/main/"
+                    "docs/troubleshooting/rs485-gateways.md"
+                ),
+            )
+        except Exception as err:
+            _LOGGER.debug("Could not create gateway repair issue: %s", err)
 
     def _get_register_map(self) -> str:
         """Get register map with migration support."""
@@ -774,6 +1008,11 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             raise UpdateFailed("Growatt client not initialized")
 
         try:
+            # Timestamp taken BEFORE the reads begin. _check_for_cloud_overrides() uses it
+            # to tell "this snapshot pre-dates the write" apart from "the value genuinely
+            # reverted" — see Issue #358.
+            poll_start = time.time()
+
             # Run the blocking operations in executor
             data = await self.hass.async_add_executor_job(self._fetch_data)
 
@@ -981,10 +1220,40 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 self._just_came_online_time = None
 
             # Check for cloud overrides on recently written registers
-            await self._check_for_cloud_overrides(data)
+            await self._check_for_cloud_overrides(data, poll_start)
+
+            # Gateway health — cheap counter comparison, raises at most once per session
+            self._check_gateway_health()
 
             # Deliver pending clock-drift notification (populated by _check_inverter_clock
             # on the first successful poll; cleared immediately so it only fires once).
+            # Profile mismatch found by the DTC re-check (#405). Raised as a repair issue
+            # rather than acted on: this offers the correction, it does not impose it.
+            if self._pending_profile_issue:
+                info = self._pending_profile_issue
+                self._pending_profile_issue = None
+                try:
+                    ir.async_create_issue(
+                        self.hass,
+                        DOMAIN,
+                        f"profile_mismatch_{self.config_entry.entry_id}",
+                        is_fixable=False,
+                        severity=ir.IssueSeverity.WARNING,
+                        translation_key="profile_mismatch",
+                        translation_placeholders={
+                            "dtc": info["dtc"],
+                            "model": info["model"],
+                            "suggested": info["suggested"],
+                            "configured": info["configured"],
+                        },
+                        learn_more_url=(
+                            "https://github.com/0xAHA/Growatt_ModbusTCP/blob/main/"
+                            "docs/hardware/autodetection.md"
+                        ),
+                    )
+                except Exception as err:
+                    _LOGGER.debug("Could not create profile mismatch issue: %s", err)
+
             if self._pending_clock_notification:
                 notif = self._pending_clock_notification
                 self._pending_clock_notification = None
@@ -1051,6 +1320,29 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             self.data = GrowattData()
             return self.data
 
+    def _apply_client_options(self) -> None:
+        """Push per-poll config-entry options onto the client.
+
+        Both fetch paths need this. It used to be duplicated inline in each, and the two
+        copies drifted: v1.3.5 fixed the block-size parsing in the shared path only, so
+        the direct path kept calling int() on the label the options flow now stores and
+        raised ValueError on every poll — taking every entity unavailable for anyone not
+        on a shared connection (Issue #367). One implementation, one place to fix.
+        """
+        opts = self.config_entry.options
+
+        self._client._battery_voltage_range = opts.get("battery_voltage_range", "Auto-detect")
+
+        # 0 = "Auto" — defer to the profile's own max_block_size (Issue #360).
+        # resolve_block_size() accepts both the label the options flow stores and the
+        # integers written by the broken v1.2.0-v1.3.4 selector.
+        self._client._block_size_override = resolve_block_size(opts.get("max_block_size")) or None
+
+        delay_s = opts.get("modbus_delay", 250) / 1000.0
+        self._client._default_min_read_interval = delay_s
+        if not self._client._backed_off:
+            self._client.min_read_interval = delay_s
+
     def _fetch_data_shared(self) -> GrowattData | None:
         """Fetch data using the shared connection hub (holds hub lock for the full poll)."""
         hub = self._hub
@@ -1070,6 +1362,12 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             return None
 
         try:
+            # Issue #364: reset the per-poll transport-error recovery budget before any
+            # reads happen, so block-level reset+retry (read_input_registers /
+            # read_holding_registers) gets a fresh allowance each poll instead of
+            # accumulating across cycles or never resetting.
+            hub.begin_poll()
+
             if not hub.ensure_connected():
                 _LOGGER.warning(
                     "Shared Modbus connection could not connect to %s:%s",
@@ -1086,13 +1384,7 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             time.sleep(0.030)
             hub._flush_receive_buffer()
 
-            self._client._battery_voltage_range = self.config_entry.options.get(
-                "battery_voltage_range", "Auto-detect"
-            )
-            delay_s = self.config_entry.options.get("modbus_delay", 250) / 1000.0
-            self._client._default_min_read_interval = delay_s
-            if not self._client._backed_off:
-                self._client.min_read_interval = delay_s
+            self._apply_client_options()
 
             data = self._client.read_all_data()
             if data is None:
@@ -1113,13 +1405,19 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                         # starts from a clean connect instead of a stale session.
                         hub.reset("retry poll returned no data")
 
-            # Device identification deliberately does NOT run here.  It reads registers
-            # this inverter may never answer, and doing that inside the poll — with the
-            # shared bus lock held for the whole fetch — is what turned a 5s poll into a
-            # 205s one and starved set_wit_mode of the lock.  Flag it instead; the event
-            # loop dispatches it as its own executor job (see _async_update_data).
-            if data is not None and self._identification_due():
-                self._identification_pending = True
+            if data is not None:
+                # Device identification deliberately does NOT run here.  It reads
+                # registers this inverter may never answer, and doing that inside the
+                # poll — with the shared bus lock held for the whole fetch — is what
+                # turned a 5s poll into a 205s one and starved set_wit_mode of the lock.
+                # Flag it instead; the event loop dispatches it as its own executor job
+                # (see _async_update_data), which takes the hub lock per read.
+                if self._identification_due():
+                    self._identification_pending = True
+                # These two stay inline: both are bounded single reads on registers the
+                # profile declares, and both need the connection this poll already holds.
+                self._refresh_inverter_clock()
+                self._recheck_profile_against_dtc()
 
             time.sleep(inter_slave_delay)
             return data
@@ -1138,6 +1436,34 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         if self._hub is not None:
             return self._fetch_data_shared()
 
+        # Hold the bus for the WHOLE poll, exactly as the shared path does.
+        #
+        # v1.8.10 gave the client a per-transaction lock, which stopped a read and a write
+        # executing at the same instant but left the gap between blocks open - and this
+        # path connects, reads many blocks, then disconnects. A write landing between two
+        # blocks takes the bus legitimately, runs its own connect/disconnect cycle, and
+        # closes the port out from under the poll. What comes back is the pair of errors
+        # this was meant to remove:
+        #
+        #     [Errno 9]  Bad file descriptor              - poll reads a closed handle
+        #     [Errno 11] Could not exclusively lock port  - write connects while poll holds it
+        #
+        # The unit that must be atomic is the poll, not the transaction. The lock is an
+        # RLock and everything below runs in this one executor job, so the per-transaction
+        # acquisitions inside re-enter rather than deadlock. Reported by @rinuskroon on
+        # v1.8.10 (#398).
+        try:
+            with self._client._bus("poll"):
+                return self._fetch_data_direct()
+        except ModbusWriteError as err:
+            _LOGGER.warning(
+                "Modbus bus busy for %s - skipping this poll: %s",
+                self.config.get(CONF_DEVICE_PATH) or self.config.get(CONF_HOST), err,
+            )
+            return None
+
+    def _fetch_data_direct(self) -> GrowattData | None:
+        """Poll over a connection this client owns outright. Bus already held."""
         max_retries = 3
         retry_delay = 3  # seconds - increased from 2
 
@@ -1167,23 +1493,23 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                     _LOGGER.debug("All connection attempts failed")
                     return None
 
-                self._client._battery_voltage_range = self.config_entry.options.get(
-                    "battery_voltage_range", "Auto-detect"
-                )
-                delay_s = self.config_entry.options.get("modbus_delay", 250) / 1000.0
-                self._client._default_min_read_interval = delay_s
-                if not self._client._backed_off:
-                    self._client.min_read_interval = delay_s
+                self._apply_client_options()
+
                 data = self._client.read_all_data()
                 if data is not None:  # Success!
                     # Lazily read device identification on the first successful connection.
                     # Previously called during async_config_entry_first_refresh, but that
                     # blocked the HA bootstrap executor and triggered a CancelledError on
                     # slow/offline inverters. Called here while the connection is still open.
-                    # Legacy (non-shared) path: no shared bus lock to starve, and the
-                    # client is disconnected right after this block, so identification
-                    # still runs inline here — but now bounded to one pass.
+                    # Legacy (non-shared) path: no shared bus lock to starve, the
+                    # poll-wide _bus() RLock is held by this very thread so the reads
+                    # re-enter rather than block, and the client is disconnected right
+                    # after this block — so identification still runs inline here, but
+                    # bounded to one pass instead of repeating every poll.
                     self._run_identification()
+                    # Before the disconnect - this path closes the socket on its way out.
+                    self._refresh_inverter_clock()
+                    self._recheck_profile_against_dtc()
                     self._client.disconnect()
                     return data
 
@@ -1581,8 +1907,10 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                         f"at its own midnight, not HA midnight. A large clock offset causes daily "
                         f"energy sensors to reset at the wrong time, which can produce incorrect "
                         f"daily totals and confuse the energy dashboard.\n\n"
-                        f"**To fix:** Set the correct time on the inverter via the ShinePhone app, "
-                        f"the inverter LCD menu, or the Growatt web portal."
+                        f"**To fix:** Enable the **Inverter Clock Sync** button on the inverter "
+                        f"device and press it, or call the `growatt_modbus.sync_inverter_time` "
+                        f"action. Failing that, set the time via the ShinePhone app, the inverter "
+                        f"LCD menu, or the Growatt web portal."
                     ),
                     "notification_id": "growatt_clock_drift",
                 }

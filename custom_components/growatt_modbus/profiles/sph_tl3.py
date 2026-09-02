@@ -6,6 +6,7 @@ from .vpp_v201 import (
     VPP_V201_STATUS, VPP_V201_PV2_INPUT, VPP_V201_PV2_TOTAL,
     VPP_V201_TEMPERATURE_1P, VPP_V201_BATTERY2, VPP_V201_HOLDING_1P,
 )
+from .sph import STORAGE_AC_CHARGE_ENERGY
 
 SPH_TL3_3000_10000 = {
     'name': 'SPH-TL3 Series 3-10kW',
@@ -90,12 +91,29 @@ SPH_TL3_3000_10000 = {
         92: {'name': 'pv_energy_total_low', 'scale': 1, 'unit': '', 'pair': 91, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'Total PV energy lifetime LOW'},
 
         # Temperatures
+        #
+        # 94 and 95 were missing while `ipm_temp` and `boost_temp` were both in this
+        # profile's sensor set — so the entities existed and published 0.0 °C on every
+        # SPH-TL3 and SPA-TL3 install. Not a hardware limit: a full scan of the #360
+        # device read 94 = 200 (20.0 °C) and 95 = 333 (33.3 °C) alongside 93 = 378
+        # (37.8 °C), all three plausible and independent.
+        #
+        # The VPP copies at 31130-31132 are mapped further down and read zero on that
+        # device, so the fallback was never going to populate these either.
         93: {'name': 'inverter_temp', 'scale': 0.1, 'unit': '°C', 'signed': True},
+        94: {'name': 'ipm_temp', 'scale': 0.1, 'unit': '°C', 'signed': True,
+             'desc': 'IPM (power module) temperature (confirmed #360 scan)'},
+        95: {'name': 'boost_temp', 'scale': 0.1, 'unit': '°C', 'signed': True,
+             'desc': 'Boost converter temperature (confirmed #360 scan)'},
 
         # Status
         105: {'name': 'fault_code', 'scale': 1, 'unit': ''},
-        112: {'name': 'warning_code', 'scale': 1, 'unit': ''},
-        
+
+        # AC charge energy today/total. SPH-TL3 is a Storage Power model, so registers
+        # 112-115 carry energy rather than the warn/fault codes a MAX-class inverter puts
+        # there — see STORAGE_AC_CHARGE_ENERGY in sph.py for the protocol detail (#390).
+        **STORAGE_AC_CHARGE_ENERGY,
+
         # ============================================================================
         # STORAGE RANGE 1000-1124: Battery and Power Flow
         # ============================================================================
@@ -114,6 +132,22 @@ SPH_TL3_3000_10000 = {
         1014: {'name': 'battery_soc', 'scale': 1, 'unit': '%'},
         1040: {'name': 'battery_temp', 'scale': 0.1, 'unit': '°C', 'signed': True},
         1041: {'name': 'battery_type', 'scale': 1, 'unit': ''},
+
+        # BMS block (input registers) — V1.39 "BMS information 1082-1124". Already
+        # implemented identically in sph.py; the Homey Growatt app reads these same
+        # addresses on this hardware (#360).
+        #
+        # Note these are INPUT registers. The holding registers at 1083-1088 in this same
+        # profile are Grid First time periods — different function code, different
+        # meaning, same addresses. Do not consolidate them.
+        #
+        # Partial by design: SOC/voltage/current/temp also exist at 1086-1089 but are
+        # already provided above at 1013/1014/1040, and adding duplicates would make
+        # _find_register_by_name() resolution order-dependent.
+        1083: {'name': 'bms_status', 'scale': 1, 'unit': '', 'desc': 'Status from BMS'},
+        1085: {'name': 'bms_error', 'scale': 1, 'unit': '', 'desc': 'Error information from BMS'},
+        1095: {'name': 'bms_cycle_count', 'scale': 1, 'unit': '', 'desc': 'Cycle count from BMS'},
+        1096: {'name': 'bms_soh', 'scale': 1, 'unit': '%', 'desc': 'SOH (State of Health) from BMS'},
         
         # Power Flow
         # Per Growatt Modbus Protocol II V1.24:

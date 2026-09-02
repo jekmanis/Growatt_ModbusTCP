@@ -9,7 +9,7 @@ select the correct profile.
 """
 
 import logging
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 from homeassistant.core import HomeAssistant
 
@@ -406,6 +406,288 @@ async def async_read_protocol_version(
         return None
 
 
+# ============================================================================
+# DTC REGISTRY — single source of truth for Device Type Code → profile
+# ============================================================================
+#
+# Two separate facts live in each entry, and conflating them was a real bug.
+#
+#   The DTC is read from the device, so it identifies the *model* reliably.
+#   Whether the profile we point that model at is *correct* is a different
+#   question — and for most entries here it has never been checked against real
+#   hardware. It came from Growatt's VPP 2.03 Table 3-1 model list alone.
+#
+# The scanner used to report "Very High" confidence for any DTC found in this
+# map, describing it as "the most reliable method". That was true of the model
+# name and untrue of the profile. #360 is what it looks like when they differ:
+# an SPA model (no solar DC inputs at all) was mapped to an SPH profile, so the
+# user got a full set of PV entities reading zero forever — reported as Very
+# High confidence, with nothing to suggest the mapping had never been tested.
+#
+# `provenance` makes that distinction machine-readable so it can be surfaced
+# rather than living in a comment nobody sees.
+#
+# This registry is also the ONLY copy. diagnostic.py used to keep a parallel
+# _DTC_MAP with a "keep in sync" comment; by the time this was written the two
+# had already drifted by nine entries.
+
+CONFIRMED = "confirmed"
+"""A real device reporting this DTC has been seen running this profile."""
+
+ASSUMED = "assumed"
+"""Mapping taken from Growatt's DTC table. Never verified against hardware."""
+
+
+class DtcEntry(NamedTuple):
+    """One DTC → profile mapping, with the evidence behind it."""
+
+    model: str
+    """Human-readable model name(s), as printed by the register scanner."""
+
+    profile: str
+    """Profile key to select."""
+
+    provenance: str
+    """CONFIRMED or ASSUMED — see the note above. Be pessimistic: mark ASSUMED
+    unless there is a citable device report."""
+
+    evidence: str
+    """Where the confirmation came from, or what is missing without it."""
+
+
+# Official DTC codes from Growatt VPP 2.03 Protocol documentation Table 3-1.
+# Note: some legacy models expose the DTC register without supporting full V2.01.
+DTC_REGISTRY: dict[int, DtcEntry] = {
+    # -- Legacy protocol models — DTC at holding register 43, no VPP support --
+    210: DtcEntry(
+        'MIC 2500-5500MTL-S', 'mic_2500_5500mtl_s',
+        CONFIRMED, 'Growatt 4200MTL-S, issue #304 (single-phase dual-string, firmware AH1.0)',
+    ),
+    2049: DtcEntry(
+        'TL3-S 3000-15000', 'tl3_s_3000_15000',
+        CONFIRMED, 'Growatt 9000TL3-S, issue #299 (three-phase grid-tied string, firmware DH1.0)',
+    ),
+
+    # -- SPH series --
+    3501: DtcEntry(
+        'SPH 3000-6000TL BL', 'sph_3000_6000_v201',
+        ASSUMED, 'no device report; sibling 3502 is confirmed and shares this map',
+    ),
+    3502: DtcEntry(
+        'SPH 3000-6000TL BL-UP', 'sph_3000_6000_v201',
+        CONFIRMED, 'issue #337 — detection corrected to this profile and confirmed by reporter',
+    ),
+    3503: DtcEntry(
+        'SPH 3000-6000TL HU', 'sph_3000_6000_v201',
+        ASSUMED, 'no device report; sibling 3504 is confirmed and shares this map',
+    ),
+    3504: DtcEntry(
+        'SPH 3000-6000TL HUB', 'sph_3000_6000_v201',
+        CONFIRMED, 'SPH 5000 TL-HUB, issue #286',
+    ),
+    3601: DtcEntry(
+        'SPH-TL3 4-10kW', 'sph_tl3_3000_10000_v201',
+        CONFIRMED, 'SPH 10000TL3 BH-UP, issue #210 — sensors confirmed working',
+    ),
+    21303: DtcEntry(
+        'SPH/SPM 8000-10000TL-HU', 'sph_8000_10000_hu',
+        CONFIRMED, 'register scan #303, firmware UL2.21',
+    ),
+
+    # -- SPA series — AC-coupled storage, NO solar DC inputs --
+    #
+    # SPA hardware has no MPPT inputs, so any SPH profile's PV sensor groups exist
+    # and read zero permanently. 3725 is fixed (see below); the single-phase codes
+    # are knowingly left pointing at an SPH profile, because the failure modes are
+    # not symmetric:
+    #
+    #   wrong sensor set  -> phantom entities reading zero (cosmetic)
+    #   wrong register range -> every entity unavailable (total failure)
+    #
+    # `spa_3000_6000_tl_bl` reads only 1000-1124. Pointing a variant at it that does
+    # not serve that range trades a cosmetic fault for a total one, and #360 is a
+    # first-hand account of what that looks like. The profile was field-built from a
+    # single device (#249) whose own DTC was never captured, so there is no code below
+    # it can be attached to on evidence. These stay ASSUMED and stay put until a scan
+    # settles it; the profile remains selectable by hand from the dropdown.
+    3701: DtcEntry(
+        'SPA 1000-3000TL BL', 'sph_3000_6000_v201',
+        ASSUMED, 'no device report; SPA mapped to an SPH profile — PV entities will be phantom (#360)',
+    ),
+    3715: DtcEntry(
+        'SPA 3000-6000TL AU', 'sph_3000_6000_v201',
+        ASSUMED, 'no device report; SPA mapped to an SPH profile — PV entities will be phantom (#360)',
+    ),
+    3716: DtcEntry(
+        'SPA 3000-6000TL AUB', 'sph_3000_6000_v201',
+        ASSUMED, 'no device report; SPA mapped to an SPH profile — PV entities will be phantom (#360)',
+    ),
+    # The one SPA code with hardware behind it. #360: the device reported 3725, failed
+    # completely on the single-phase SPA profile, and ran correctly on the SPH-TL3
+    # register map. spa_tl3_4000_10000_v201 reuses that exact map with the PV groups
+    # dropped, so this mapping reads the same registers the device is known to answer.
+    3725: DtcEntry(
+        'SPA-TL3 4-10kW', 'spa_tl3_4000_10000_v201',
+        CONFIRMED, 'DTC and register layout both confirmed on hardware (#360); profile shares the verified SPH-TL3 map without the phantom PV sensor groups',
+    ),
+    3735: DtcEntry(
+        'SPA 3000TL BL-UP', 'sph_3000_6000_v201',
+        ASSUMED, 'DTC confirmed (VPP-capable variant) but mapped to an SPH profile. spa_3000_6000_tl_bl was field-built from a "SPA 3000TL BL" (#249) — which per Table 3-1 is 3701 (SPA 1000-3000TL BL), not this BL-UP variant. Which of the two it belongs to needs a scan to settle',
+    ),
+
+    # -- SPF series — off-grid (034xx range from SPF protocol documentation) --
+    # CRITICAL: these inverters RESET if VPP registers (30000+, 31000+) are read.
+    3400: DtcEntry(
+        'SPF 3000-6000 ES PLUS', 'spf_3000_6000_es_plus',
+        ASSUMED, 'no device report on this DTC',
+    ),
+    3401: DtcEntry(
+        'SPF 3000-6000 ES PLUS variant', 'spf_3000_6000_es_plus',
+        ASSUMED, 'no device report on this DTC',
+    ),
+    3402: DtcEntry(
+        'SPF 3000-6000 ES PLUS variant', 'spf_3000_6000_es_plus',
+        ASSUMED, 'no device report on this DTC',
+    ),
+    3403: DtcEntry(
+        'SPF 3000-6000 ES PLUS variant', 'spf_3000_6000_es_plus',
+        ASSUMED, 'no device report on this DTC',
+    ),
+
+    # -- SPE series — single-phase hybrid (SPF protocol variant, 8-12kW) --
+    64541: DtcEntry(
+        'SPE 8000-12000 ES', 'spe_8000_12000_es',
+        CONFIRMED, 'register scan, issue #212',
+    ),
+
+    # -- MIN-XH series --
+    5100: DtcEntry(
+        'MIN 2500-6000TL-XH/XH2/XHE/XA', 'tl_xh_3000_10000_v201',
+        CONFIRMED, 'MIN 6000 TL-XH + APX battery + backup box, issue #71',
+    ),
+
+    # -- MIC/MIN-X series --
+    5200: DtcEntry(
+        'MIC 600-3300TL-X/X2/X2(Pro); MIN 2500-6000TL-X/X2/X2(Pro)/X2(Pro.E)',
+        'min_3000_6000_tl_x_v201',
+        ASSUMED, 'this DTC covers BOTH families in Growatt Table 3-1, so it cannot '
+                 'identify a model on its own — a runtime probe of registers 59-62 picks '
+                 'MIC vs MIN. That probe misassigned a MIN 5000TL-X2 to the MIC profile '
+                 '(#367) and was rebuilt; no confirmed MIC device report yet',
+    ),
+    5201: DtcEntry(
+        'MIN 7-10KTL-X/X2/X2(E)', 'min_7000_10000_tl_x_v201',
+        CONFIRMED, "maintainer's MIN 10000TL-X, scan on v1.1.6 — DTC 5201 read from legacy "
+                   "holding 43. Note this unit has no VPP range (30000/30099 return Illegal "
+                   "Function), so the V2.01 key below is downgraded to min_7000_10000_tl_x "
+                   "by convert_to_legacy_profile(). It is the reference device most fixes "
+                   "are verified against",
+    ),
+
+    # -- MOD/MID-XH series --
+    5400: DtcEntry(
+        'MOD 3-10KTL3-XH/BP; MID 11-30KTL3-XH; MID 8-15KTL3-XHL/JP', 'mod_6000_15000tl3_xh_v201',
+        CONFIRMED, 'MID 30KTL3-XH issue #313; MID 25KTL3-XH issue #362',
+    ),
+    5401: DtcEntry(
+        'MOD 3-15KTL3-HU; MID 33-50KTL3-HU', 'mod_6000_15000tl3_xh_v201',
+        CONFIRMED, 'register scan #228',
+    ),
+
+    # -- MOD/MID/MAC-X series — grid-tied (no battery, no CT meter) --
+    # These report VPP 2.01 registers (31100-31115 active). Grid-power registers
+    # (3041-3044, 31112-31113) read zero on units with no CT at the grid connection
+    # point, which is the common case — but NOT always. A MOD 5000TL3-X with an
+    # external DTSU6666 meter fitted returned 31112/31113 = 65535/63424, which is
+    # -2112 signed, or -211.2 W exporting, and it tracked load changes across the
+    # zero crossing (#228). So the register is dead without a meter, not dead on the
+    # family. If mapping it, declare it signed: read unsigned that value is
+    # 429,496,518 W, which the 32-bit underflow guard withholds (#401) - so a careless
+    # mapping makes grid power vanish precisely when exporting.
+    # The MID models split cleanly across these two codes: 5001 is every MID, 5002 is
+    # every MOD. The last two MID entries fall at the top of the following page in
+    # Table 3-1 under a merged cell, so they read as belonging to 5002 unless you check
+    # where the merge starts — maintainer confirmed against the PDF that it runs from
+    # MID 17-25KTL3-X through MID 3-33KTL3-X3.
+    5001: DtcEntry(
+        'MID 17-25KTL3-X; MID 20-30KTL3-X2; MID 25-30KTL3-X2 Pro/X2 Pro.E; '
+        'MID 33-50KTL3-X2/X2 Pro/X2 Pro.E; MID 30-40KTL3-X; '
+        'MID 33-36KTL3-X(Pro.E); MID 3-33KTL3-X3',
+        'mid_15000_25000tl3_x_v201',
+        CONFIRMED, 'issue #242',
+    ),
+    5002: DtcEntry(
+        'MOD 3-15KTL3-X; MOD 3-15KTL3-X2(Pro); MOD 12-20KTL3-X2; '
+        'MOD 12-20KTL3-X2(E); MOD 3-33KTL3-X3',
+        'mid_15000_25000tl3_x_v201',
+        CONFIRMED, 'issue #228 - MOD 5000TL3-X scan, DTC 5002 read from register 30000',
+    ),
+    5003: DtcEntry(
+        'MAC 30-70KTL3-X; MAC 15-36KTL3-XL; MAC 50-70KTL3-X2; MAC 30-36KTL3-XL2',
+        'mid_15000_25000tl3_x_v201',
+        ASSUMED, 'best-effort — no MAC profile exists; MID map used as the closest available',
+    ),
+
+    # -- MAX/MAX-X series — large commercial grid-tied string inverters --
+    #
+    # Table 3-1 note: "MIN-X & MOD/MID/MAC-X & MAX/MAX-X do not use the battery
+    # and energy storage related registers." So these belong with the grid-tied
+    # group above, and the MID map is the closest available — but no MAX device
+    # has ever been seen by this integration, and no MAX profile exists.
+    #
+    # Mapping them at all is a judgement call: without an entry the DTC is
+    # unknown and detection falls through to heuristics, which is not obviously
+    # better. They are ASSUMED and will say so loudly in the log.
+    5000: DtcEntry(
+        'MAX 50-100KTL3 LV/MV', 'mid_15000_25000tl3_x_v201',
+        ASSUMED, 'no device report; no MAX profile exists — MID map used as closest available',
+    ),
+    5500: DtcEntry(
+        'MAX 175-253KTL3-X HV', 'mid_15000_25000tl3_x_v201',
+        ASSUMED, 'no device report; no MAX profile exists — MID map used as closest available',
+    ),
+    5501: DtcEntry(
+        'MAX 80-150KTL3-X LV/MV; MAX 100-150KYL3-X2 LV/MV', 'mid_15000_25000tl3_x_v201',
+        ASSUMED, 'no device report; no MAX profile exists — MID map used as closest available',
+    ),
+    5502: DtcEntry(
+        'MAX 320-350KTL3-X', 'mid_15000_25000tl3_x_v201',
+        ASSUMED, 'no device report; no MAX profile exists — MID map used as closest available',
+    ),
+
+    # -- WIT/WIS series — register 988 can distinguish: 0=WIT, 1=WIS --
+    5603: DtcEntry(
+        'WIT 4-15kW Hybrid', 'wit_4000_15000tl3',
+        CONFIRMED, 'hardware, issue #335 (residential three-phase hybrid, Protocol V2.03)',
+    ),
+    5600: DtcEntry(
+        'WIS 100K-AM; WIT 50-100K-H/HE/HU/A/AE/AU (incl. -US); '
+        'WIT 28-55K-H/HE/HU/A/AE/AU-US L2',
+        'wit_29900_50000tl3_xhu',
+        ASSUMED, 'interim — uses the 50K-XHU profile (4 PV strings + 8000-range battery); VPP 31200+ is not supported on 100K-HU, tracked in #349',
+    ),
+    5601: DtcEntry(
+        'WIT 29.9-50K-XHU', 'wit_29900_50000tl3_xhu',
+        CONFIRMED, 'WIT 30K register scan, issue #338 (4 MPPT, 3 battery channels)',
+    ),
+    5800: DtcEntry(
+        'WIS 210K', 'mid_15000_25000tl3_x_v201',
+        ASSUMED, 'no device report; WIS mapped to a MID profile',
+    ),
+    5801: DtcEntry(
+        'WIS 215K-AM', 'mid_15000_25000tl3_x_v201',
+        ASSUMED, 'no device report; WIS mapped to a MID profile',
+    ),
+}
+
+
+# TODO #249: SPA VPP register applicability notes (from Growatt VPP 2.01/2.03 docs):
+#   30406 (Load Priority Discharge Cutoff SOC): Only DTC 3502, 3735, 3750, 3601
+#   30208 (Export Limitation Protection Mode): NOT used by DTC 3725, 3601, 5601, 5800
+#   30157 (EPS Offline Voltage): Different valid ranges per model —
+#     consult Growatt documentation for per-model min/max before writing
+
+
 def detect_profile_from_dtc(dtc_code: int) -> Optional[str]:
     """
     Match DTC (Device Type Code) to a profile.
@@ -439,76 +721,26 @@ def detect_profile_from_dtc(dtc_code: int) -> Optional[str]:
     Returns:
         Profile key or None if no match
     """
-    # Official DTC codes from Growatt VPP 2.03 Protocol documentation Table 3-1
-    # Note: Some legacy models use DTC register but don't support full V2.01 protocol
-    dtc_map = {
-        # Legacy protocol models — DTC at holding register 43, no VPP support
-        210:  'mic_2500_5500mtl_s',     # MIC 2500-5500MTL-S: single-phase dual-string, firmware AH1.0
-        2049: 'tl3_s_3000_15000',      # TL3-S 3000-15000: three-phase grid-tied string, firmware DH1.0
-
-        # SPH series - Official Growatt DTCs (VPP 2.03 Table 3-1)
-        3501: 'sph_3000_6000_v201',       # SPH 3000-6000TL BL
-        3502: 'sph_3000_6000_v201',       # SPH 3000-6000TL BL-UP
-        3503: 'sph_3000_6000_v201',       # SPH 3000-6000TL HU
-        3504: 'sph_3000_6000_v201',       # SPH 3000-6000TL HUB
-        3601: 'sph_tl3_3000_10000_v201',  # SPH 4-10KTL3 BH-UP (confirmed DTC)
-        21303: 'sph_8000_10000_hu',       # SPH/SPM 8000-10000TL-HU (firmware UL2.21, DTC confirmed scan #303)
-
-        # SPA series - Official Growatt DTCs (VPP 2.03 Table 3-1)
-        # SPA variants share the sph_3000_6000_v201 register layout for VPP.
-        # Non-VPP SPA (firmware RH1.0) is caught by async_detect_inverter_series()
-        # battery voltage check before DTC lookup and never reaches this map.
-        3701: 'sph_3000_6000_v201',       # SPA 1000-3000TL BL
-        3715: 'sph_3000_6000_v201',       # SPA 3000-6000TL AU
-        3716: 'sph_3000_6000_v201',       # SPA 3000-6000TL AUB
-        3725: 'sph_tl3_3000_10000_v201',  # SPA 4-10KTL3 BH-UP (confirmed DTC)
-        3735: 'sph_3000_6000_v201',       # SPA 3000-6000TL BL (VPP-capable variant, confirmed DTC)
-        # TODO #249: SPA VPP register applicability notes (from Growatt VPP 2.01/2.03 docs):
-        #   30406 (Load Priority Discharge Cutoff SOC): Only DTC 3502, 3735, 3750, 3601
-        #   30208 (Export Limitation Protection Mode): NOT used by DTC 3725, 3601, 5601, 5800
-        #   30157 (EPS Offline Voltage): Different valid ranges per model —
-        #     consult Growatt documentation for per-model min/max before writing
-
-        # SPF series - Off-Grid (034xx range from SPF protocol documentation)
-        3400: 'spf_3000_6000_es_plus',         # SPF 3000-6000 ES PLUS (off-grid)
-        3401: 'spf_3000_6000_es_plus',         # SPF 3000-6000 ES PLUS variant
-        3402: 'spf_3000_6000_es_plus',         # SPF 3000-6000 ES PLUS variant
-        3403: 'spf_3000_6000_es_plus',         # SPF 3000-6000 ES PLUS variant
-
-        # SPE series - Single-phase hybrid (SPF protocol variant, 8-12kW)
-        64541: 'spe_8000_12000_es',            # SPE 8000-12000 ES (confirmed from issue #212 register scan)
-
-        # MIN-XH series - Official Growatt DTCs (VPP 2.03 Table 3-1)
-        5100: 'tl_xh_3000_10000_v201',    # MIN 2500-6000TL-XH/XH2/XHE/XA
-
-        # MIC/MIN-X series - Official Growatt DTCs (VPP 2.03 Table 3-1)
-        5200: 'min_3000_6000_tl_x_v201',  # MIC 600-3300TL-X/X2; MIN 2500-6000TL-X/X2 — refined by testing regs 59-62
-        5201: 'min_7000_10000_tl_x_v201', # MIN 7-10KTL-X/X2
-
-        # MOD/MID-XH series — Official Growatt DTCs (VPP 2.03 Table 3-1)
-        5400: 'mod_6000_15000tl3_xh_v201', # MOD 3-10KTL3-XH/BP; MID 11-30KTL3-XH; MID 8-15KTL3-XHL/JP
-        5401: 'mod_6000_15000tl3_xh_v201', # MOD 3-15KTL3-HU; MID 33-50KTL3-HU (confirmed scan #228)
-
-        # MOD/MID/MAC-X series — grid-tied (no battery, no CT meter) — VPP 2.03 Table 3-1
-        # These report VPP 2.01 registers (31100-31115 active) but grid-power registers
-        # (3041-3044, 31112-31113) are always zero — no built-in CT at grid connection point.
-        5001: 'mid_15000_25000tl3_x_v201', # MID 17-25KTL3-X; MID 20-30KTL3-X2; MID 33-50KTL3-X2 (confirmed #242)
-        5002: 'mid_15000_25000tl3_x_v201', # MID 33-36KTL3-X(Pro.E); MID 3-33KTL3-X3; MOD 3-15KTL3-X; MOD 3-15KTL3-X2
-        5003: 'mid_15000_25000tl3_x_v201', # MAC 30-70KTL3-X; MAC 15-36KTL3-XL; MAC 50-70KTL3-X2 (best-effort, no profile)
-
-        # WIT/WIS series - Official Growatt DTCs (VPP 2.03 Table 3-1)
-        # Register 988 can distinguish: 0=WIT, 1=WIS
-        5603: 'wit_4000_15000tl3',          # WIT 4-15kW (residential three-phase hybrid) - Protocol V2.03 (confirmed via hardware, Issue #335)
-        5600: 'wit_29900_50000tl3_xhu',      # WIT 50-100K-H/HE/HU/A/AE/AU; WIS 100K-AM (interim: uses 50K-XHU profile — 4 PV strings + 8000-range battery; VPP 31200+ not supported on 100K-HU, tracked in issue #349)
-        5601: 'wit_29900_50000tl3_xhu',      # WIT 29.9-50K-XHU (4 MPPT, 3 battery channels)
-        5800: 'mid_15000_25000tl3_x_v201',  # WIS 210K
-        5801: 'mid_15000_25000tl3_x_v201',  # WIS 215K-AM
-    }
-
-    profile_key = dtc_map.get(dtc_code)
-    if profile_key:
-        _LOGGER.info(f"Matched DTC code {dtc_code} to V2.01 profile '{profile_key}'")
-        return profile_key
+    entry = DTC_REGISTRY.get(dtc_code)
+    if entry:
+        if entry.provenance == CONFIRMED:
+            _LOGGER.info(
+                "Matched DTC %s (%s) to profile '%s' — mapping confirmed: %s",
+                dtc_code, entry.model, entry.profile, entry.evidence,
+            )
+        else:
+            # Say so at WARNING. The model name is reliable; the profile behind it
+            # has never been checked on this hardware, and a user chasing odd
+            # entities deserves to find that in the log rather than assume
+            # auto-detection settled it.
+            _LOGGER.warning(
+                "Matched DTC %s (%s) to profile '%s', but this mapping is UNCONFIRMED: %s. "
+                "Sensors may be missing or present-but-meaningless. A register scan "
+                "(Developer Tools -> Actions -> Growatt Modbus: Universal Register Scanner) "
+                "attached to a GitHub issue is what turns this into a confirmed mapping.",
+                dtc_code, entry.model, entry.profile, entry.evidence,
+            )
+        return entry.profile
 
     _LOGGER.warning(f"✗ DTC Detection - Unknown DTC code: {dtc_code} (not in supported models)")
     return None
@@ -925,40 +1157,51 @@ async def async_refine_dtc_detection(
         elif dtc_code == 5200:
             _LOGGER.info("DTC 5200 detected - Testing registers 59-62 for MIC per-MPPT energy tracking")
 
-            # Test MIC-specific per-MPPT energy registers (59-62)
-            # MIC hardware: registers contain plausible energy values (high word typically 0-100)
-            # MIN hardware: registers may return garbage/system values (e.g., DTC code 5200)
-            mic_registers_found = False
+            # Test MIC-specific per-MPPT energy registers (59-62).
+            #
+            # DTC 5200 covers BOTH families in Growatt's own table ("MIC 600-3300TL-X/X2;
+            # MIN 2500-6000TL-X/X2"), so the code alone cannot separate them and this
+            # probe has to. On a MIC these hold per-MPPT energy *today*; on a MIN the
+            # same addresses hold something else.
+            #
+            # The previous version tested each pair as `high < 100 or (high == 0 and
+            # low > 0)` and stopped at the first pass. That accepts any non-zero 16-bit
+            # low word — up to 6553.5 kWh — as a plausible *daily* figure. A MIN 5000TL-X2
+            # (#367) read [0, 2] at 59-60, matched on the first test, and was assigned the
+            # MIC profile; its 61-62 held 1578.7 kWh (lifetime DC total, not a daily
+            # figure) and was never examined because the check had already short-circuited.
+            # The user lost 18 entities and saw a valid register rejected every poll by
+            # ENERGY_GUARD for looking implausible as a daily total — which it was.
+            #
+            # Now: read both pairs, and require every one to be plausible as a daily
+            # per-MPPT energy. A lifetime total or a garbage/system value fails the bound
+            # even when a sibling register looks reasonable.
+            MAX_PLAUSIBLE_DAILY_KWH = 200.0  # generous: 6 kW flat out for 24 h is ~144
 
-            # Check register 59-60 (PV1 energy today)
-            result = await hass.async_add_executor_job(
-                client.read_input_registers, 59, 2  # PV1 energy today (high/low)
+            def _read_energy_pair(regs):
+                """Return (combined_kwh, present). None kWh means unreadable."""
+                if regs is None or len(regs) != 2:
+                    return None, False
+                combined = (regs[0] << 16) | regs[1]
+                return combined * 0.1, True
+
+            pair_59, _ = _read_energy_pair(await hass.async_add_executor_job(
+                client.read_input_registers, 59, 2))
+            pair_61, _ = _read_energy_pair(await hass.async_add_executor_job(
+                client.read_input_registers, 61, 2))
+
+            readable = [v for v in (pair_59, pair_61) if v is not None]
+            # Zero is fine — an unused MPPT string reads 0 on a genuine MIC.
+            implausible = [v for v in readable if v > MAX_PLAUSIBLE_DAILY_KWH]
+            mic_registers_found = bool(readable) and not implausible and any(v > 0 for v in readable)
+
+            _LOGGER.info(
+                "MIC/MIN probe — reg 59-60 = %s kWh, reg 61-62 = %s kWh: %s",
+                f"{pair_59:.1f}" if pair_59 is not None else "unreadable",
+                f"{pair_61:.1f}" if pair_61 is not None else "unreadable",
+                "plausible per-MPPT daily energy → MIC" if mic_registers_found
+                else "not per-MPPT daily energy → MIN",
             )
-            if result is not None and len(result) == 2:
-                high_word = result[0]
-                low_word = result[1]
-                # Valid energy data: high word should be small (0-100 for reasonable energy values)
-                # MIN inverters return garbage (e.g., 5200 = DTC code) - reject these
-                if 0 < high_word < 100 or (high_word == 0 and low_word > 0):
-                    mic_registers_found = True
-                    _LOGGER.info(f"Register 59-60 (PV1 energy) = {high_word}/{low_word} - Valid MIC per-MPPT energy data detected")
-                elif high_word >= 100:
-                    _LOGGER.info(f"Register 59-60 = {high_word}/{low_word} - Invalid (garbage/system data, not energy)")
-
-            # Also check register 61-62 (PV2 energy today) for confirmation
-            if not mic_registers_found:
-                result = await hass.async_add_executor_job(
-                    client.read_input_registers, 61, 2  # PV2 energy today (high/low)
-                )
-                if result is not None and len(result) == 2:
-                    high_word = result[0]
-                    low_word = result[1]
-                    # Same validation: high word should be small for plausible energy
-                    if 0 < high_word < 100 or (high_word == 0 and low_word > 0):
-                        mic_registers_found = True
-                        _LOGGER.info(f"Register 61-62 (PV2 energy) = {high_word}/{low_word} - Valid MIC per-MPPT energy data detected")
-                    elif high_word >= 100:
-                        _LOGGER.info(f"Register 61-62 = {high_word}/{low_word} - Invalid (garbage/system data, not energy)")
 
             # If MIC per-MPPT registers found, this is a MIC inverter
             if mic_registers_found:

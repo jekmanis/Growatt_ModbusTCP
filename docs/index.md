@@ -1,7 +1,8 @@
 # Growatt Modbus Integration
 
 ![HACS Badge](https://img.shields.io/badge/HACS-Custom-orange.svg)
-![Version](https://img.shields.io/badge/Version-0.9.8-blue.svg)
+[![Version](https://img.shields.io/github/v/release/0xAHA/Growatt_ModbusTCP?label=Version&color=blue)](https://github.com/0xAHA/Growatt_ModbusTCP/releases/latest)
+[![Installations](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fanalytics.home-assistant.io%2Fcustom_integrations.json&query=%24.growatt_modbus.total&label=Installations&color=41BDF5&logo=home-assistant&logoColor=white&cacheSeconds=21600)](https://analytics.home-assistant.io/#integrations)
 [![GitHub Issues](https://img.shields.io/github/issues/0xAHA/Growatt_ModbusTCP.svg)](https://github.com/0xAHA/Growatt_ModbusTCP/issues)
 
 A native Home Assistant integration for Growatt solar inverters using **direct Modbus RTU/TCP communication**. Real-time data straight from your inverter — no cloud, no ShineWiFi, no dependency on Growatt's servers.
@@ -26,6 +27,7 @@ The integration polls your inverter directly over Modbus — the same protocol t
 - **[Raising an Issue](troubleshooting/raising-an-issue.md)** — what to include when reporting a bug
 - **[Diagnostic Service](troubleshooting/diagnostic-service.md)** — Universal Register Scanner
 - **[DTC Debugging](troubleshooting/dtc-debugging.md)** — device type code reference
+- **[RS485 Gateways](troubleshooting/rs485-gateways.md)** — which adapters work, and diagnosing one that doesn't
 - **[Adding Sensors](developer/adding-sensors.md)** — add registers and sensors to an existing profile
 - **[New Profile](developer/new-profile.md)** — support a new or unsupported inverter model
 - **[Release Notes](release-notes.md)** — changelog
@@ -76,6 +78,38 @@ The setup wizard runs auto-detection automatically for VPP-capable inverters. Fo
 | Scan Interval | 30 s | Polling frequency (5–300 s) |
 | Connection Timeout | 10 s | Response timeout (1–60 s) |
 | Invert Grid Power | Auto | Fix a backwards CT clamp |
+| USB / Serial Port | - | Change the adapter path without re-adding the entry |
+| Host / TCP Port | - | Change the gateway address without re-adding the entry |
+
+### Use a stable path for USB adapters
+
+`/dev/ttyUSB0` is assigned in the order devices are enumerated. With more than one USB
+serial adapter attached - an inverter and a battery BMS, say - a reboot can swap them, and
+the integration then talks to the wrong device or fails to connect.
+
+There are two stable alternatives, and the setup page lists both. Which one is right depends
+on your adapter:
+
+| Path | Keyed on | Use it when |
+|---|---|---|
+| `/dev/serial/by-id/...` | the adapter's vendor, product and **serial number** | your adapter has a serial number - it then survives being moved to another socket |
+| `/dev/serial/by-path/...` | the **physical USB socket** | your adapter has no serial number, or you have two identical adapters |
+
+```
+/dev/serial/by-id/usb-1a86_USB_Single_Serial_58CA017290-if00
+/dev/serial/by-path/pci-0000:00:14.0-usb-0:5:1.0-port0
+```
+
+**Check for a serial number before choosing by-id.** The first example above ends in
+`58CA017290`, a real serial. A name like `usb-1a86_USB2.0-Serial-if00-port0` has none - it
+describes the chip model only. CH340 chips (USB vendor `1a86`), which most cheap RS485
+adapters use, ship without serial numbers, so **two identical CH340 adapters cannot be told
+apart by by-id** and you may end up pointing two config entries at the same one. Use
+`by-path` for those.
+
+If yours is not listed, run `ls -l /dev/serial/by-id/ /dev/serial/by-path/` on the host and
+paste the path into the manual field.
+
 
 ---
 

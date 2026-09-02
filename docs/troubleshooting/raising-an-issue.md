@@ -1,59 +1,99 @@
 # Raising an Issue
 
-Before opening an issue, please search [existing issues](https://github.com/0xAHA/Growatt_ModbusTCP/issues) to check if it has already been reported.
-
-When opening a new issue, include the information below. Issues missing key details may be closed without investigation.
+Please [search existing issues](https://github.com/0xAHA/Growatt_ModbusTCP/issues) first — your inverter model or symptom may already be covered.
 
 ---
 
-## 1. Integration Version
+## Start here: two attachments answer most questions
 
-The version number shown in **Settings → Devices & Services → Growatt Modbus → ⋮ → Integration manifest**, or the `version` field in `manifest.json`.
+You don't need to fill in a long form. These two cover the majority of reports.
 
----
+### 1. Download diagnostics
 
-## 2. Inverter Model and Profile
+**Settings → Devices & Services → Growatt Modbus → ⋮ → Download diagnostics**
 
-- Your inverter model (e.g. `SPH 6000TL BL-UP`, `MIN 6000TL-X`, `WIT 10000TL3-X`)
-- The profile selected in the integration — check **Settings → Devices & Services → Growatt Modbus → Configure**
-- Single-phase or three-phase?
-- Does your inverter have a battery? If so, what model?
+Attach the JSON file to your issue. It contains almost everything needed to diagnose a problem: integration version, inverter model and profile, connection type, block size, poll interval, how many polls have failed, which register ranges responded, and the last full set of decoded values.
 
----
+Your **IP address, serial number and device path are removed automatically** before the file is written.
 
-## 3. Connection Type
+### 2. Logs, as text
 
-- TCP (via Shine WiFi-X, ShineLink, or a serial-to-TCP adapter)?
-- Direct serial/RTU?
-- If using an adapter, what model (e.g. USR-DR164, Waveshare, EW11)?
+**Settings → Devices & Services → Growatt Modbus → Enable debug logging**, reproduce the problem, then **Disable debug logging** — Home Assistant downloads the log for you.
 
----
+Please paste log lines as text in a code block rather than a screenshot. Screenshots can't be searched, and the useful detail is often a register number or a count in the middle of a long line.
 
-## 4. What Happened vs. What You Expected
+!!! tip "Text beats a screenshot for anything made of characters"
+    This applies to more than logs, and it is the single thing that most often decides whether a report can be acted on at once or needs another round trip.
 
-- What were you doing when the issue occurred?
-- What did you expect to happen?
-- What actually happened?
+    Text can be searched, quoted back to you, pasted into a test, and compared against the protocol tables. An image of text can only be read by eye, and long log lines and wide tables are frequently unreadable at the size they upload at.
 
-If entities are missing or showing wrong values, a screenshot of the affected device card in Home Assistant is very helpful.
+    | Instead of a screenshot of | Send |
+    |---|---|
+    | Log errors | The lines as text in a code block, or the downloaded log file |
+    | A register scan | The CSV itself — drag it into the comment box. It holds far more than the on-screen summary |
+    | Register or sensor values | The numbers typed out, ideally two readings taken at different operating points |
+    | An error message | The message text |
 
----
+    Screenshots remain the right choice for genuinely visual things: a settings page, the shape of a graph, a dialog that is behaving oddly, or a page from a manufacturer document. It is specifically **text inside an image** that costs time.
 
-## 5. Home Assistant Logs
-
-Enable debug logging by adding the following to your `configuration.yaml`, then **restart Home Assistant** and reproduce the issue:
-
-```yaml
-logger:
-  default: warning
-  logs:
-    custom_components.growatt_modbus: debug
-```
-
-Then copy the relevant log lines from **Settings → System → Logs** and paste them into the issue.
+!!! tip "Is there anything under Settings → Repairs?"
+    The integration raises repair notices for problems it can detect itself, such as an inverter reverting your settings or a gateway returning malformed responses. If one is showing, say so — it usually names the cause outright.
 
 ---
 
-## 6. Register Scan (if relevant)
+## Then: what kind of problem is it?
 
-For issues with missing sensors or incorrect values, use the [Universal Register Scanner](diagnostic-service.md) to scan the relevant register range and paste the output into the issue. This is often the fastest way to diagnose a register mapping problem.
+Different symptoms need different evidence. Find yours below.
+
+### A sensor shows a wrong or impossible value
+
+Say **which sensor**, **what it reads**, and **what you believe it should be** — the last part matters most, and it's the part most often left out.
+
+If you can compare against another source — the ShinePhone app, the Growatt portal, a utility meter — that comparison is the single most valuable thing you can provide. It settles questions that a register table cannot.
+
+**One reading proves very little.** Two values can look identical by coincidence at one moment and differ completely an hour later. A second reading at a different time of day, or at a different battery or solar state, turns a guess into evidence.
+
+### A sensor is missing, or you think a register is mapped wrongly
+
+Run the [Universal Register Scanner](diagnostic-service.md) and attach the CSV.
+
+!!! warning "Disable the integration before scanning, and pick your device from the dropdown"
+    **⋮ → Disable**, wait about 30 seconds, run the scan, then re-enable. Don't delete it.
+
+    The scanner opens its own connection. If the integration is still polling, the two compete for the same adapter and most reads fail — producing a scan that looks like a broken inverter on a system that is working perfectly.
+
+    **In the scan service, select your inverter under "Config entry" rather than typing the host and port.** That is how the scan inherits the slave ID, Modbus delay and block size you already have working. Entering the connection by hand starts from defaults instead, which a sensitive adapter may not tolerate — the same empty-looking scan, from a different cause. Selecting the device works while it is disabled (v1.5.2 and later; on earlier versions it did not, which is why this note now exists).
+
+### The connection drops, or entities go unavailable
+
+Nearly always the RS485 adapter rather than the inverter or the integration. Read [RS485 Gateways](rs485-gateways.md) first — it lists which adapters are known to work, the settings that matter, and how to tell a gateway fault from an inverter one.
+
+Worth including: your adapter model, and whether the problem survives a restart of Home Assistant.
+
+### A control won't stick, or reverts after a few seconds
+
+Usually the Growatt cloud overwriting your change. If a **ShineWiFi or ShineLink dongle** is connected, the cloud can restore its own settings within seconds of a local write. The integration detects this and raises a repair notice.
+
+Say which control, what you set it to, and what it reverted to.
+
+### Your inverter model isn't supported, or auto-detection picks the wrong profile
+
+Attach a register scan (see above) and tell us the **exact model from the inverter's label**, not the marketing name. If you know your DTC code, say so — it's in the diagnostics file and in the scan.
+
+---
+
+## Things that genuinely help
+
+- **Correcting yourself.** If a later measurement contradicts what you first reported, say so. It is never unwelcome, and it prevents a working register being "fixed" into a broken one.
+- **Saying what you already ruled out**, and how. It stops the same ground being covered twice.
+- **Telling us it's working.** Confirmation that a fix landed is what lets an issue close, and a report that something works on hardware nobody else has is useful in its own right.
+
+## Things that slow it down
+
+- Screenshots of text.
+- "It doesn't work" without saying what *it* is, or what you expected instead.
+- A scan taken while the integration was still running (see the warning above).
+
+---
+
+None of this is a barrier to reporting. If you're unsure what to include, **open the issue anyway with the diagnostics file attached** — it's better to ask a follow-up question than to have a problem go unreported.

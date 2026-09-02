@@ -8,7 +8,8 @@ SPA_3000_6000_TL_BL = {
     'name': 'SPA (AC Storage) 3-6kW',
     'description': 'AC-coupled battery storage inverter — no PV MPPT inputs (SPA 3000TL BL and similar)',
     'notes': (
-        'Uses ONLY 1000-1124 register range. No solar DC inputs. '
+        'Uses the 1000-1124 range, plus 2000-2124 per the protocol (unverified). '
+        'No solar DC inputs. '
         'Base range (0-124) and 3000+ range respond with zeros — not exceptions. '
         'Holding registers identical to SPH-TL3. '
         'Register layout differs from SPH-TL3 at shared addresses: '
@@ -39,6 +40,25 @@ SPA_3000_6000_TL_BL = {
         1014: {'name': 'battery_soc', 'scale': 1, 'unit': '%'},
         1040: {'name': 'battery_temp', 'scale': 0.1, 'unit': '°C', 'signed': True},
         1041: {'name': 'battery_type', 'scale': 1, 'unit': ''},
+
+        # BMS block (input registers) — documented in V1.39 as "BMS information 1082-1124".
+        #
+        # Added from the protocol rather than a scan: the same block is already
+        # implemented identically in sph.py, and the Homey Growatt app reads these exact
+        # addresses on this hardware. A user on #360 showed Battery Health 97%, cycle
+        # count 225 and BMS status 129 in Homey while Home Assistant had none of them —
+        # not a hardware limit, just registers we had never asked for.
+        #
+        # DELIBERATELY PARTIAL. The full block also defines SOC/voltage/current/temp at
+        # 1086-1089, and those are NOT added here: this profile already carries them at
+        # 1013/1014/1040/1088, field-verified by energy balance in #249. Adding the BMS
+        # copies would duplicate register 1088 outright (silently overriding a verified
+        # mapping, since a later dict key wins) and would give two registers the same
+        # name, making _find_register_by_name() resolution order-dependent.
+        1083: {'name': 'bms_status', 'scale': 1, 'unit': '', 'desc': 'Status from BMS'},
+        1085: {'name': 'bms_error', 'scale': 1, 'unit': '', 'desc': 'Error information from BMS'},
+        1095: {'name': 'bms_cycle_count', 'scale': 1, 'unit': '', 'desc': 'Cycle count from BMS'},
+        1096: {'name': 'bms_soh', 'scale': 1, 'unit': '%', 'desc': 'SOH (State of Health) from BMS'},
 
         # Battery Current (BMS) — signed 16-bit, ×0.01 A
         # Positive = charging, negative = discharging (HA standard convention).
@@ -119,6 +139,84 @@ SPA_3000_6000_TL_BL = {
         1062: {'name': 'load_energy_total_high', 'scale': 1, 'unit': '', 'pair': 1063},
         1063: {'name': 'load_energy_total_low', 'scale': 1, 'unit': '', 'pair': 1062,
                'combined_scale': 0.1, 'combined_unit': 'kWh'},
+
+        # ============================================================================
+        # SPA EXTENDED RANGE 2000-2124 — "thirteen group for Storage power's SPA"
+        # ============================================================================
+        #
+        # UNVERIFIED ON HARDWARE. Scales and meanings are from the V1.39 protocol,
+        # documented in docs/developer/protocol-v139.md under "Thirteenth group — SPA
+        # storage (2000-2124)". Nobody has yet read these addresses on a device.
+        #
+        # These were mapped only after a user posted a photo of the same table on #360,
+        # months after the range was already extracted into our own reference. The
+        # information was checked in the whole time. Grep the reference before treating
+        # a screenshot as a discovery.
+        #
+        # They are added because they fill gaps this profile has carried since it was
+        # built: AC current and AC output power were explicitly recorded as "not
+        # confirmed for SPA" in the model docs, and inverter status and AC energy had no
+        # source at all. Every sensor below is already in this profile's sensor set and
+        # simply had no register behind it.
+        #
+        # Scope note, and the reason this range is not in the SPA-TL3 profile: the
+        # #360 reporter's three-phase SPA-TL3 answers nothing here, nor in 1000-1124.
+        # This block describes single-phase SPA models only. A three-phase SPA uses the
+        # SPH-TL3 layout instead — see spa_tl3_4000_10000_v201.
+        #
+        # If you own a single-phase SPA, a scan of 2000-2124 would confirm or refute all
+        # of this in one pass; the scanner has covered the range since v1.4.0.
+        #
+        # PARTIAL. The protocol documents roughly forty registers here; the ones below
+        # are those with an existing sensor behind them. Still unmapped and available:
+        # 2040/2041 (apparent power VA), 2057/2058 (work time total), 2097 (BatVolt_DSP),
+        # 2098/2099 (P/N bus voltage), 2102-2111 (extra-inverter and system energy),
+        # 2112-2115 (AC charge energy). Each needs a sensor definition, so they are left
+        # until there is a device to verify against.
+        2000: {'name': 'status', 'scale': 1, 'unit': '',
+               'desc': 'Inverter run state (0=waiting, 1=normal, 3=fault) — spec, unverified'},
+
+        # Pac — AC output power. Distinct from the 1000-range flow registers above:
+        # this is the inverter's own output, not the grid connection point.
+        2035: {'name': 'ac_power_high', 'scale': 1, 'unit': '', 'pair': 2036},
+        2036: {'name': 'ac_power_low', 'scale': 1, 'unit': '', 'pair': 2035,
+               'combined_scale': 0.1, 'combined_unit': 'W',
+               'desc': 'AC output power (spec 0.1W, unverified)'},
+
+        # Iac1 — AC output current. Fills a gap the model matrix flagged as unconfirmed.
+        #
+        # Vac1 (2038, 0.1V) and Fac (2037, 0.01Hz) are deliberately NOT mapped: this
+        # profile already has ac_voltage at 1105 and ac_frequency at 1113, both verified
+        # against real readings in #249. A second register with the same name would make
+        # _find_register_by_name() resolution order-dependent, and the verified one must
+        # win. Document-derived values do not get to displace measured ones.
+        2039: {'name': 'ac_current', 'scale': 0.1, 'unit': 'A',
+               'desc': 'AC output current (spec 0.1A, unverified)'},
+
+        # Eac today / total — AC energy generated.
+        #
+        # Worth stating because it was an open question: an AC-coupled inverter with no
+        # solar inputs does still meter the energy it puts out when discharging, and the
+        # protocol gives it a home here. That is why ENERGY_SENSORS belongs on this
+        # profile but not on SPA-TL3, which cannot reach these addresses.
+        2053: {'name': 'energy_today_high', 'scale': 1, 'unit': '', 'pair': 2054},
+        2054: {'name': 'energy_today_low', 'scale': 1, 'unit': '', 'pair': 2053,
+               'combined_scale': 0.1, 'combined_unit': 'kWh',
+               'desc': 'AC energy today (spec 0.1kWh, unverified)'},
+        2055: {'name': 'energy_total_high', 'scale': 1, 'unit': '', 'pair': 2056},
+        2056: {'name': 'energy_total_low', 'scale': 1, 'unit': '', 'pair': 2055,
+               'combined_scale': 0.1, 'combined_unit': 'kWh',
+               'desc': 'AC energy total (spec 0.1kWh, unverified)'},
+
+        # Temperatures. This profile had none at all before — an SPA reported no
+        # temperature of any kind, which read as "this hardware doesn't measure it"
+        # rather than "we never asked".
+        2093: {'name': 'inverter_temp', 'scale': 0.1, 'unit': '°C', 'signed': True,
+               'desc': 'Inverter temperature (spec 0.1C, unverified)'},
+        2094: {'name': 'ipm_temp', 'scale': 0.1, 'unit': '°C', 'signed': True,
+               'desc': 'IPM temperature (spec 0.1C, unverified)'},
+        2095: {'name': 'boost_temp', 'scale': 0.1, 'unit': '°C', 'signed': True,
+               'desc': 'Boost temperature (spec 0.1C, unverified)'},
     },
     'holding_registers': {
         # Confirmed identical to SPH-TL3 from entity values in scan:

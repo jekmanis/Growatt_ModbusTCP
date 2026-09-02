@@ -12,9 +12,13 @@ from homeassistant.helpers.entity import EntityCategory
 
 from .const import DOMAIN, WRITABLE_REGISTERS, CONF_REGISTER_MAP, get_device_type_for_control, DEVICE_TYPE_BATTERY, MOD_TOU_PERIODS
 from .coordinator import GrowattModbusCoordinator
+from .entity import GrowattEntity
 from .growatt_modbus import ModbusWriteError
 
 _LOGGER = logging.getLogger(__name__)
+
+# Writable platform — serialise. See number.py for the reasoning.
+PARALLEL_UPDATES = 1
 
 # Controls that use hex-packed time encoding: register_value = hours*256 + minutes
 # e.g. 06:00 = 0x0600 = 1536, 22:00 = 0x1600 = 5632
@@ -29,7 +33,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Growatt Modbus time entities."""
-    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator = config_entry.runtime_data
 
     register_map_name = config_entry.data.get(CONF_REGISTER_MAP)
     from .const import REGISTER_MAPS
@@ -66,7 +70,7 @@ async def async_setup_entry(
         async_add_entities(entities)
 
 
-class GrowattWitVppTouTime(CoordinatorEntity, TimeEntity):
+class GrowattWitVppTouTime(GrowattEntity, TimeEntity):
     """WIT VPP TOU period start or end time.
 
     Stores time as plain minutes since midnight (0–1439 start, 0–1440 end).
@@ -74,7 +78,6 @@ class GrowattWitVppTouTime(CoordinatorEntity, TimeEntity):
     Writes use FC16 — WIT inverter rejects FC06 on VPP holding registers.
     """
 
-    _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(
@@ -84,8 +87,12 @@ class GrowattWitVppTouTime(CoordinatorEntity, TimeEntity):
         period: int,
         is_start: bool,
     ) -> None:
-        super().__init__(coordinator)
-        self._config_entry = config_entry
+        super().__init__(
+            coordinator,
+            config_entry,
+            f"vpp_tou_p{period}_{'start' if is_start else 'end'}",
+            DEVICE_TYPE_BATTERY,
+        )
         self._period = period
         self._is_start = is_start
         offset = 0 if is_start else 1
@@ -94,13 +101,7 @@ class GrowattWitVppTouTime(CoordinatorEntity, TimeEntity):
 
         self._attr_icon = "mdi:clock-start" if is_start else "mdi:clock-end"
         label = "Start" if is_start else "End"
-        entry_name = config_entry.data.get("name", config_entry.title)
-        self._attr_name = f"{entry_name} TOU Period {period} {label}"
-        self._attr_unique_id = f"{config_entry.entry_id}_vpp_tou_p{period}_{'start' if is_start else 'end'}"
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        return self.coordinator.get_device_info(DEVICE_TYPE_BATTERY)
+        self._attr_name = f"TOU Period {period} {label}"
 
     @property
     def native_value(self) -> dt_time | None:
@@ -134,14 +135,14 @@ class GrowattWitVppTouTime(CoordinatorEntity, TimeEntity):
             _LOGGER.exception("[WIT-TOU] Period %d %s write error: %s", self._period, slot, err)
 
 
-class GrowattGenericTime(CoordinatorEntity, TimeEntity):
+class GrowattGenericTime(GrowattEntity, TimeEntity):
     """Time entity for inverter time period start/end controls.
 
     Hardware stores time as hex-packed bytes: hours*256 + minutes.
     e.g. 06:00 = 0x0600 = 1536, 22:00 = 0x1600 = 5632.
     """
 
-    _attr_has_entity_name = True
+    # has_entity_name comes from GrowattEntity, as do unique_id and device_info.
     _attr_entity_category = EntityCategory.CONFIG
     _attr_icon = "mdi:clock-outline"
 
@@ -153,19 +154,17 @@ class GrowattGenericTime(CoordinatorEntity, TimeEntity):
         control_config: dict,
     ) -> None:
         """Initialize the time entity."""
-        super().__init__(coordinator)
-        self._config_entry = config_entry
+        super().__init__(
+            coordinator,
+            config_entry,
+            control_name,
+            get_device_type_for_control(control_name),
+        )
         self._control_name = control_name
         self._control_config = control_config
 
         friendly_name = control_config.get('label') or control_name.replace('_', ' ').title()
         self._attr_name = friendly_name
-        self._attr_unique_id = f"{config_entry.entry_id}_{control_name}"
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return device information."""
-        return self.coordinator.get_device_info(get_device_type_for_control(self._control_name))
 
     @property
     def native_value(self) -> dt_time | None:
@@ -247,6 +246,7 @@ class GrowattGenericTime(CoordinatorEntity, TimeEntity):
         )
         if triple is not None and len(triple) >= 3:
             current_start, current_end, current_enable = int(triple[0]), int(triple[1]), int(triple[2])
+            values_are_fresh = True
         else:
             _LOGGER.warning(
                 "%s: could not read fresh register triple (reg %d) — falling back to cached data",
@@ -256,9 +256,31 @@ class GrowattGenericTime(CoordinatorEntity, TimeEntity):
             current_start = int(getattr(data, start_name, 0) or 0) if data else 0
             current_end = int(getattr(data, end_name, 0) or 0) if data else 0
             current_enable = int(getattr(data, enable_name, 0) or 0) if data else 0
+            values_are_fresh = False
 
         new_start = raw_value if is_start else current_start
         new_end = raw_value if not is_start else current_end
+
+        # Skip a write that would change nothing (#392).
+        #
+        # These registers are believed to be held in non-volatile memory with finite write
+        # endurance — believed rather than known: Growatt marks a handful of VPP registers
+        # "Not storage" and documents nothing about the rest, so we treat the rest
+        # conservatively. A price-driven controller recomputing all nine slots daily will
+        # usually find most of them unchanged, and there is no reason to spend a write
+        # cycle proving it. `number.py` has done this since v1.6.6; the time entities did
+        # not, which is where a TOU scheduler actually writes.
+        #
+        # Only when the comparison is against a *fresh* read. On the cached fallback the
+        # values may be up to a scan interval old, and a skipped write that should have
+        # happened is worse than a redundant one — the same reasoning that makes this
+        # method re-read the siblings rather than trust coordinator.data at all.
+        if values_are_fresh and new_start == current_start and new_end == current_end:
+            _LOGGER.debug(
+                "%s: already reads start=0x%04X end=0x%04X — skipping write to register %d",
+                name, current_start, current_end, start_reg,
+            )
+            return
 
         _LOGGER.debug(
             "%s: atomic FC16 → reg %d [start=0x%04X, end=0x%04X, enable=%d]",
@@ -311,7 +333,7 @@ class GrowattGenericTime(CoordinatorEntity, TimeEntity):
             await self.coordinator.async_request_refresh()
 
 
-class GrowattModTouTime(CoordinatorEntity, TimeEntity):
+class GrowattModTouTime(GrowattEntity, TimeEntity):
     """Time entity for MOD TL3-XH TOU period start/end registers.
 
     Start registers encode: bit15=enable, bit13-14=priority, bit8-12=hour, bit0-7=minute.
@@ -333,8 +355,12 @@ class GrowattModTouTime(CoordinatorEntity, TimeEntity):
         is_start: bool,
     ) -> None:
         """Initialize the MOD TOU time entity."""
-        super().__init__(coordinator)
-        self._config_entry = config_entry
+        super().__init__(
+            coordinator,
+            config_entry,
+            f"mod_tou_{period_def['period']}_{'start' if is_start else 'end'}",
+            DEVICE_TYPE_BATTERY,
+        )
         self._period_def = period_def
         self._is_start = is_start
         self._period = period_def["period"]
@@ -347,13 +373,6 @@ class GrowattModTouTime(CoordinatorEntity, TimeEntity):
             self._register = period_def["end_reg"]
             self._data_field = period_def["end_field"]
             self._attr_name = f"TOU Period {self._period} End"
-
-        self._attr_unique_id = f"{config_entry.entry_id}_mod_tou_{self._period}_{'start' if is_start else 'end'}"
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return device information."""
-        return self.coordinator.get_device_info(DEVICE_TYPE_BATTERY)
 
     @property
     def native_value(self) -> dt_time | None:
@@ -394,6 +413,7 @@ class GrowattModTouTime(CoordinatorEntity, TimeEntity):
         )
         if pair is not None and len(pair) >= 2:
             current_start, current_end = int(pair[0]), int(pair[1])
+            values_are_fresh = True
         else:
             _LOGGER.warning(
                 "MOD TOU period %d: could not read fresh register pair (reg %d) — falling back to cached data",
@@ -402,6 +422,7 @@ class GrowattModTouTime(CoordinatorEntity, TimeEntity):
             data = self.coordinator.data
             current_start = int(getattr(data, period["start_field"], 0) if data else 0)
             current_end = int(getattr(data, period["end_field"], 0) if data else 0)
+            values_are_fresh = False
 
         # Compute new start raw, preserving priority (bits 13-14) and enable (bit 15)
         if self._is_start:
@@ -416,6 +437,21 @@ class GrowattModTouTime(CoordinatorEntity, TimeEntity):
             new_end = current_end  # unchanged — keep current end when writing start
 
         slot = "start" if self._is_start else "end"
+
+        # Skip a write that would change nothing (#392) — see the matching note in
+        # GrowattGenericTime.async_set_value above. Only against a fresh read; the cached
+        # fallback may be a scan interval old, and a missed write is worse than a spare one.
+        #
+        # Comparing the raw words rather than the times matters here: new_start preserves
+        # the priority and enable bits (13-15) from the current value, so an equal
+        # comparison means the whole register is unchanged, not just the hour and minute.
+        if values_are_fresh and new_start == current_start and new_end == current_end:
+            _LOGGER.debug(
+                "MOD TOU period %d %s: already reads start=0x%04X end=0x%04X — skipping write",
+                self._period, slot, current_start, current_end,
+            )
+            return
+
         try:
             success = await self.hass.async_add_executor_job(
                 self.coordinator.modbus_client.write_registers,

@@ -218,7 +218,44 @@ def test_read_all_data_clears_blacklists_after_a_reconnect(growatt_modbus):
     assert client._failed_optional_holding_addrs == {}
 
 
-def test_shared_connection_bumps_generation_on_each_fresh_connect(growatt_modbus):
+class _FakeTcpClient:
+    """Just enough of a pymodbus TCP client for the hub's connect/close cycle.
+
+    pymodbus is a real test dependency now (the suite installs it), so an unpatched
+    hub would genuinely dial 10.0.0.1:502 and block on the connect timeout. Patching
+    the module-level name is upstream's own idiom - see
+    tests/test_serial_shared_connection.py, which does the same for ``ModbusClient``.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.socket = None
+
+    def connect(self):
+        self.socket = object()
+        return True
+
+    def is_socket_open(self):
+        return self.socket is not None
+
+    def close(self):
+        # reset() only calls disconnect(), which does not drop the client object, so
+        # is_socket_open() going False here is what makes the next ensure_connected()
+        # open a genuinely new session and bump the generation.
+        self.socket = None
+
+
+@pytest.fixture
+def fake_tcp_client(growatt_modbus, monkeypatch):
+    """Make ``SharedModbusConnection.ensure_connected()`` cheap and offline.
+
+    Every test below that connects a hub needs this. Without it the hub really dials
+    10.0.0.1:502 and each connect burns the full 10 s pymodbus timeout.
+    """
+    monkeypatch.setattr(growatt_modbus, "ModbusTcpClient", _FakeTcpClient)
+    return _FakeTcpClient
+
+
+def test_shared_connection_bumps_generation_on_each_fresh_connect(growatt_modbus, fake_tcp_client):
     hub = growatt_modbus.SharedModbusConnection("10.0.0.1", 502)
     assert hub.connection_generation == 0
 
@@ -501,7 +538,7 @@ class _GoodResponse:
         return False
 
 
-def test_hub_reports_no_response_for_an_error_response(growatt_modbus):
+def test_hub_reports_no_response_for_an_error_response(growatt_modbus, fake_tcp_client):
     hub = growatt_modbus.SharedModbusConnection("10.0.0.1", 502)
     hub.ensure_connected()
     hub._client.read_holding_registers = lambda **kw: _ErrorResponse()
@@ -510,7 +547,7 @@ def test_hub_reports_no_response_for_an_error_response(growatt_modbus):
     assert hub.last_error_kind == growatt_modbus.ERROR_KIND_NO_RESPONSE
 
 
-def test_hub_reports_link_for_a_transport_exception(growatt_modbus):
+def test_hub_reports_link_for_a_transport_exception(growatt_modbus, fake_tcp_client):
     hub = growatt_modbus.SharedModbusConnection("10.0.0.1", 502)
     hub.ensure_connected()
 
@@ -523,7 +560,7 @@ def test_hub_reports_link_for_a_transport_exception(growatt_modbus):
     assert hub.last_error_kind == growatt_modbus.ERROR_KIND_LINK
 
 
-def test_hub_clears_the_error_kind_on_success(growatt_modbus):
+def test_hub_clears_the_error_kind_on_success(growatt_modbus, fake_tcp_client):
     hub = growatt_modbus.SharedModbusConnection("10.0.0.1", 502)
     hub.ensure_connected()
     hub.last_error_kind = growatt_modbus.ERROR_KIND_LINK

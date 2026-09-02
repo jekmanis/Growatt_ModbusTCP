@@ -21,6 +21,11 @@ from .const import (
     CONF_DEVICE_PATH,
     CONF_BAUDRATE,
     CONF_INVERT_BATTERY_POWER,
+    PROTOCOL_VARIANT_AUTO,
+    PROTOCOL_VARIANT_LEGACY,
+    PROTOCOL_VARIANT_V201,
+    BLOCK_SIZE_OPTIONS,
+    resolve_block_size,
     DEFAULT_PORT,
     DEFAULT_SLAVE_ID,
     DEFAULT_BAUDRATE,
@@ -36,6 +41,78 @@ from .growatt_modbus import GrowattModbus
 from .auto_detection import async_determine_inverter_type
 
 _LOGGER = logging.getLogger(__name__)
+
+# Where udev puts the stable serial symlinks. Paths here are keyed on vendor, product and
+# serial number, so a given adapter keeps the same one across reboots — unlike /dev/ttyUSBn,
+# which is assigned in enumeration order and swaps between devices (#383).
+SERIAL_BY_ID_DIR = "/dev/serial/by-id"
+
+# The other stable form, keyed on the physical USB socket rather than the device. It is the
+# right choice when the adapter has no serial number to key on — CH340 chips (USB vendor
+# 1a86), which is most of the cheap RS485 adapters, ship without one. Two identical CH340s
+# then produce by-id names that cannot distinguish them, so a user with two adapters can
+# unknowingly point two config entries at the same one. by-path cannot be ambiguous: it
+# names the socket the adapter is plugged into (#384).
+SERIAL_BY_PATH_DIR = "/dev/serial/by-path"
+
+MANUAL_PATH_SENTINEL = "manual"
+
+
+def _serial_port_options(current_path: str | None = None) -> dict[str, str]:
+    """Build the device-path choices for a serial connection.
+
+    Lists the stable symlinks first and says why, because the alternative is a path that
+    silently starts pointing at a different device. The reporter on #383 has a JK BMS on the
+    same machine and loses the inverter whenever the two swap between ttyUSB0 and ttyUSB1.
+
+    Both stable forms are offered, because neither is right for everyone:
+
+    - **by-id** follows the adapter, so it survives being moved to a different socket. It
+      needs the adapter to have a serial number, and CH340s do not have one.
+    - **by-path** follows the USB socket, so it is unambiguous even with two identical
+      adapters, but changes if you replug into a different port.
+
+    `current_path` is always included even when the device is absent right now. That is the
+    whole point: this form exists to be used *after* a path has stopped working, and a
+    `vol.In` whose default is not among its own options renders as an error rather than a
+    form.
+    """
+    options: dict[str, str] = {}
+
+    try:
+        import os
+
+        if os.path.isdir(SERIAL_BY_ID_DIR):
+            for name in sorted(os.listdir(SERIAL_BY_ID_DIR)):
+                path = f"{SERIAL_BY_ID_DIR}/{name}"
+                options[path] = f"{name}  (stable — follows the adapter)"
+    except OSError as err:
+        _LOGGER.debug("Could not list %s: %s", SERIAL_BY_ID_DIR, err)
+
+    try:
+        if os.path.isdir(SERIAL_BY_PATH_DIR):
+            for name in sorted(os.listdir(SERIAL_BY_PATH_DIR)):
+                path = f"{SERIAL_BY_PATH_DIR}/{name}"
+                options[path] = f"{name}  (stable — follows the USB socket)"
+    except OSError as err:
+        _LOGGER.debug("Could not list %s: %s", SERIAL_BY_PATH_DIR, err)
+
+    try:
+        for port in serial.tools.list_ports.comports():
+            if port.device in options:
+                continue
+            desc = port.device
+            if port.description and port.description != "n/a":
+                desc = f"{port.device} - {port.description}"
+            options[port.device] = desc
+    except Exception as err:  # pragma: no cover - platform dependent
+        _LOGGER.debug("Could not enumerate serial ports: %s", err)
+
+    if current_path and current_path not in options:
+        options[current_path] = f"{current_path}  (configured, not detected)"
+
+    options[MANUAL_PATH_SENTINEL] = "⌨️  Enter path manually"
+    return options
 
 
 def _detect_grid_orientation(client: GrowattModbus) -> tuple[bool, str]:
@@ -294,20 +371,17 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
         else:
             _LOGGER.warning("No serial devices found on system")
 
-        # Build port options with descriptions
-        port_options = {}
-        for port in ports:
-            # Create friendly description
-            desc = port.device
-            if port.description and port.description != "n/a":
-                desc = f"{port.device} - {port.description}"
-            port_options[port.device] = desc
+        # Same list the options page builds, so a stable /dev/serial/by-id/ path is offered
+        # at first setup rather than only after a ttyUSB path has already moved (#383).
+        #
+        # First setup is the better moment to choose one: nothing has been built on top of
+        # the entity IDs yet, so picking the durable path costs nothing here and saves a
+        # reconfigure later.
+        port_options = await self.hass.async_add_executor_job(_serial_port_options)
 
-        # Add manual entry option
-        port_options["manual"] = "⌨️  Enter path manually"
-
-        # Default to first port or manual if no ports found
-        default_port = next(iter(port_options.keys())) if port_options else "manual"
+        # by-id paths sort first in the dict, so this defaults to a stable path when one
+        # exists and falls back to whatever was detected otherwise.
+        default_port = next(iter(port_options.keys())) if port_options else MANUAL_PATH_SENTINEL
 
         if not ports:
             _LOGGER.info("Defaulting to manual entry (no devices detected)")
@@ -827,8 +901,13 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
         errors = {}
 
         if user_input is not None:
-            # Update options
-            new_options = {**user_input}
+            # Start from the stored options so keys the form does not expose survive.
+            #
+            # This used to be `{**user_input}`, which replaced the dict wholesale and
+            # silently destroyed anything absent from the schema. `inter_slave_delay` is
+            # read from options by the shared-connection path but has no UI field, so it
+            # reverted to its default every time any option was saved (#367).
+            new_options = {**self.config_entry.options, **user_input}
             
             # If profile changed, update config data too
             new_data = dict(self.config_entry.data)
@@ -851,6 +930,31 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
                 # and legitimate V2.01 users can re-run setup to restore it correctly.
                 supports_v201 = self.config_entry.data.get("vpp_protocol_confirmed", False)
 
+                # An explicit Protocol variant choice overrides that flag (#385).
+                #
+                # Auto keeps whatever detection concluded, so nobody who ignores the field
+                # sees a change. The two explicit values are the escape hatch: until now a
+                # stored flag that disagreed with the hardware could not be corrected at
+                # all, because re-selecting the same family name resolved through the same
+                # flag that was wrong. The only way out was deleting the config entry.
+                #
+                # The new value is persisted, so the override survives a later save that
+                # leaves the field on its stored setting.
+                variant = user_input.get("protocol_variant", PROTOCOL_VARIANT_AUTO)
+                if variant == PROTOCOL_VARIANT_LEGACY:
+                    supports_v201 = False
+                elif variant == PROTOCOL_VARIANT_V201:
+                    supports_v201 = True
+
+                if variant != PROTOCOL_VARIANT_AUTO and \
+                        new_data.get("vpp_protocol_confirmed") != supports_v201:
+                    _LOGGER.info(
+                        "Protocol variant set to %s by hand (was vpp_protocol_confirmed=%s)",
+                        variant, new_data.get("vpp_protocol_confirmed"),
+                    )
+                    new_data["vpp_protocol_confirmed"] = supports_v201
+                    changed = True
+
                 # Resolve to actual profile ID
                 new_series = resolve_profile_selection(selected_display_name, supports_v201=supports_v201)
 
@@ -864,24 +968,95 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
                     changed = True
                     _LOGGER.info(f"Profile changed to: {profile['name']}")
             
-            if changed:
-                self.hass.config_entries.async_update_entry(
-                    self.config_entry,
-                    data=new_data,
-                    options=new_options,
-                    title=new_data[CONF_NAME],
-                )
+            # Connection settings (#383). Written into data rather than options because
+            # that is where the connection lives and where __init__ reads it from.
+            #
+            # No unique_id is recomputed. It was derived from host/port or path/slave at
+            # setup and is only used to stop the same device being added twice; rewriting it
+            # here could collide with another entry, and the failure would be a broken entry
+            # rather than a rejected form.
+            connection_type = self.config_entry.data.get(CONF_CONNECTION_TYPE, "tcp")
+
+            if connection_type == "serial":
+                selected_path = user_input.get(CONF_DEVICE_PATH)
+                manual_path = (user_input.get("manual_path") or "").strip()
+
+                if selected_path == MANUAL_PATH_SENTINEL:
+                    if not manual_path:
+                        errors["base"] = "manual_path_required"
+                        selected_path = None
+                    else:
+                        selected_path = manual_path
+                elif manual_path:
+                    # A path typed while a device was also picked. Take the typed one —
+                    # someone who filled in the free-text box meant it.
+                    selected_path = manual_path
+
+                if selected_path and selected_path != new_data.get(CONF_DEVICE_PATH):
+                    _LOGGER.info(
+                        "Serial device path changed: %s -> %s",
+                        new_data.get(CONF_DEVICE_PATH), selected_path,
+                    )
+                    new_data[CONF_DEVICE_PATH] = selected_path
+                    changed = True
+
+                if CONF_BAUDRATE in user_input and user_input[CONF_BAUDRATE] != new_data.get(CONF_BAUDRATE):
+                    new_data[CONF_BAUDRATE] = user_input[CONF_BAUDRATE]
+                    changed = True
             else:
-                # Just update options
-                self.hass.config_entries.async_update_entry(
-                    self.config_entry,
-                    options=new_options,
-                )
-            
-            # Reload the integration to apply changes
-            await self.hass.config_entries.async_reload(self.config_entry.entry_id)
-            
-            return self.async_create_entry(title="", data=new_options)
+                new_host = (user_input.get(CONF_HOST) or "").strip()
+                if new_host and new_host != new_data.get(CONF_HOST):
+                    _LOGGER.info(
+                        "Host changed: %s -> %s", new_data.get(CONF_HOST), new_host
+                    )
+                    new_data[CONF_HOST] = new_host
+                    changed = True
+
+                if CONF_PORT in user_input and user_input[CONF_PORT] != new_data.get(CONF_PORT):
+                    new_data[CONF_PORT] = user_input[CONF_PORT]
+                    changed = True
+
+            # An invalid entry must not save a partial change. Nothing above has been
+            # persisted yet - new_data and new_options are still local - so when there are
+            # errors we fall through to the form builder below, which re-renders the page
+            # with `errors` populated and the current values as defaults.
+            if not errors:
+                if changed:
+                    self.hass.config_entries.async_update_entry(
+                        self.config_entry,
+                        data=new_data,
+                        options=new_options,
+                        title=new_data[CONF_NAME],
+                    )
+                else:
+                    # Just update options
+                    self.hass.config_entries.async_update_entry(
+                        self.config_entry,
+                        options=new_options,
+                    )
+
+                # Reload the integration to apply changes.
+                #
+                # The settings are already persisted by async_update_entry() above, so this
+                # reload is a convenience - not part of saving. It must not be allowed to
+                # fail the form: async_reload() raises OperationNotAllowed when the entry is
+                # in a non-recoverable state such as FAILED_UNLOAD (e.g. a poll wedged on an
+                # unresponsive gateway held the connection open past the unload timeout).
+                # Unguarded, that propagated to the UI as a bare "Unknown error" while the
+                # change had in fact been saved - leaving the user to retry a save that had
+                # already applied, on an entry that was now stuck (Issue #361).
+                try:
+                    await self.hass.config_entries.async_reload(self.config_entry.entry_id)
+                except Exception as err:
+                    _LOGGER.warning(
+                        "Settings saved, but reloading the integration failed (%s). "
+                        "The new settings will take effect after a manual reload or an HA "
+                        "restart. If this persists the inverter is likely unreachable - "
+                        "check the connection before retrying.",
+                        err,
+                    )
+
+                return self.async_create_entry(title="", data=new_options)
 
         # Build options schema with current values
         current_name = self.config_entry.data.get(CONF_NAME, "Growatt")
@@ -893,12 +1068,44 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
         current_invert_battery = self.config_entry.options.get("invert_battery_power", False)
         current_bvr = self.config_entry.options.get("battery_voltage_range", "Auto-detect")
         current_modbus_delay = self.config_entry.options.get("modbus_delay", 250)
+        # Stored value may be an int from the broken v1.2.0-v1.3.4 selector; map it back
+        # to the label so the dropdown pre-selects correctly instead of showing blank.
+        _stored_block_size = self.config_entry.options.get("max_block_size")
+        _resolved_block_size = resolve_block_size(_stored_block_size)
+        current_max_block_size = next(
+            (label for label, size in BLOCK_SIZE_OPTIONS.items() if size == _resolved_block_size),
+            "Auto (recommended)",
+        )
 
         # Get user-friendly profiles
         available_profiles = get_available_profiles(legacy_only=False, friendly_names=True)
 
         # Convert current profile ID to display name for default
         current_display_name = get_display_name_for_profile(current_series)
+
+        # get_display_name_for_profile() falls back to the profile's technical `name` when
+        # the profile has no PROFILE_DISPLAY_NAMES entry. That value is not a valid dropdown
+        # key, so vol.In() below would reject the default and the user could not save ANY
+        # option change — locked out of scan interval, modbus delay, everything (Issue #361,
+        # where auto-detection assigned tl_xh_3000_10000_v201 for DTC 5100).
+        #
+        # The missing entries are added, but keep this guard: an unrenderable default should
+        # degrade to "profile shown as something else" rather than a dead options page.
+        if current_display_name not in available_profiles:
+            _LOGGER.warning(
+                "Profile '%s' has no display-name entry (resolved to '%s', which is not a "
+                "valid option). Falling back to the first available profile for the form "
+                "default — the configured profile is unchanged unless you select a new one.",
+                current_series, current_display_name,
+            )
+            current_display_name = next(iter(available_profiles), "MIN (7-10kW)")
+
+        # Which variant is in force right now, and what Auto would mean if left alone.
+        # Shown in the Auto label rather than as separate text: a user who does not care
+        # never reads it, and a user debugging can see it without opening a log.
+        _v201_now = self.config_entry.data.get("vpp_protocol_confirmed", False)
+        _variant_now = "VPP V2.01" if _v201_now else "Legacy V1.39"
+        _current_variant = PROTOCOL_VARIANT_AUTO
 
         options_schema = vol.Schema({
             vol.Required(
@@ -909,6 +1116,18 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
                 CONF_INVERTER_SERIES,
                 default=current_display_name
             ): vol.In(list(available_profiles.keys())),
+            # Ten families exist as two register maps. The dropdown above shows one plain
+            # name for both on purpose; this is where the choice can be overridden when
+            # detection got it wrong (#385). Auto is the stored result, so leaving this
+            # alone changes nothing.
+            vol.Required(
+                "protocol_variant",
+                default=_current_variant
+            ): vol.In({
+                PROTOCOL_VARIANT_AUTO: f"Auto (currently {_variant_now})",
+                PROTOCOL_VARIANT_LEGACY: "Legacy V1.39",
+                PROTOCOL_VARIANT_V201: "VPP V2.01",
+            }),
             vol.Required(
                 "scan_interval",
                 default=current_scan_interval
@@ -941,14 +1160,81 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
                 "modbus_delay",
                 default=current_modbus_delay
             ): vol.All(vol.Coerce(int), vol.Range(min=50, max=1000)),
+            # Registers per Modbus request. 0 = Auto (the profile decides).
+            # Lower this when the RS485 gateway truncates large responses — the symptom is
+            # "Unable to decode request" or unit-ID mismatch errors in the log, with
+            # entities unavailable or stuck at zero (Issue #360).
+            vol.Required(
+                "max_block_size",
+                default=current_max_block_size
+            ): vol.In(list(BLOCK_SIZE_OPTIONS)),
         })
+
+        # Connection settings (#383).
+        #
+        # Until now these could only be set at initial setup, so a USB port that changed
+        # after a reboot, or a gateway that moved IP, could only be fixed by deleting the
+        # entry and adding it again — which loses entity IDs, and with them automations,
+        # dashboards and statistics history. The reporter was re-passing USB devices through
+        # Proxmox to force the old path back rather than face that.
+        #
+        # Shown per connection type: a serial entry has no use for a host field, and offering
+        # both invites someone to fill in the wrong one.
+        current_connection_type = self.config_entry.data.get(CONF_CONNECTION_TYPE, "tcp")
+
+        if current_connection_type == "serial":
+            current_device_path = self.config_entry.data.get(CONF_DEVICE_PATH, "")
+            # Enumerating serial ports globs /dev and opens sysfs files, so it must not run
+            # on the event loop — Home Assistant reports it as a blocking call (#384). The
+            # initial config flow already did this correctly; this call site was added later
+            # and did not.
+            port_options = await self.hass.async_add_executor_job(
+                _serial_port_options, current_device_path
+            )
+            options_schema = options_schema.extend({
+                vol.Required(
+                    CONF_DEVICE_PATH,
+                    default=current_device_path if current_device_path in port_options
+                    else MANUAL_PATH_SENTINEL,
+                ): vol.In(port_options),
+                vol.Optional("manual_path"): str,
+                vol.Required(
+                    CONF_BAUDRATE,
+                    default=self.config_entry.data.get(CONF_BAUDRATE, DEFAULT_BAUDRATE),
+                ): vol.In({
+                    9600: "9600 (Default)",
+                    19200: "19200",
+                    38400: "38400",
+                    115200: "115200",
+                }),
+            })
+        else:
+            options_schema = options_schema.extend({
+                vol.Required(
+                    CONF_HOST,
+                    default=self.config_entry.data.get(CONF_HOST, ""),
+                ): str,
+                vol.Required(
+                    CONF_PORT,
+                    default=self.config_entry.data.get(CONF_PORT, DEFAULT_PORT),
+                ): vol.All(vol.Coerce(int), vol.Range(min=1, max=65535)),
+            })
 
         return self.async_show_form(
             step_id="init",
             data_schema=options_schema,
             errors=errors,
             description_placeholders={
-                "info": "Update integration settings and inverter profile"
+                # Name the register map that is actually loaded (#385). Families with
+                # two protocol variants used to share one dropdown entry, so nothing
+                # on this page told you which of them you were running - and a scan
+                # attached to an issue reported the profile key as UNKNOWN on top of
+                # that. Stating it here is what turns "it did not work" into a
+                # diagnosis without a debug log.
+                "info": (
+                    "Update integration settings and inverter profile. "
+                    f"Currently loaded register map: {current_series}"
+                )
             }
         )
     

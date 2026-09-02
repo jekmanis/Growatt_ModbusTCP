@@ -4,6 +4,42 @@ from .vpp_v201 import (
     VPP_V201_BATTERY2, VPP_V201_HOLDING_1P,
 )
 
+# AC charge energy — input registers 112-115, Storage Power interpretation.
+#
+# Protocol V1.39 gives this block two meanings, selected by device class. The rightmost
+# column of the spec table is the selector:
+#
+#   | Reg | MAX-class string inverter | Storage Power (SPH, SPA) |
+#   |-----|---------------------------|--------------------------|
+#   | 112 | Warn Maincode             | EACharge_Today_H         |
+#   | 113 | real Power Percent        | EACharge_Today_L         |
+#   | 114 | inv start delay time      | EACharge_Total_H         |
+#   | 115 | bINVAllFaultCode          | EACharge_Total_L         |
+#
+# SPH is a Storage Power model, so the energy reading applies to every profile in this
+# file. Until this was corrected these profiles mapped 112 as `warning_code` (the MAX
+# meaning) *and* 115 alone as `ac_charge_energy_total` (the Storage meaning) — two
+# interpretations of one block, which cannot both be right on one device (#390).
+#
+# Reading 115 without its high word at 114 also capped the lifetime total at 6553.5 kWh.
+# A reporter's scan read 114=1, 115=5462 → (1<<16)|5462 = 70998 → 7099.8 kWh, where 115
+# alone would have said 546.2.
+#
+# NOT applied to MIN/MID/MOD/MIC/TL3-S/TL-XH. Those also map 112 as warning_code, and for
+# the MAX-class ones that is correct; for the XH hybrids there is no evidence either way
+# and guessing which side of the column they fall on is how wrong-but-plausible values
+# get shipped.
+STORAGE_AC_CHARGE_ENERGY = {
+    112: {'name': 'ac_charge_energy_today_high', 'scale': 1, 'unit': '', 'pair': 113,
+          'desc': 'AC charge energy today HIGH (EACharge_Today_H)'},
+    113: {'name': 'ac_charge_energy_today_low', 'scale': 1, 'unit': '', 'pair': 112,
+          'combined_scale': 0.1, 'combined_unit': 'kWh'},
+    114: {'name': 'ac_charge_energy_total_high', 'scale': 1, 'unit': '', 'pair': 115,
+          'desc': 'AC charge energy total HIGH (EACharge_Total_H)'},
+    115: {'name': 'ac_charge_energy_total_low', 'scale': 1, 'unit': '', 'pair': 114,
+          'combined_scale': 0.1, 'combined_unit': 'kWh'},
+}
+
 # SPH 3000-6000 (Single-phase hybrid with battery)
 SPH_3000_6000 = {
     'name': 'SPH Series 3-6kW',
@@ -48,12 +84,93 @@ SPH_3000_6000 = {
         # Power Flow — grid import/export and load (Issue #326)
         1015: {'name': 'power_to_user_high', 'scale': 1, 'unit': '', 'pair': 1016, 'desc': 'Power to user (grid import when positive)'},
         1016: {'name': 'power_to_user_low', 'scale': 1, 'unit': '', 'pair': 1015, 'combined_scale': 0.1, 'combined_unit': 'W'},
-        1021: {'name': 'power_to_load_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'Total load power consumption'},
-        1022: {'name': 'power_to_load_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        # 1021 was mapped as power_to_load and 1037 as self_consumption_power, which is
+        # the wrong way round (#369). Per V1.39 the storage range runs in four 8-register
+        # blocks — R, S, T, Total — so:
+        #
+        #   1021  PactouserTotal   AC power to user total     -> grid import
+        #   1029  Pactogrid total  AC power to grid total     -> grid export
+        #   1037  PLocalLoad total INV power to local load    -> house load
+        #
+        # Load Power was therefore showing grid import, and the real load at 1037 was
+        # read into a name no sensor group uses and discarded.
+        #
+        # Confirmed on an SPH 5000 (#369): Power to Load, Power to User and Grid Import
+        # Power charted three identical lines across a sunny morning, down to a shared
+        # 29 W baseline. On a single-phase unit R phase and Total are the same
+        # measurement, so 1015 and a mis-mapped 1021 return the same number — genuine
+        # load power would have diverged from import the moment the sun or the battery
+        # supplied the house.
+        #
+        # 1021 keeps a suffixed name so it does not collide with 1015 and does not
+        # participate in fallback, matching what SPH_TL3_3000_10000_V201 already does.
+        1021: {'name': 'power_to_user_total_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal) — grid import'},
+        1022: {'name': 'power_to_user_total_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
         1029: {'name': 'power_to_grid_high', 'scale': 1, 'unit': '', 'pair': 1030, 'desc': 'AC power to grid total (positive=export)'},
         1030: {'name': 'power_to_grid_low', 'scale': 1, 'unit': '', 'pair': 1029, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
-        1037: {'name': 'self_consumption_power_high', 'scale': 1, 'unit': '', 'pair': 1038},
-        1038: {'name': 'self_consumption_power_low', 'scale': 1, 'unit': '', 'pair': 1037, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1037: {'name': 'power_to_load_high', 'scale': 1, 'unit': '', 'pair': 1038, 'desc': 'INV power to local load total H (PLocalLoad total) — house load'},
+        1038: {'name': 'power_to_load_low', 'scale': 1, 'unit': '', 'pair': 1037, 'combined_scale': 0.1, 'combined_unit': 'W'},
+
+        # Battery and load energy counters (#377).
+        #
+        # Absent from this profile until now, which is not the same as being wrong: the
+        # sensors exist in the profile's sensor set and GrowattData defaults them to 0.0,
+        # so Charge/Discharge Today and Total published a steady zero forever. Nothing
+        # errored, because there was never a read to fail.
+        #
+        # Confirmed on an SPH 3600 (DTC 3501) against ShinePhone, register dump and app
+        # screenshot minutes apart, all six exact:
+        #
+        #   discharged  0.7 / 6985.5      charged  2.0 / 6516.5      load  6.7 / 66983.9
+        #
+        # Names match SPH_8000_10000_HU, which already maps this block. The coordinator
+        # accepts either battery_charge_today_low or charge_energy_today_low, so these
+        # feed the existing sensors without further plumbing.
+        #
+        # NOT added here: 1044-1051 (Etouser / Etogrid). They read plausibly on the same
+        # device, but the export lifetime total disagreed with the portal (7561.0 kWh
+        # against 6362), so they want their own evidence rather than riding along on this.
+        # Grid import/export energy. Absent from these two legacy maps until v1.8.10 while
+        # their V2.01 siblings had them, so Export/Import Energy Today and Total had no
+        # register behind them at all and published a default that never moved. Confirmed
+        # on an SPH 5000 against ShinePhone and the Growatt cloud, and corroborated by a
+        # second user's diagnostics on a different unit (#395).
+        #
+        # INPUT space. Holding 1044 in this same profile is priority_mode - a different
+        # register that happens to share the address.
+        1044: {'name': 'energy_to_user_today_high', 'scale': 1, 'unit': '', 'pair': 1045, 'desc': 'Grid import energy today'},
+        1045: {'name': 'energy_to_user_today_low', 'scale': 1, 'unit': '', 'pair': 1044, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1046: {'name': 'energy_to_user_total_high', 'scale': 1, 'unit': '', 'pair': 1047, 'desc': 'Grid import energy total'},
+        1047: {'name': 'energy_to_user_total_low', 'scale': 1, 'unit': '', 'pair': 1046, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1048: {'name': 'energy_to_grid_today_high', 'scale': 1, 'unit': '', 'pair': 1049, 'desc': 'Grid export energy today'},
+        1049: {'name': 'energy_to_grid_today_low', 'scale': 1, 'unit': '', 'pair': 1048, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1050: {'name': 'energy_to_grid_total_high', 'scale': 1, 'unit': '', 'pair': 1051, 'desc': 'Grid export energy total'},
+        1051: {'name': 'energy_to_grid_total_low', 'scale': 1, 'unit': '', 'pair': 1050, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        # BMS block, input space. Confirmed on an SPH3600 against independent instruments
+        # rather than against other registers (#397):
+        #   1086 = 68    while the SOC sensor read 68 %
+        #   1087 = 5420  while the battery measured 54.2 V
+        #   1088 = 1640  against a clamp DC ammeter reading 16.4 A
+        #
+        # The ammeter fixes the scale at 0.01, not the 0.1 that SPH_8000_10000_HU declares
+        # for the same address. Left as measured rather than harmonised with that map: the
+        # two were confirmed on different hardware and only this one against a meter.
+        #
+        # battery_current had no register at all on these profiles before this, so the
+        # entity published its default of 0.00 A permanently - the same shape as #395.
+        1088: {'name': 'battery_current', 'scale': 0.01, 'unit': 'A', 'signed': True, 'desc': 'Battery current from BMS (confirmed vs clamp meter, #397)'},
+        1052: {'name': 'battery_discharge_today_high', 'scale': 1, 'unit': '', 'pair': 1053, 'desc': 'Battery discharge energy today HIGH (Edischarge1_today)'},
+        1053: {'name': 'battery_discharge_today_low', 'scale': 1, 'unit': '', 'pair': 1052, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1054: {'name': 'battery_discharge_total_high', 'scale': 1, 'unit': '', 'pair': 1055, 'desc': 'Battery discharge energy total HIGH (Edischarge1_total)'},
+        1055: {'name': 'battery_discharge_total_low', 'scale': 1, 'unit': '', 'pair': 1054, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1056: {'name': 'battery_charge_today_high', 'scale': 1, 'unit': '', 'pair': 1057, 'desc': 'Battery charge energy today HIGH (Echarge1_today)'},
+        1057: {'name': 'battery_charge_today_low', 'scale': 1, 'unit': '', 'pair': 1056, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1058: {'name': 'battery_charge_total_high', 'scale': 1, 'unit': '', 'pair': 1059, 'desc': 'Battery charge energy total HIGH (Echarge1_total)'},
+        1059: {'name': 'battery_charge_total_low', 'scale': 1, 'unit': '', 'pair': 1058, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1060: {'name': 'load_energy_today_high', 'scale': 1, 'unit': '', 'pair': 1061, 'desc': 'Local load energy today HIGH (ELocalLoad_Today)'},
+        1061: {'name': 'load_energy_today_low', 'scale': 1, 'unit': '', 'pair': 1060, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1062: {'name': 'load_energy_total_high', 'scale': 1, 'unit': '', 'pair': 1063, 'desc': 'Local load energy total HIGH (ELocalLoad_Total)'},
+        1063: {'name': 'load_energy_total_low', 'scale': 1, 'unit': '', 'pair': 1062, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
         # AC Output
         37: {'name': 'ac_frequency', 'scale': 0.01, 'unit': 'Hz'},
@@ -94,10 +211,9 @@ SPH_3000_6000 = {
         # Diagnostics
         104: {'name': 'derating_mode', 'scale': 1, 'unit': ''},
         105: {'name': 'fault_code', 'scale': 1, 'unit': ''},
-        112: {'name': 'warning_code', 'scale': 1, 'unit': ''},
 
-        # Battery AC Charge Energy (SPH 3-6kW V201 with newer firmware)
-        115: {'name': 'ac_charge_energy_total', 'scale': 0.1, 'unit': 'kWh', 'desc': 'Total energy charged from AC/grid to battery'},
+        # AC charge energy today/total — see STORAGE_AC_CHARGE_ENERGY above.
+        **STORAGE_AC_CHARGE_ENERGY,
     },
     'holding_registers': {
         # Basic Control
@@ -287,12 +403,93 @@ SPH_7000_10000 = {
         # Power Flow — grid import/export and load (Issue #326)
         1015: {'name': 'power_to_user_high', 'scale': 1, 'unit': '', 'pair': 1016, 'desc': 'Power to user (grid import when positive)'},
         1016: {'name': 'power_to_user_low', 'scale': 1, 'unit': '', 'pair': 1015, 'combined_scale': 0.1, 'combined_unit': 'W'},
-        1021: {'name': 'power_to_load_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'Total load power consumption'},
-        1022: {'name': 'power_to_load_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        # 1021 was mapped as power_to_load and 1037 as self_consumption_power, which is
+        # the wrong way round (#369). Per V1.39 the storage range runs in four 8-register
+        # blocks — R, S, T, Total — so:
+        #
+        #   1021  PactouserTotal   AC power to user total     -> grid import
+        #   1029  Pactogrid total  AC power to grid total     -> grid export
+        #   1037  PLocalLoad total INV power to local load    -> house load
+        #
+        # Load Power was therefore showing grid import, and the real load at 1037 was
+        # read into a name no sensor group uses and discarded.
+        #
+        # Confirmed on an SPH 5000 (#369): Power to Load, Power to User and Grid Import
+        # Power charted three identical lines across a sunny morning, down to a shared
+        # 29 W baseline. On a single-phase unit R phase and Total are the same
+        # measurement, so 1015 and a mis-mapped 1021 return the same number — genuine
+        # load power would have diverged from import the moment the sun or the battery
+        # supplied the house.
+        #
+        # 1021 keeps a suffixed name so it does not collide with 1015 and does not
+        # participate in fallback, matching what SPH_TL3_3000_10000_V201 already does.
+        1021: {'name': 'power_to_user_total_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal) — grid import'},
+        1022: {'name': 'power_to_user_total_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
         1029: {'name': 'power_to_grid_high', 'scale': 1, 'unit': '', 'pair': 1030, 'desc': 'AC power to grid total (positive=export)'},
         1030: {'name': 'power_to_grid_low', 'scale': 1, 'unit': '', 'pair': 1029, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
-        1037: {'name': 'self_consumption_power_high', 'scale': 1, 'unit': '', 'pair': 1038},
-        1038: {'name': 'self_consumption_power_low', 'scale': 1, 'unit': '', 'pair': 1037, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1037: {'name': 'power_to_load_high', 'scale': 1, 'unit': '', 'pair': 1038, 'desc': 'INV power to local load total H (PLocalLoad total) — house load'},
+        1038: {'name': 'power_to_load_low', 'scale': 1, 'unit': '', 'pair': 1037, 'combined_scale': 0.1, 'combined_unit': 'W'},
+
+        # Battery and load energy counters (#377).
+        #
+        # Absent from this profile until now, which is not the same as being wrong: the
+        # sensors exist in the profile's sensor set and GrowattData defaults them to 0.0,
+        # so Charge/Discharge Today and Total published a steady zero forever. Nothing
+        # errored, because there was never a read to fail.
+        #
+        # Confirmed on an SPH 3600 (DTC 3501) against ShinePhone, register dump and app
+        # screenshot minutes apart, all six exact:
+        #
+        #   discharged  0.7 / 6985.5      charged  2.0 / 6516.5      load  6.7 / 66983.9
+        #
+        # Names match SPH_8000_10000_HU, which already maps this block. The coordinator
+        # accepts either battery_charge_today_low or charge_energy_today_low, so these
+        # feed the existing sensors without further plumbing.
+        #
+        # NOT added here: 1044-1051 (Etouser / Etogrid). They read plausibly on the same
+        # device, but the export lifetime total disagreed with the portal (7561.0 kWh
+        # against 6362), so they want their own evidence rather than riding along on this.
+        # Grid import/export energy. Absent from these two legacy maps until v1.8.10 while
+        # their V2.01 siblings had them, so Export/Import Energy Today and Total had no
+        # register behind them at all and published a default that never moved. Confirmed
+        # on an SPH 5000 against ShinePhone and the Growatt cloud, and corroborated by a
+        # second user's diagnostics on a different unit (#395).
+        #
+        # INPUT space. Holding 1044 in this same profile is priority_mode - a different
+        # register that happens to share the address.
+        1044: {'name': 'energy_to_user_today_high', 'scale': 1, 'unit': '', 'pair': 1045, 'desc': 'Grid import energy today'},
+        1045: {'name': 'energy_to_user_today_low', 'scale': 1, 'unit': '', 'pair': 1044, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1046: {'name': 'energy_to_user_total_high', 'scale': 1, 'unit': '', 'pair': 1047, 'desc': 'Grid import energy total'},
+        1047: {'name': 'energy_to_user_total_low', 'scale': 1, 'unit': '', 'pair': 1046, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1048: {'name': 'energy_to_grid_today_high', 'scale': 1, 'unit': '', 'pair': 1049, 'desc': 'Grid export energy today'},
+        1049: {'name': 'energy_to_grid_today_low', 'scale': 1, 'unit': '', 'pair': 1048, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1050: {'name': 'energy_to_grid_total_high', 'scale': 1, 'unit': '', 'pair': 1051, 'desc': 'Grid export energy total'},
+        1051: {'name': 'energy_to_grid_total_low', 'scale': 1, 'unit': '', 'pair': 1050, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        # BMS block, input space. Confirmed on an SPH3600 against independent instruments
+        # rather than against other registers (#397):
+        #   1086 = 68    while the SOC sensor read 68 %
+        #   1087 = 5420  while the battery measured 54.2 V
+        #   1088 = 1640  against a clamp DC ammeter reading 16.4 A
+        #
+        # The ammeter fixes the scale at 0.01, not the 0.1 that SPH_8000_10000_HU declares
+        # for the same address. Left as measured rather than harmonised with that map: the
+        # two were confirmed on different hardware and only this one against a meter.
+        #
+        # battery_current had no register at all on these profiles before this, so the
+        # entity published its default of 0.00 A permanently - the same shape as #395.
+        1088: {'name': 'battery_current', 'scale': 0.01, 'unit': 'A', 'signed': True, 'desc': 'Battery current from BMS (confirmed vs clamp meter, #397)'},
+        1052: {'name': 'battery_discharge_today_high', 'scale': 1, 'unit': '', 'pair': 1053, 'desc': 'Battery discharge energy today HIGH (Edischarge1_today)'},
+        1053: {'name': 'battery_discharge_today_low', 'scale': 1, 'unit': '', 'pair': 1052, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1054: {'name': 'battery_discharge_total_high', 'scale': 1, 'unit': '', 'pair': 1055, 'desc': 'Battery discharge energy total HIGH (Edischarge1_total)'},
+        1055: {'name': 'battery_discharge_total_low', 'scale': 1, 'unit': '', 'pair': 1054, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1056: {'name': 'battery_charge_today_high', 'scale': 1, 'unit': '', 'pair': 1057, 'desc': 'Battery charge energy today HIGH (Echarge1_today)'},
+        1057: {'name': 'battery_charge_today_low', 'scale': 1, 'unit': '', 'pair': 1056, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1058: {'name': 'battery_charge_total_high', 'scale': 1, 'unit': '', 'pair': 1059, 'desc': 'Battery charge energy total HIGH (Echarge1_total)'},
+        1059: {'name': 'battery_charge_total_low', 'scale': 1, 'unit': '', 'pair': 1058, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1060: {'name': 'load_energy_today_high', 'scale': 1, 'unit': '', 'pair': 1061, 'desc': 'Local load energy today HIGH (ELocalLoad_Today)'},
+        1061: {'name': 'load_energy_today_low', 'scale': 1, 'unit': '', 'pair': 1060, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1062: {'name': 'load_energy_total_high', 'scale': 1, 'unit': '', 'pair': 1063, 'desc': 'Local load energy total HIGH (ELocalLoad_Total)'},
+        1063: {'name': 'load_energy_total_low', 'scale': 1, 'unit': '', 'pair': 1062, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
         # AC Output
         37: {'name': 'ac_frequency', 'scale': 0.01, 'unit': 'Hz'},
@@ -319,6 +516,20 @@ SPH_7000_10000 = {
         65: {'name': 'pv2_energy_total_high', 'scale': 1, 'unit': '', 'pair': 66, 'desc': 'PV2 DC energy total HIGH'},
         66: {'name': 'pv2_energy_total_low', 'scale': 1, 'unit': '', 'pair': 65, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'PV2 DC energy total LOW'},
 
+        # PV3 energy. This profile declares has_pv3, and use_mppt_energy_today sums the
+        # per-string counters, so without these a third string is missing from the daily
+        # solar figure entirely — measured as a whole-string shortfall on the MOD map (#381).
+        #
+        # Protocol V1.39 documents 67-70 as Epv3_today / Epv3_total. Confirmed on hardware
+        # for MOD_6000_15000TL3_XH; carried here on the protocol plus the shared register
+        # layout, not on an SPH 7-10kW reading. A two-string unit answers 0 and the sensors
+        # stay hidden by their non-zero condition, so this cannot make anything worse than
+        # the current silent omission.
+        67: {'name': 'pv3_energy_today_high', 'scale': 1, 'unit': '', 'pair': 68, 'desc': 'PV3 DC energy today HIGH (Epv3_today)'},
+        68: {'name': 'pv3_energy_today_low', 'scale': 1, 'unit': '', 'pair': 67, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'PV3 DC energy today LOW'},
+        69: {'name': 'pv3_energy_total_high', 'scale': 1, 'unit': '', 'pair': 70, 'desc': 'PV3 DC energy total HIGH (Epv3_total)'},
+        70: {'name': 'pv3_energy_total_low', 'scale': 1, 'unit': '', 'pair': 69, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'PV3 DC energy total LOW'},
+
         # Temperatures
         93: {'name': 'inverter_temp', 'scale': 0.1, 'unit': '°C', 'signed': True},
         94: {'name': 'ipm_temp', 'scale': 0.1, 'unit': '°C', 'signed': True},
@@ -327,7 +538,9 @@ SPH_7000_10000 = {
         # Diagnostics
         104: {'name': 'derating_mode', 'scale': 1, 'unit': ''},
         105: {'name': 'fault_code', 'scale': 1, 'unit': ''},
-        112: {'name': 'warning_code', 'scale': 1, 'unit': ''},
+
+        # AC charge energy today/total — see STORAGE_AC_CHARGE_ENERGY above.
+        **STORAGE_AC_CHARGE_ENERGY,
     },
     'holding_registers': {
         # Basic Control
@@ -509,12 +722,13 @@ SPH_8000_10000_HU = {
         # Power Flow - Critical for grid import/export tracking
         1015: {'name': 'power_to_user_high', 'scale': 1, 'unit': '', 'pair': 1016, 'desc': 'Power to user (grid import when positive)'},
         1016: {'name': 'power_to_user_low', 'scale': 1, 'unit': '', 'pair': 1015, 'combined_scale': 0.1, 'combined_unit': 'W'},
-        1021: {'name': 'power_to_load_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'Total load power consumption'},
-        1022: {'name': 'power_to_load_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        # Same correction as the two profiles above — see #369 and the note there.
+        1021: {'name': 'power_to_user_total_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal) — grid import'},
+        1022: {'name': 'power_to_user_total_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
         1029: {'name': 'power_to_grid_high', 'scale': 1, 'unit': '', 'pair': 1030, 'desc': 'AC power to grid total H (Pactogrid total, positive=export)'},
         1030: {'name': 'power_to_grid_low', 'scale': 1, 'unit': '', 'pair': 1029, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
-        1037: {'name': 'self_consumption_power_high', 'scale': 1, 'unit': '', 'pair': 1038},
-        1038: {'name': 'self_consumption_power_low', 'scale': 1, 'unit': '', 'pair': 1037, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1037: {'name': 'power_to_load_high', 'scale': 1, 'unit': '', 'pair': 1038, 'desc': 'INV power to local load total H (PLocalLoad total) — house load'},
+        1038: {'name': 'power_to_load_low', 'scale': 1, 'unit': '', 'pair': 1037, 'combined_scale': 0.1, 'combined_unit': 'W'},
         1039: {'name': 'self_consumption_percentage', 'scale': 1, 'unit': '%'},
 
         # Energy Breakdown - Hardware registers for grid import/export
@@ -546,9 +760,27 @@ SPH_8000_10000_HU = {
         1084: {'name': 'bms_error_old', 'scale': 1, 'unit': '', 'desc': 'Error info Old from BMS'},
         1085: {'name': 'bms_error', 'scale': 1, 'unit': '', 'desc': 'Error information from BMS'},
         1086: {'name': 'battery_soc', 'scale': 1, 'unit': '%', 'desc': 'SOC from BMS (actual battery state of charge)'},
-        1087: {'name': 'battery_voltage', 'scale': 0.1, 'unit': 'V', 'desc': 'Battery voltage from BMS'},
-        1088: {'name': 'battery_current', 'scale': 0.1, 'unit': 'A', 'desc': 'Battery current from BMS', 'signed': True},
-        1089: {'name': 'battery_temp', 'scale': 0.1, 'unit': '°C', 'desc': 'Battery temperature from BMS', 'signed': True},
+        # Scales here come from the ESS Protocol, which V1.39 names as the reference for
+        # this whole block (see Protocols/1xSxxP_ESS_Protocol_rev2.3_20171128.pdf and
+        # docs/developer/protocol-ess.md). Its Status Query table gives:
+        #   0x0016 Voltage      10 mV  -> 0.01 V
+        #   0x0017 Current      10 mA  -> 0.01 A, two's complement
+        #   0x0018 Temperature  degC   -> whole degrees, range -127..127
+        #
+        # 1088 was 0.1 here, which is neither documented nor measured - most likely taken
+        # by analogy from register 3170 (Ibat), which really is 0.1 A on the MIN/MOD range.
+        # Corrected to the documented 0.01, matching the four other SPH maps where it was
+        # also confirmed against a clamp meter (#397).
+        #
+        # 1087 and 1089 left as they are, deliberately:
+        #   - 1087 is shadowed by 1013, which carries the same name and is found first, so
+        #     this scale is never exercised. Changing it would be an untested no-op.
+        #   - 1089 reads whole degrees per the spec, but the runtime detection added for
+        #     #397 already corrects that at read time on any firmware that does so.
+        # Neither has a device report behind it and no HU owner has measured either.
+        1087: {'name': 'battery_voltage', 'scale': 0.1, 'unit': 'V', 'desc': 'Battery voltage from BMS (shadowed by 1013; scale unverified)'},
+        1088: {'name': 'battery_current', 'scale': 0.01, 'unit': 'A', 'desc': 'Battery current from BMS (ESS Protocol 0x0017, 10 mA)', 'signed': True},
+        1089: {'name': 'battery_temp', 'scale': 0.1, 'unit': '°C', 'desc': 'Battery temperature from BMS (whole degrees per ESS; corrected at read time)', 'signed': True},
         1090: {'name': 'bms_max_current', 'scale': 0.1, 'unit': 'A', 'desc': 'Max charge/discharge current from BMS'},
         1091: {'name': 'bms_gauge_rm', 'scale': 1, 'unit': '', 'desc': 'Gauge RM from BMS'},
         1092: {'name': 'bms_gauge_fcc', 'scale': 1, 'unit': '', 'desc': 'Gauge FCC from BMS'},
@@ -612,8 +844,13 @@ SPH_3000_6000_V201 = {
         # 1021: PactouserTotal  = AC power to user total (grid import)
         # 1029: Pactogrid total = AC power to grid total (grid export)
         # 1037: PLocalLoad total = INV power to local load total
-        1021: {'name': 'power_to_user_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal)'},
-        1022: {'name': 'power_to_user_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        # Suffixed, because this profile inherits 1015/1016 as `power_to_user` from the
+        # legacy map above. Both addresses carry grid import and are the same number on
+        # single-phase hardware, so naming them identically was harmless in effect — but
+        # it left _find_register_by_name() picking whichever came first in iteration
+        # order, which is not something to rely on. Matches SPH_TL3_3000_10000_V201.
+        1021: {'name': 'power_to_user_total_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal)'},
+        1022: {'name': 'power_to_user_total_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
         1029: {'name': 'power_to_grid_high', 'scale': 1, 'unit': '', 'pair': 1030, 'desc': 'AC power to grid total H (Pactogrid total)'},
         1030: {'name': 'power_to_grid_low', 'scale': 1, 'unit': '', 'pair': 1029, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
         1037: {'name': 'power_to_load_high', 'scale': 1, 'unit': '', 'pair': 1038, 'desc': 'INV power to local load total H (PLocalLoad total)'},
@@ -630,10 +867,44 @@ SPH_3000_6000_V201 = {
         1051: {'name': 'energy_to_grid_total_low', 'scale': 1, 'unit': '', 'pair': 1050, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
         # Grid Energy (from grid / import)
-        1052: {'name': 'grid_import_energy_today_high', 'scale': 1, 'unit': '', 'pair': 1053},
-        1053: {'name': 'grid_import_energy_today_low', 'scale': 1, 'unit': '', 'pair': 1052, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        1054: {'name': 'grid_import_energy_total_high', 'scale': 1, 'unit': '', 'pair': 1055},
-        1055: {'name': 'grid_import_energy_total_low', 'scale': 1, 'unit': '', 'pair': 1054, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        # 1052-1059 are the LEGACY battery energy counters, not grid import (#378).
+        #
+        # These were mapped as grid_import_energy_*, which cannot be right: grid import is
+        # already correctly at 1044/1046 (Etouser) in this same profile, and Protocol V1.39
+        # documents 1052 as Edischarge1_today and 1056 as Echarge1_today. Confirmed on SPH
+        # hardware against ShinePhone (#377), where all six of 1052-1063 matched exactly.
+        #
+        # These carry the CANONICAL names; the VPP block at 31202-31209 carries a _vpp
+        # suffix plus maps_to. That matches how battery_voltage (1013 / 31214) and
+        # battery_soc (1014 / 31217) are already handled in this same profile, and it lets
+        # the range detection pick whichever range the device actually answers on.
+        #
+        # The direction matters (#377). With the canonical names on the VPP side instead, a
+        # V1.39 SPH configured onto a V2.01 profile read a permanent 0.0 for battery energy:
+        # its poll never touches the 31000 range at all, so the only mapping under the name
+        # the coordinator looks for was one the hardware never answers. Voltage and SOC
+        # worked on the same device precisely because they follow this convention.
+        # BMS block, input space. Confirmed on an SPH3600 against independent instruments
+        # rather than against other registers (#397):
+        #   1086 = 68    while the SOC sensor read 68 %
+        #   1087 = 5420  while the battery measured 54.2 V
+        #   1088 = 1640  against a clamp DC ammeter reading 16.4 A
+        #
+        # The ammeter fixes the scale at 0.01, not the 0.1 that SPH_8000_10000_HU declares
+        # for the same address. Left as measured rather than harmonised with that map: the
+        # two were confirmed on different hardware and only this one against a meter.
+        #
+        # battery_current had no register at all on these profiles before this, so the
+        # entity published its default of 0.00 A permanently - the same shape as #395.
+        1088: {'name': 'battery_current', 'scale': 0.01, 'unit': 'A', 'signed': True, 'desc': 'Battery current from BMS (confirmed vs clamp meter, #397)'},
+        1052: {'name': 'battery_discharge_today_high', 'scale': 1, 'unit': '', 'pair': 1053, 'desc': 'Battery discharge today (Edischarge1_today)'},
+        1053: {'name': 'battery_discharge_today_low', 'scale': 1, 'unit': '', 'pair': 1052, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1054: {'name': 'battery_discharge_total_high', 'scale': 1, 'unit': '', 'pair': 1055, 'desc': 'Battery discharge total (Edischarge1_total)'},
+        1055: {'name': 'battery_discharge_total_low', 'scale': 1, 'unit': '', 'pair': 1054, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1056: {'name': 'battery_charge_today_high', 'scale': 1, 'unit': '', 'pair': 1057, 'desc': 'Battery charge today (Echarge1_today)'},
+        1057: {'name': 'battery_charge_today_low', 'scale': 1, 'unit': '', 'pair': 1056, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1058: {'name': 'battery_charge_total_high', 'scale': 1, 'unit': '', 'pair': 1059, 'desc': 'Battery charge total (Echarge1_total)'},
+        1059: {'name': 'battery_charge_total_low', 'scale': 1, 'unit': '', 'pair': 1058, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
         # Load Energy
         1060: {'name': 'load_energy_today_high', 'scale': 1, 'unit': '', 'pair': 1061},
@@ -693,14 +964,16 @@ SPH_3000_6000_V201 = {
 
         # Battery Energy (VPP V2.01 protocol: 31202=charge today, 31204=charge total,
         #                                       31206=discharge today, 31208=discharge total)
-        31202: {'name': 'battery_charge_today_high', 'scale': 1, 'unit': '', 'pair': 31203, 'desc': 'Battery charge energy today HIGH'},
-        31203: {'name': 'battery_charge_today_low', 'scale': 1, 'unit': '', 'pair': 31202, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        31204: {'name': 'battery_charge_total_high', 'scale': 1, 'unit': '', 'pair': 31205, 'desc': 'Battery charge energy total HIGH'},
-        31205: {'name': 'battery_charge_total_low', 'scale': 1, 'unit': '', 'pair': 31204, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        31206: {'name': 'battery_discharge_today_high', 'scale': 1, 'unit': '', 'pair': 31207, 'desc': 'Battery discharge energy today HIGH'},
-        31207: {'name': 'battery_discharge_today_low', 'scale': 1, 'unit': '', 'pair': 31206, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        31208: {'name': 'battery_discharge_total_high', 'scale': 1, 'unit': '', 'pair': 31209, 'desc': 'Battery discharge energy total HIGH'},
-        31209: {'name': 'battery_discharge_total_low', 'scale': 1, 'unit': '', 'pair': 31208, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        # _vpp suffix plus maps_to, so these are the fallback rather than the only source.
+        # The canonical names live on 1052-1059 above; range detection chooses between them.
+        31202: {'name': 'battery_charge_today_vpp_high', 'scale': 1, 'unit': '', 'pair': 31203, 'desc': 'Battery charge energy today HIGH (VPP)'},
+        31203: {'name': 'battery_charge_today_vpp_low', 'scale': 1, 'unit': '', 'pair': 31202, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'maps_to': 'battery_charge_today_low'},
+        31204: {'name': 'battery_charge_total_vpp_high', 'scale': 1, 'unit': '', 'pair': 31205, 'desc': 'Battery charge energy total HIGH (VPP)'},
+        31205: {'name': 'battery_charge_total_vpp_low', 'scale': 1, 'unit': '', 'pair': 31204, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'maps_to': 'battery_charge_total_low'},
+        31206: {'name': 'battery_discharge_today_vpp_high', 'scale': 1, 'unit': '', 'pair': 31207, 'desc': 'Battery discharge energy today HIGH (VPP)'},
+        31207: {'name': 'battery_discharge_today_vpp_low', 'scale': 1, 'unit': '', 'pair': 31206, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'maps_to': 'battery_discharge_today_low'},
+        31208: {'name': 'battery_discharge_total_vpp_high', 'scale': 1, 'unit': '', 'pair': 31209, 'desc': 'Battery discharge energy total HIGH (VPP)'},
+        31209: {'name': 'battery_discharge_total_vpp_low', 'scale': 1, 'unit': '', 'pair': 31208, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'maps_to': 'battery_discharge_total_low'},
 
         31214: {'name': 'battery_voltage_vpp', 'scale': 0.1, 'unit': 'V', 'maps_to': 'battery_voltage', 'signed': True},
         31215: {'name': 'battery_current_vpp', 'scale': 0.1, 'unit': 'A', 'maps_to': 'battery_current', 'signed': True},
@@ -744,8 +1017,13 @@ SPH_7000_10000_V201 = {
         # 1021: PactouserTotal  = AC power to user total (grid import)
         # 1029: Pactogrid total = AC power to grid total (grid export)
         # 1037: PLocalLoad total = INV power to local load total
-        1021: {'name': 'power_to_user_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal)'},
-        1022: {'name': 'power_to_user_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        # Suffixed, because this profile inherits 1015/1016 as `power_to_user` from the
+        # legacy map above. Both addresses carry grid import and are the same number on
+        # single-phase hardware, so naming them identically was harmless in effect — but
+        # it left _find_register_by_name() picking whichever came first in iteration
+        # order, which is not something to rely on. Matches SPH_TL3_3000_10000_V201.
+        1021: {'name': 'power_to_user_total_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal)'},
+        1022: {'name': 'power_to_user_total_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
         1029: {'name': 'power_to_grid_high', 'scale': 1, 'unit': '', 'pair': 1030, 'desc': 'AC power to grid total H (Pactogrid total)'},
         1030: {'name': 'power_to_grid_low', 'scale': 1, 'unit': '', 'pair': 1029, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
         1037: {'name': 'power_to_load_high', 'scale': 1, 'unit': '', 'pair': 1038, 'desc': 'INV power to local load total H (PLocalLoad total)'},
@@ -762,10 +1040,44 @@ SPH_7000_10000_V201 = {
         1051: {'name': 'energy_to_grid_total_low', 'scale': 1, 'unit': '', 'pair': 1050, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
         # Grid Energy (from grid / import)
-        1052: {'name': 'grid_import_energy_today_high', 'scale': 1, 'unit': '', 'pair': 1053},
-        1053: {'name': 'grid_import_energy_today_low', 'scale': 1, 'unit': '', 'pair': 1052, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        1054: {'name': 'grid_import_energy_total_high', 'scale': 1, 'unit': '', 'pair': 1055},
-        1055: {'name': 'grid_import_energy_total_low', 'scale': 1, 'unit': '', 'pair': 1054, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        # 1052-1059 are the LEGACY battery energy counters, not grid import (#378).
+        #
+        # These were mapped as grid_import_energy_*, which cannot be right: grid import is
+        # already correctly at 1044/1046 (Etouser) in this same profile, and Protocol V1.39
+        # documents 1052 as Edischarge1_today and 1056 as Echarge1_today. Confirmed on SPH
+        # hardware against ShinePhone (#377), where all six of 1052-1063 matched exactly.
+        #
+        # These carry the CANONICAL names; the VPP block at 31202-31209 carries a _vpp
+        # suffix plus maps_to. That matches how battery_voltage (1013 / 31214) and
+        # battery_soc (1014 / 31217) are already handled in this same profile, and it lets
+        # the range detection pick whichever range the device actually answers on.
+        #
+        # The direction matters (#377). With the canonical names on the VPP side instead, a
+        # V1.39 SPH configured onto a V2.01 profile read a permanent 0.0 for battery energy:
+        # its poll never touches the 31000 range at all, so the only mapping under the name
+        # the coordinator looks for was one the hardware never answers. Voltage and SOC
+        # worked on the same device precisely because they follow this convention.
+        # BMS block, input space. Confirmed on an SPH3600 against independent instruments
+        # rather than against other registers (#397):
+        #   1086 = 68    while the SOC sensor read 68 %
+        #   1087 = 5420  while the battery measured 54.2 V
+        #   1088 = 1640  against a clamp DC ammeter reading 16.4 A
+        #
+        # The ammeter fixes the scale at 0.01, not the 0.1 that SPH_8000_10000_HU declares
+        # for the same address. Left as measured rather than harmonised with that map: the
+        # two were confirmed on different hardware and only this one against a meter.
+        #
+        # battery_current had no register at all on these profiles before this, so the
+        # entity published its default of 0.00 A permanently - the same shape as #395.
+        1088: {'name': 'battery_current', 'scale': 0.01, 'unit': 'A', 'signed': True, 'desc': 'Battery current from BMS (confirmed vs clamp meter, #397)'},
+        1052: {'name': 'battery_discharge_today_high', 'scale': 1, 'unit': '', 'pair': 1053, 'desc': 'Battery discharge today (Edischarge1_today)'},
+        1053: {'name': 'battery_discharge_today_low', 'scale': 1, 'unit': '', 'pair': 1052, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1054: {'name': 'battery_discharge_total_high', 'scale': 1, 'unit': '', 'pair': 1055, 'desc': 'Battery discharge total (Edischarge1_total)'},
+        1055: {'name': 'battery_discharge_total_low', 'scale': 1, 'unit': '', 'pair': 1054, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1056: {'name': 'battery_charge_today_high', 'scale': 1, 'unit': '', 'pair': 1057, 'desc': 'Battery charge today (Echarge1_today)'},
+        1057: {'name': 'battery_charge_today_low', 'scale': 1, 'unit': '', 'pair': 1056, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        1058: {'name': 'battery_charge_total_high', 'scale': 1, 'unit': '', 'pair': 1059, 'desc': 'Battery charge total (Echarge1_total)'},
+        1059: {'name': 'battery_charge_total_low', 'scale': 1, 'unit': '', 'pair': 1058, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
         # Load Energy
         1060: {'name': 'load_energy_today_high', 'scale': 1, 'unit': '', 'pair': 1061},
@@ -819,24 +1131,24 @@ SPH_7000_10000_V201 = {
         #                      31206=discharge today, 31208=discharge total
         31200: {'name': 'battery_power_high', 'scale': 1, 'unit': '', 'pair': 31201},
         31201: {'name': 'battery_power_low', 'scale': 1, 'unit': '', 'pair': 31200, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
-        31202: {'name': 'battery_charge_today_high', 'scale': 1, 'unit': '', 'pair': 31203, 'desc': 'Battery charge energy today HIGH'},
-        31203: {'name': 'battery_charge_today_low', 'scale': 1, 'unit': '', 'pair': 31202, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        31204: {'name': 'battery_charge_total_high', 'scale': 1, 'unit': '', 'pair': 31205, 'desc': 'Battery charge energy total HIGH'},
-        31205: {'name': 'battery_charge_total_low', 'scale': 1, 'unit': '', 'pair': 31204, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        31206: {'name': 'battery_discharge_today_high', 'scale': 1, 'unit': '', 'pair': 31207, 'desc': 'Battery discharge energy today HIGH'},
-        31207: {'name': 'battery_discharge_today_low', 'scale': 1, 'unit': '', 'pair': 31206, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        31208: {'name': 'battery_discharge_total_high', 'scale': 1, 'unit': '', 'pair': 31209, 'desc': 'Battery discharge energy total HIGH'},
-        31209: {'name': 'battery_discharge_total_low', 'scale': 1, 'unit': '', 'pair': 31208, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        # _vpp suffix plus maps_to, so these are the fallback rather than the only source.
+        # The canonical names live on 1052-1059 above; range detection chooses between them.
+        31202: {'name': 'battery_charge_today_vpp_high', 'scale': 1, 'unit': '', 'pair': 31203, 'desc': 'Battery charge energy today HIGH (VPP)'},
+        31203: {'name': 'battery_charge_today_vpp_low', 'scale': 1, 'unit': '', 'pair': 31202, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'maps_to': 'battery_charge_today_low'},
+        31204: {'name': 'battery_charge_total_vpp_high', 'scale': 1, 'unit': '', 'pair': 31205, 'desc': 'Battery charge energy total HIGH (VPP)'},
+        31205: {'name': 'battery_charge_total_vpp_low', 'scale': 1, 'unit': '', 'pair': 31204, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'maps_to': 'battery_charge_total_low'},
+        31206: {'name': 'battery_discharge_today_vpp_high', 'scale': 1, 'unit': '', 'pair': 31207, 'desc': 'Battery discharge energy today HIGH (VPP)'},
+        31207: {'name': 'battery_discharge_today_vpp_low', 'scale': 1, 'unit': '', 'pair': 31206, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'maps_to': 'battery_discharge_today_low'},
+        31208: {'name': 'battery_discharge_total_vpp_high', 'scale': 1, 'unit': '', 'pair': 31209, 'desc': 'Battery discharge energy total HIGH (VPP)'},
+        31209: {'name': 'battery_discharge_total_vpp_low', 'scale': 1, 'unit': '', 'pair': 31208, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'maps_to': 'battery_discharge_total_low'},
         31214: {'name': 'battery_voltage_vpp', 'scale': 0.1, 'unit': 'V', 'maps_to': 'battery_voltage', 'signed': True},
         31215: {'name': 'battery_current_vpp', 'scale': 0.1, 'unit': 'A', 'maps_to': 'battery_current', 'signed': True},
         31217: {'name': 'battery_soc_vpp', 'scale': 1, 'unit': '%', 'maps_to': 'battery_soc'},
         31218: {'name': 'battery_soh', 'scale': 1, 'unit': '%', 'desc': 'Battery state of health'},
         # Note: Registers 31220-31221 appear to contain incorrect data when paired as 32-bit
-        # AC charge energy total is available in register 115 (legacy range) instead
+        # AC charge energy total is available in registers 114/115 (legacy range) instead,
+        # inherited from SPH_7000_10000 above.
         31222: {'name': 'battery_temp_vpp', 'scale': 0.1, 'unit': '°C', 'maps_to': 'battery_temp', 'signed': True},
-
-        # Battery AC Charge Energy (SPH 7-10kW V201 with newer firmware)
-        115: {'name': 'ac_charge_energy_total', 'scale': 0.1, 'unit': 'kWh', 'desc': 'Total energy charged from AC/grid to battery'},
 
         # Battery Cluster 2 State
         **VPP_V201_BATTERY2,

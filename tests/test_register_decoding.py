@@ -1,0 +1,294 @@
+"""Register decoding tests.
+
+Every case here corresponds to a bug that reached users. The decoding path — scale,
+signedness, 32-bit pairing, combined_scale — is where the integration converts raw
+Modbus words into the numbers people see, and it has been the source of the most
+user-visible failures.
+
+Cases covered:
+  * unsigned 32-bit pairing            (baseline)
+  * SIGNED 32-bit pairing              v1.2.1 shipped AC power unsigned; a negative
+                                       reading surfaced as 429,496,471 W  (#361)
+  * high/low order independence        pairs are declared from both directions
+  * combined_scale on the LOW word     the convention the profiles rely on
+  * missing register -> None           must not decode as 0, which is what made a
+                                       dead link look like a healthy inverter (#357)
+"""
+from __future__ import annotations
+
+import importlib
+
+import pytest
+
+# conftest.py binds `growatt_under_test` to the component directory and stubs the
+# unused homeassistant import; it runs before collection, so this resolves.
+GrowattModbus = importlib.import_module("growatt_under_test.growatt_modbus").GrowattModbus
+
+
+def _client(input_registers: dict, cache: dict) -> GrowattModbus:
+    """Build a client with a synthetic register map and cache, no I/O.
+
+    `__init__` is bypassed deliberately - it opens connections. The cost is that any
+    instance state the decode path relies on has to be set here explicitly, so a new
+    attribute in `__init__` surfaces as an AttributeError in these tests rather than in
+    production. Add it below when that happens.
+    """
+    client = GrowattModbus.__new__(GrowattModbus)  # bypass __init__ / no connection
+    client.register_map = {"name": "TEST", "input_registers": input_registers}
+    client._register_cache = dict(cache)
+    client._underflow_warned = set()   # warn-once tracking, see #401
+    return client
+
+
+# --------------------------------------------------------------------------
+# 32-bit pairing
+# --------------------------------------------------------------------------
+
+def test_unsigned_pair_combines_high_and_low():
+    regs = {
+        100: {"name": "power_high", "scale": 1, "pair": 101},
+        101: {"name": "power_low", "scale": 1, "pair": 100,
+              "combined_scale": 0.1, "combined_unit": "W"},
+    }
+    # (1 << 16) | 4464 = 70000 -> x0.1 = 7000.0 W
+    client = _client(regs, {100: 1, 101: 4464})
+    assert client._get_register_value(101) == pytest.approx(7000.0)
+
+
+def test_pair_decodes_the_same_from_either_end():
+    """A pair must decode identically whether addressed by its HIGH or LOW word."""
+    regs = {
+        100: {"name": "power_high", "scale": 1, "pair": 101},
+        101: {"name": "power_low", "scale": 1, "pair": 100, "combined_scale": 0.1},
+    }
+    client = _client(regs, {100: 1, 101: 4464})
+    assert client._get_register_value(100) == client._get_register_value(101)
+
+
+# --------------------------------------------------------------------------
+# Signedness — the #361 regression
+# --------------------------------------------------------------------------
+
+def test_signed_pair_decodes_negative_value():
+    """Regression: MIN TL-XH2 AC power reported 429,496,471 W (Issue #361).
+
+    A small negative active power (importing from grid) has 0xFFFF in the high word.
+    Read unsigned it becomes ~4.29e9; scaled by 0.1 that is the number the user saw.
+    """
+    regs = {
+        31100: {"name": "power_to_grid_high", "scale": 1, "pair": 31101},
+        31101: {"name": "power_to_grid_low", "scale": 1, "pair": 31100,
+                "combined_scale": 0.1, "signed": True},
+    }
+    # two's complement of -2586 in 32 bits -> high 0xFFFF, low 62950
+    client = _client(regs, {31100: 0xFFFF, 31101: 62950})
+    assert client._get_register_value(31101) == pytest.approx(-258.6)
+
+
+def test_unsigned_pair_with_the_sign_bit_set_is_withheld():
+    """Same registers WITHOUT the signed flag — the #361 shape.
+
+    This used to return 429,496,471.0, and that absurd number is how the missing flag was
+    noticed. It is now withheld instead: publishing garbage is worse for the reader than
+    publishing nothing, and the same decode path is what turned a daily counter dipping
+    below zero at midnight into 429,496,727.9 kWh (#401).
+
+    The diagnosis is not lost — the withholding logs a warning naming the register and the
+    value it would have had if signed. See the underflow tests for that.
+    """
+    regs = {
+        31100: {"name": "power_to_grid_high", "scale": 1, "pair": 31101},
+        31101: {"name": "power_to_grid_low", "scale": 1, "pair": 31100,
+                "combined_scale": 0.1},  # no 'signed'
+    }
+    client = _client(regs, {31100: 0xFFFF, 31101: 62950})
+    assert client._get_register_value(31101) is None
+
+
+def test_signed_flag_on_either_register_of_the_pair_applies():
+    """`signed` is honoured whether declared on the HIGH or the LOW word."""
+    on_low = {
+        200: {"name": "p_high", "scale": 1, "pair": 201},
+        201: {"name": "p_low", "scale": 1, "pair": 200, "combined_scale": 0.1,
+              "signed": True},
+    }
+    on_high = {
+        200: {"name": "p_high", "scale": 1, "pair": 201, "signed": True},
+        201: {"name": "p_low", "scale": 1, "pair": 200, "combined_scale": 0.1},
+    }
+    cache = {200: 0xFFFF, 201: 62950}
+    assert _client(on_low, cache)._get_register_value(201) == pytest.approx(-258.6)
+    assert _client(on_high, cache)._get_register_value(201) == pytest.approx(-258.6)
+
+
+def test_signed_single_register_is_not_treated_as_negative_when_positive():
+    regs = {300: {"name": "battery_current", "scale": 0.01, "signed": True}}
+    assert _client(regs, {300: 1400})._get_register_value(300) == pytest.approx(14.0)
+
+
+# --------------------------------------------------------------------------
+# Missing data must NOT decode as zero — the #357 class of bug
+# --------------------------------------------------------------------------
+
+def test_register_absent_from_cache_returns_none_not_zero():
+    """Regression guard for Issue #357.
+
+    A register that was never read must decode to None. Returning 0.0 is what made a
+    failed poll look like a healthy inverter reporting zeros, so no reconnect or
+    backoff ever ran and entities stayed 'available' showing 0.
+    """
+    regs = {400: {"name": "pv1_voltage", "scale": 0.1}}
+    client = _client(regs, {})  # empty cache — nothing was read
+    assert client._get_register_value(400) is None
+
+
+def test_pair_with_missing_partner_returns_none_not_a_fabricated_value():
+    """Regression guard for Issue #367.
+
+    A truncated block read can capture a 32-bit value's high word and not its low word.
+    The decoder used to substitute 0 for the missing half, producing (high << 16) — a
+    high word of 10000 was published as 65,536,000 W of PV power and written into Home
+    Assistant's long-term statistics as if it were a real measurement.
+
+    The protocol defines UINT32/INT32 as "high word first, low word last" and every
+    32-bit register table entry declares a length of 2, so a missing partner can only
+    mean the read failed. It must decode to nothing.
+    """
+    regs = {
+        5: {"name": "pv1_power_high", "scale": 1, "pair": 6},
+        6: {"name": "pv1_power_low", "scale": 1, "pair": 5, "combined_scale": 0.1},
+    }
+    # High word arrived, low word did not — exactly the reported failure.
+    client = _client(regs, {5: 10000})
+    assert client._get_register_value(5) is None
+
+    # And the same when only the low word arrived.
+    assert _client(regs, {6: 1234})._get_register_value(6) is None
+
+
+def test_the_exact_reported_value_can_no_longer_be_produced():
+    """65,536,000 W from Issue #367 was (10000 << 16) * 0.1 with a missing low word."""
+    regs = {
+        5: {"name": "pv1_power_high", "scale": 1, "pair": 6},
+        6: {"name": "pv1_power_low", "scale": 1, "pair": 5, "combined_scale": 0.1},
+    }
+    assert _client(regs, {5: 10000})._get_register_value(5) != pytest.approx(65536000.0)
+
+
+def test_complete_pair_still_decodes_when_partner_is_zero():
+    """A partner genuinely READ as 0 is valid and must still decode.
+
+    The fix keys on absence from the cache, not on the value being falsy — a high word
+    of 0 is the normal case for any value below 65536.
+    """
+    regs = {
+        5: {"name": "power_high", "scale": 1, "pair": 6},
+        6: {"name": "power_low", "scale": 1, "pair": 5, "combined_scale": 0.1},
+    }
+    assert _client(regs, {5: 0, 6: 2500})._get_register_value(6) == pytest.approx(250.0)
+
+
+def test_register_not_in_profile_returns_none():
+    client = _client({400: {"name": "pv1_voltage", "scale": 0.1}}, {999: 123})
+    assert client._get_register_value(999) is None
+
+
+def test_zero_is_a_real_value_and_distinct_from_missing():
+    """A genuine zero reading must decode as 0.0, not None."""
+    regs = {400: {"name": "pv1_voltage", "scale": 0.1}}
+    assert _client(regs, {400: 0})._get_register_value(400) == 0.0
+
+
+# --------------------------------------------------------------------------
+# Scaling
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("raw", "scale", "expected"),
+    [
+        (2394, 0.1, 239.4),    # grid voltage
+        (4996, 0.01, 49.96),   # grid frequency
+        (95, 1, 95),           # battery SOC
+        (4246, 0.1, 424.6),    # HV battery voltage
+    ],
+)
+def test_single_register_scaling(raw, scale, expected):
+    regs = {500: {"name": "value", "scale": scale}}
+    assert _client(regs, {500: raw})._get_register_value(500) == pytest.approx(expected)
+
+
+# --------------------------------------------------------------------------
+# 32-bit underflow at the midnight rollover (#401)
+#
+# A daily counter can dip just below zero around the reset. Read unsigned, -17 arrives
+# as 4,294,967,279, which at 0.1 kWh is 429,496,727.9 kWh. The energy guard rejected the
+# spike but the decode kept producing it, once per poll, until the counter climbed back.
+# --------------------------------------------------------------------------
+
+def _energy_client(cache: dict) -> GrowattModbus:
+    return _client(
+        {
+            1060: {"name": "load_energy_today_high", "scale": 1, "pair": 1061},
+            1061: {"name": "load_energy_today_low", "scale": 1, "pair": 1060,
+                   "combined_scale": 0.1},
+        },
+        cache,
+    )
+
+
+@pytest.mark.parametrize("raw,as_signed", [
+    (4294967279, -17),   # the reporter's 429,496,727.9 kWh
+    (4294967280, -16),
+    (4294967295, -1),    # -0.1 kWh, the smallest possible dip
+    (0x80000000, -2147483648),  # exactly the sign bit
+])
+def test_a_negative_daily_counter_is_withheld_not_published(raw, as_signed):
+    """Neither 429 million kWh nor a negative daily total is publishable. The field goes
+    unread for that poll and recovers on the next one."""
+    client = _energy_client({1060: raw >> 16, 1061: raw & 0xFFFF})
+    assert client._get_register_value(1061) is None
+
+
+def test_the_largest_legitimate_value_is_still_returned():
+    """0x7FFFFFFF has the sign bit clear, so it decodes normally. Absurd as a reading, but
+    the rule is about the sign bit and not about plausibility - drawing the line anywhere
+    else would need a per-quantity threshold."""
+    raw = 0x7FFFFFFF
+    client = _energy_client({1060: raw >> 16, 1061: raw & 0xFFFF})
+    assert client._get_register_value(1061) == pytest.approx(raw * 0.1)
+
+
+def test_a_normal_daily_reading_is_unaffected():
+    raw = 123          # 12.3 kWh
+    client = _energy_client({1060: 0, 1061: raw})
+    assert client._get_register_value(1061) == pytest.approx(12.3)
+
+
+def test_a_declared_signed_pair_still_converts_rather_than_withholding():
+    """The guard must not swallow registers that are legitimately negative - battery and
+    grid power go negative in normal operation."""
+    regs = {
+        31100: {"name": "power_to_grid_high", "scale": 1, "pair": 31101, "signed": True},
+        31101: {"name": "power_to_grid_low", "scale": 1, "pair": 31100,
+                "combined_scale": 0.1, "signed": True},
+    }
+    client = _client(regs, {31100: 0xFFFF, 31101: 0xFFEF})
+    assert client._get_register_value(31101) == pytest.approx(-1.7)
+
+
+def test_the_first_withheld_reading_warns_and_the_rest_do_not(caplog):
+    """A missing 'signed' flag is persistent and used to announce itself with an absurd
+    number somebody reported (#361). Withholding silently would hide it. One warning per
+    register per session keeps that visible without a line per poll for a rollover glitch.
+    """
+    import logging
+
+    client = _energy_client({1060: 0xFFFF, 1061: 0xFFEF})
+    with caplog.at_level(logging.DEBUG):
+        for _ in range(5):
+            assert client._get_register_value(1061) is None
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, f"expected exactly one warning, got {len(warnings)}"
+    assert "load_energy_today" in warnings[0].getMessage()
+    assert "-17" in warnings[0].getMessage(), "the warning does not show the signed value"

@@ -6,20 +6,21 @@ from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.entity import EntityCategory
 
 from .const import (
-    DOMAIN,
     CONF_REGISTER_MAP,
     REGISTER_MAPS,
     DEVICE_TYPE_GRID,
     DEVICE_TYPE_INVERTER,
-    get_device_type_for_control,
 )
 from .coordinator import GrowattModbusCoordinator
+from .entity import GrowattEntity
 
 _LOGGER = logging.getLogger(__name__)
+
+# Writable platform - serialise. See number.py for the reasoning.
+PARALLEL_UPDATES = 1
 
 # TOU periods register (30411) - setting to 0 clears all TOU schedules
 VPP_TOU_NUM_PERIODS = 30411
@@ -37,7 +38,9 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Growatt Modbus switch entities."""
-    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    # Coordinators live on entry.runtime_data since v1.6; hass.data[DOMAIN] now holds
+    # only the shared-connection registry, so indexing it by entry_id is always a bug.
+    coordinator = config_entry.runtime_data
 
     register_map_name = config_entry.data.get(CONF_REGISTER_MAP)
     register_map = REGISTER_MAPS.get(register_map_name, {})
@@ -61,26 +64,24 @@ async def async_setup_entry(
         async_add_entities(entities)
 
 
-class GrowattWitExportSwitch(CoordinatorEntity, SwitchEntity):
+class GrowattWitExportSwitch(GrowattEntity, SwitchEntity):
     """Toggle grid export on/off (register 30201: 0=off, 100=on)."""
 
     _attr_icon = "mdi:transmission-tower-export"
     _attr_entity_category = EntityCategory.CONFIG
+    # has_entity_name is inherited from GrowattEntity, so HA prefixes the device name.
+    # The unique_id suffix must stay `grid_export_switch` - switch.growatt_grid_export
+    # is an existing registry row.
+    _attr_name = "Grid Export"
 
     def __init__(
         self,
         coordinator: GrowattModbusCoordinator,
         config_entry: ConfigEntry,
     ) -> None:
-        super().__init__(coordinator)
-        self._config_entry = config_entry
-        entry_name = config_entry.data.get("name", config_entry.title)
-        self._attr_name = f"{entry_name} Grid Export"
-        self._attr_unique_id = f"{config_entry.entry_id}_grid_export_switch"
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        return self.coordinator.get_device_info(DEVICE_TYPE_GRID)
+        super().__init__(
+            coordinator, config_entry, "grid_export_switch", DEVICE_TYPE_GRID
+        )
 
     @property
     def is_on(self) -> bool:
@@ -121,7 +122,7 @@ class GrowattWitExportSwitch(CoordinatorEntity, SwitchEntity):
             _LOGGER.exception("[WIT] Grid export disable failed: %s", err)
 
 
-class GrowattWitOptimizerSwitch(CoordinatorEntity, SwitchEntity):
+class GrowattWitOptimizerSwitch(GrowattEntity, SwitchEntity):
     """Enable/disable battery optimizer + TOU schedules.
 
     OFF: Clears TOU periods (30411=0) AND turns off input_boolean.battery_optimizer_enabled
@@ -130,21 +131,16 @@ class GrowattWitOptimizerSwitch(CoordinatorEntity, SwitchEntity):
 
     _attr_icon = "mdi:battery-clock"
     _attr_entity_category = EntityCategory.CONFIG
+    _attr_name = "Battery Optimizer"
 
     def __init__(
         self,
         coordinator: GrowattModbusCoordinator,
         config_entry: ConfigEntry,
     ) -> None:
-        super().__init__(coordinator)
-        self._config_entry = config_entry
-        entry_name = config_entry.data.get("name", config_entry.title)
-        self._attr_name = f"{entry_name} Battery Optimizer"
-        self._attr_unique_id = f"{config_entry.entry_id}_battery_optimizer_switch"
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        return self.coordinator.get_device_info(DEVICE_TYPE_INVERTER)
+        super().__init__(
+            coordinator, config_entry, "battery_optimizer_switch", DEVICE_TYPE_INVERTER
+        )
 
     @property
     def is_on(self) -> bool:
@@ -154,7 +150,15 @@ class GrowattWitOptimizerSwitch(CoordinatorEntity, SwitchEntity):
 
     @property
     def available(self) -> bool:
-        """Available if the optimizer input_boolean exists."""
+        """Available if the optimizer input_boolean exists.
+
+        Deliberately does NOT chain to `super().available` (i.e. to
+        `coordinator.last_update_success`). This is the manual kill switch for the
+        AppDaemon battery optimizer, and it is most needed precisely when the Modbus
+        link is unhealthy: making it unavailable during a failed poll would hide the
+        one control that stops further inverter writes. Turning it off still attempts
+        the 30411 clear, which is allowed to fail independently.
+        """
         return self.hass.states.get(OPTIMIZER_ENTITY) is not None
 
     async def async_turn_on(self, **kwargs: Any) -> None:

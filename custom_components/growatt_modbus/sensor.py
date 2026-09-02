@@ -1,6 +1,6 @@
 """Sensor platform for Growatt Modbus Integration."""
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -21,6 +21,7 @@ from homeassistant.const import (
     UnitOfTemperature,
 )
 from homeassistant.core import HomeAssistant, callback
+import homeassistant.util.dt as dt_util
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -32,9 +33,14 @@ from .const import (
     get_entity_category,
 )
 from .coordinator import GrowattModbusCoordinator
+from .entity import GrowattEntity
 from .device_profiles import get_sensors_for_profile
 
 _LOGGER = logging.getLogger(__name__)
+
+# Entities read from a single coordinator poll rather than doing their own I/O, so
+# there is nothing to serialise — 0 disables HA's per-platform update throttle.
+PARALLEL_UPDATES = 0
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +197,13 @@ SENSOR_DEFINITIONS = {
         "unit": UnitOfEnergy.KILO_WATT_HOUR,
         "attr": "pv3_energy_today",
         "disabled_by_default": True,
-        "condition": lambda data: data.pv3_energy_today > 0,
+        # Gated on the LIFETIME counter, not on itself. The gate exists to hide PV3 on
+        # two-string hardware, and lifetime does that job without the side effect: a
+        # daily counter gated on its own value is absent after any restart that happens
+        # while it reads zero, so an overnight restart loses it until sunrise. Lifetime
+        # is monotonic - zero forever on an unpopulated string, non-zero on a real one
+        # once commissioned. Raised by @as-wallpen (#399).
+        "condition": lambda data: data.pv3_energy_total > 0,
     },
     "pv3_energy_total": {
         "name": "PV3 Energy Total",
@@ -241,7 +253,8 @@ SENSOR_DEFINITIONS = {
         "unit": UnitOfEnergy.KILO_WATT_HOUR,
         "attr": "pv4_energy_today",
         "disabled_by_default": True,
-        "condition": lambda data: data.pv4_energy_today > 0,
+        # See pv3_energy_today - same reasoning (#399).
+        "condition": lambda data: data.pv4_energy_total > 0,
     },
     "pv4_energy_total": {
         "name": "PV4 Energy Total",
@@ -463,7 +476,7 @@ SENSOR_DEFINITIONS = {
         "state_class": SensorStateClass.TOTAL_INCREASING,
         "unit": UnitOfEnergy.KILO_WATT_HOUR,
         "attr": "pv_energy_total",
-        "description": "Lifetime DC energy captured from the solar panels (Epv). Measured before the inverter conversion stage, so it is slightly higher than Energy Total due to inverter losses (~2-7%). Unlike Energy Total, this is unaffected by battery charge/discharge cycles.",
+        "description": "Lifetime DC energy captured from the solar panels (Epv), measured before the inverter conversion stage. On a grid-tied inverter with no battery this is slightly higher than Energy Total, by the conversion loss (~2-7%). On a hybrid it is usually LOWER, because Energy Total counts everything the inverter has delivered including battery discharge — and a battery charged from the grid returns energy that never came from the panels. Unaffected by battery cycles itself. NOTE: on at least one SPH this register tracked AC generation instead of DC harvest, reading ~18% above the sum of its own per-string counters. To check yours, compare it against PV1 Energy Total + PV2 Energy Total (both disabled by default); if they disagree, trust the per-string sum.",
     },
 
     # Energy Breakdown (storage/hybrid models)
@@ -1017,6 +1030,157 @@ SENSOR_DEFINITIONS = {
         "value_map": {0: "Off", 1: "On"},
     },
 
+    # MOD TL3-XH peak shaving / demand management (holding 3307-3312, #372)
+    #
+    # Settings rather than measurements, so DIAGNOSTIC. Not disabled by default: the whole
+    # point is that these were invisible — one of them capped a user's grid charging at
+    # 55% for two days with no way to see it.
+    #
+    # 3312 is not here. It is writable and appears as a number entity instead.
+    "demand_import_limit": {
+        "name": "Import Limit",
+        "icon": "mdi:transmission-tower-import",
+        "device_class": SensorDeviceClass.POWER,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfPower.KILO_WATT,
+        "attr": "demand_import_limit",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "description": "Demand-management import limit. Set in the Growatt portal; read-only here.",
+    },
+    "demand_export_limit": {
+        "name": "Export Limit",
+        "icon": "mdi:transmission-tower-export",
+        "device_class": SensorDeviceClass.POWER,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfPower.KILO_WATT,
+        "attr": "demand_export_limit",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "description": "Demand-management export limit. Set in the Growatt portal; read-only here.",
+    },
+    "peak_shaving_reserve_soc": {
+        "name": "Peak Shaving Reserve SOC",
+        "icon": "mdi:battery-lock",
+        "device_class": SensorDeviceClass.BATTERY,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": PERCENTAGE,
+        "attr": "peak_shaving_reserve_soc",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "description": "Battery charge held in reserve for peak shaving. Set in the Growatt portal.",
+    },
+    "ac_charge_max_power": {
+        "name": "AC Charge Max Power",
+        "icon": "mdi:transmission-tower",
+        "device_class": SensorDeviceClass.POWER,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfPower.KILO_WATT,
+        "attr": "ac_charge_max_power",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "description": "Ceiling on charging power drawn from the grid. Set in the Growatt portal.",
+    },
+
+    # VPP remote power control state (holding 30100, 30407-30409, 30474, #373)
+    #
+    # Read-only. This family supports remote power control, but commanding it is not yet
+    # exposed: the power value is a target rather than a cap and will import from the grid
+    # to reach it even with grid charging disabled. These make the state visible and let
+    # anyone confirm the capability on their own hardware.
+    #
+    # Disabled by default — most users have no VPP setup, and an always-zero control
+    # register on the dashboard invites the assumption that something is broken.
+    "control_authority": {
+        "name": "VPP Control Authority",
+        "icon": "mdi:shield-key",
+        "attr": "control_authority",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "disabled_by_default": True,
+        "value_map": {0: "Disabled", 1: "Enabled"},
+        "description": "VPP master enable. Remote power control has no effect while this is Disabled.",
+    },
+    "remote_power_control_enable": {
+        "name": "VPP Remote Power Control",
+        "icon": "mdi:remote",
+        "attr": "remote_power_control_enable",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "disabled_by_default": True,
+        "value_map": {0: "Disabled", 1: "Enabled"},
+        "description": "Remote power control enable. Note the duration can expire while this still "
+                       "reads Enabled — it does not indicate whether control is currently active.",
+    },
+    "remote_charge_and_discharge_power": {
+        "name": "VPP Commanded Power",
+        "icon": "mdi:battery-charging-outline",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": PERCENTAGE,
+        "attr": "remote_charge_and_discharge_power",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "disabled_by_default": True,
+        "description": "Commanded charge/discharge power, negative for discharge. This is a target, "
+                       "not a limit — the inverter will import from the grid to reach it.",
+    },
+    "vpp_last_setpoint": {
+        "name": "VPP Last Setpoint",
+        "icon": "mdi:history",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": PERCENTAGE,
+        "attr": "vpp_last_setpoint",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "disabled_by_default": True,
+        "description": "Mirror of the last commanded VPP setpoint. Does not reset when remote "
+                       "control is disabled, so it reflects history rather than current state.",
+    },
+
+    # Insulation resistance, DC injection and leakage current (ISO/DCI/GFCI)
+    # Registers 3087-3091 (V1.39 / VPP 2.01 3000-range inverters: MIN, TL-XH, MOD, WIT)
+    "pv_iso": {
+        "name": "Insulation Resistance",
+        "icon": "mdi:omega",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": "kΩ",
+        "attr": "pv_iso",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "disabled_by_default": True,
+    },
+    "dci_r": {
+        "name": "DC Injection Current",
+        "icon": "mdi:current-dc",
+        "device_class": SensorDeviceClass.CURRENT,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfElectricCurrent.MILLIAMPERE,
+        "attr": "dci_r",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "disabled_by_default": True,
+    },
+    "dci_s": {
+        "name": "DC Injection Current (S-Phase)",
+        "icon": "mdi:current-dc",
+        "device_class": SensorDeviceClass.CURRENT,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfElectricCurrent.MILLIAMPERE,
+        "attr": "dci_s",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "disabled_by_default": True,
+    },
+    "dci_t": {
+        "name": "DC Injection Current (T-Phase)",
+        "icon": "mdi:current-dc",
+        "device_class": SensorDeviceClass.CURRENT,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfElectricCurrent.MILLIAMPERE,
+        "attr": "dci_t",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "disabled_by_default": True,
+    },
+    "gfci": {
+        "name": "Leakage Current",
+        "icon": "mdi:leak",
+        "device_class": SensorDeviceClass.CURRENT,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfElectricCurrent.MILLIAMPERE,
+        "attr": "gfci",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "disabled_by_default": True,
+    },
+
     # Safety/compliance read-only diagnostic registers 235-238 (Issue #282).
     # These are installer/grid-compliance controls. Writing them is intentionally
     # blocked by the integration — see release notes for safety rationale.
@@ -1123,7 +1287,13 @@ SENSOR_DEFINITIONS = {
         "state_class": None,
         "unit": None,
         "attr": "wit_mode_status",
-        "condition": lambda data: hasattr(data, 'wit_mode_status') and data.wit_mode_status != "",
+        # The gate is the VALUE, not the attribute: wit_mode_status is a GrowattData
+        # field with a "" default, so hasattr() here could never be False (#362) and
+        # would have read as a profile check while being decorative. Only the WIT poll
+        # path fills it in (coordinator._compute_wit_mode_status), and on WIT the entity
+        # comes from GrowattWitModeStatusSensor instead - this entry exists so the key is
+        # device-mapped and entity-ID-migrated, and so no other profile publishes "".
+        "condition": lambda data: getattr(data, 'wit_mode_status', "") != "",
     },
 
     # Backup Box Sensors (Growatt ARK transfer switch, TL-X/TL-XH only, regs 3281-3342)
@@ -1219,7 +1389,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Growatt Modbus sensors."""
-    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator = config_entry.runtime_data
     
     # Wait for first data to determine which sensors to create
     if coordinator.data is None:
@@ -1238,14 +1408,21 @@ async def async_setup_entry(
     
     entities = []
     
-    # WIT-specific sensors handled by custom classes below
+    # Sensor keys that have a bespoke entity class below and must never be built by
+    # the generic SENSOR_DEFINITIONS loop. Unconditional, not gated on is_wit: the key
+    # is in device_profiles.STATUS_SENSORS, which nearly every profile includes, so on a
+    # non-WIT profile it passed the profile check, failed its condition (the field stays
+    # ""), and landed in the `deferred` list below - where it can never be satisfied,
+    # because only the WIT branch of the coordinator ever fills wit_mode_status. That
+    # kept the deferred listener subscribed for the life of the entry, re-evaluating it
+    # on every poll.
     is_wit = "wit" in inverter_series.lower()
-    wit_custom_sensors = {"wit_mode_status"} if is_wit else set()
+    custom_class_sensors = {"wit_mode_status"}
 
     # Create sensors based on available data and conditions
     for sensor_key, sensor_def in SENSOR_DEFINITIONS.items():
         # Skip sensors that have custom class implementations
-        if sensor_key in wit_custom_sensors:
+        if sensor_key in custom_class_sensors:
             continue
 
         # Check if sensor is supported by this inverter profile
@@ -1272,9 +1449,18 @@ async def async_setup_entry(
             )
         )
     
-    # Add WIT-specific custom sensor with extra attributes
+    # Add WIT-specific custom sensor with extra attributes. Like the clock sensor
+    # below it is not a plain register->field mapping: it derives an effective mode
+    # from several VPP holding blocks, so it has its own class and is excluded from
+    # the SENSOR_DEFINITIONS loop above via custom_class_sensors.
     if is_wit:
         entities.append(GrowattWitModeStatusSensor(coordinator, config_entry))
+
+    # Not register-driven, so it is not in SENSOR_DEFINITIONS: it reads the RTC directly
+    # rather than coming out of a GrowattData field. Off-grid profiles encode the year
+    # differently and are excluded, same as the sync button (#393).
+    if coordinator.modbus_client.is_clock_supported:
+        entities.append(GrowattInverterClockSensor(coordinator, config_entry))
 
     _LOGGER.info("Created %d sensors for %s", len(entities), inverter_series)
     async_add_entities(entities)
@@ -1291,12 +1477,20 @@ async def async_setup_entry(
     # arrives (coordinator.has_real_data becomes True). Any that now pass are added via
     # async_add_entities. The listener removes itself when all deferred sensors are
     # resolved or the config entry is unloaded.
-    created_keys = {e._sensor_key for e in entities if hasattr(e, "_sensor_key")}
+    # Only the register-driven sensors carry a _sensor_key. GrowattInverterClockSensor
+    # and GrowattWitModeStatusSensor do not, and they are in this same list - iterating
+    # all of them raised AttributeError in v1.8.6-v1.8.8, which aborted setup right here,
+    # after the unconditioned sensors had been added and before the deferred block below
+    # ever ran. Every condition-gated sensor silently ceased to exist, with no repair and
+    # no automation warning (#399).
+    created_keys = {
+        e._sensor_key for e in entities if isinstance(e, GrowattModbusSensor)
+    }
     deferred: list[tuple[str, dict]] = [
         (sk, sd)
         for sk, sd in SENSOR_DEFINITIONS.items()
         if sk in available_sensors and "condition" in sd and sk not in created_keys
-        and sk not in wit_custom_sensors
+        and sk not in custom_class_sensors
     ]
 
     if deferred:
@@ -1334,10 +1528,89 @@ async def async_setup_entry(
         config_entry.async_on_unload(_remove_listener)
 
 
-class GrowattModbusSensor(CoordinatorEntity, SensorEntity):
-    """Representation of a Growatt Modbus sensor."""
+class GrowattInverterClockSensor(GrowattEntity, SensorEntity):
+    """The inverter's own real-time clock.
 
-    _attr_has_entity_name = True
+    Worth exposing because time-of-use windows fire against *this* clock, not Home
+    Assistant's: a window set for 13:00 starts whenever the inverter believes it is 13:00.
+    A reporter's export window was running two minutes late for exactly that reason, and
+    there was no way to see it without a manual register read.
+
+    Disabled by default and diagnostic, which puts it next to the Inverter Clock Sync
+    button. Enabling it costs one extra holding-register read per poll - the coordinator
+    does not read the RTC at all until this sensor asks it to.
+    """
+
+    # Deliberately NOT SensorDeviceClass.TIMESTAMP. Home Assistant renders a timestamp
+    # sensor as relative time - "12 seconds ago", ticking every second - which is useless
+    # for reading a clock and looks like a broken "last updated" field. The point of this
+    # entity is to show what time the inverter thinks it is, so the state is the formatted
+    # wall-clock time and the machine-readable form is an attribute.
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+    _attr_icon = "mdi:clock-outline"
+    _attr_translation_key = "inverter_clock"
+
+    def __init__(self, coordinator, config_entry: ConfigEntry) -> None:
+        """Initialise the inverter clock sensor."""
+        super().__init__(
+            coordinator,
+            config_entry,
+            unique_key="inverter_clock",
+            device_type=get_device_type_for_sensor("inverter_clock"),
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Ask the coordinator to start reading the RTC.
+
+        Disabled entities are never added, so a user who leaves this off never pays for
+        the extra read.
+        """
+        await super().async_added_to_hass()
+        self.coordinator.enable_clock_polling()
+
+    @property
+    def available(self) -> bool:
+        """Unavailable until the clock has actually been read.
+
+        The first poll after enabling has usually not happened yet, and on a model whose
+        RTC registers do not decode it never will - better unavailable than a made-up
+        timestamp.
+        """
+        return (
+            self.coordinator.last_update_success
+            and self.coordinator.is_online
+            and self.coordinator.inverter_clock is not None
+        )
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the inverter's clock as readable local wall-clock time."""
+        value = self.coordinator.inverter_clock
+        if value is None:
+            return None
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Drift, plus the timestamp in a form templates and automations can parse.
+
+        Positive drift means the inverter is ahead of Home Assistant. The registers hold
+        wall-clock time with no timezone, so the local zone is attached for `timestamp`.
+        """
+        value = self.coordinator.inverter_clock
+        if value is None:
+            return {}
+        drift = (value - dt_util.now().replace(tzinfo=None)).total_seconds()
+        return {
+            "timestamp": value.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE).isoformat(),
+            "drift_seconds": round(drift),
+            "drift_minutes": round(drift / 60, 1),
+        }
+
+
+class GrowattModbusSensor(GrowattEntity, SensorEntity):
+    """Representation of a Growatt Modbus sensor."""
 
     def __init__(
         self,
@@ -1347,16 +1620,23 @@ class GrowattModbusSensor(CoordinatorEntity, SensorEntity):
         sensor_def: dict[str, Any],
     ) -> None:
         """Initialize the sensor."""
-        super().__init__(coordinator)
+        # unique_key is the sensor key, preserving the existing unique ID exactly.
+        super().__init__(
+            coordinator,
+            config_entry,
+            sensor_key,
+            get_device_type_for_sensor(sensor_key),
+        )
 
-        self._config_entry = config_entry
         self._sensor_key = sensor_key
         self._sensor_def = sensor_def
-        self._attr_name = sensor_def['name']
-        self._attr_unique_id = f"{config_entry.entry_id}_{sensor_key}"
 
-        # Determine which device this sensor belongs to
-        self._device_type = get_device_type_for_sensor(sensor_key)
+        # Name comes from strings.json / translations/*.json under entity.sensor.<key>.name
+        # rather than from sensor_def['name'], so the 22 shipped languages can translate it.
+        # The English text there was generated from sensor_def['name'], so what users see is
+        # unchanged; tests_ha asserts every key has an entry, because a missing one leaves
+        # the entity with no name at all rather than falling back.
+        self._attr_translation_key = sensor_key
 
         # Set entity category (None for main sensors, "diagnostic" for technical details)
         entity_category = get_entity_category(sensor_key)
@@ -1374,11 +1654,6 @@ class GrowattModbusSensor(CoordinatorEntity, SensorEntity):
             self._attr_icon = sensor_def["icon"]
         if sensor_def.get("disabled_by_default"):
             self._attr_entity_registry_enabled_default = False
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return device information."""
-        return self.coordinator.get_device_info(self._device_type)
 
     @property
     def available(self) -> bool:
@@ -1724,7 +1999,21 @@ class GrowattModbusSensor(CoordinatorEntity, SensorEntity):
             return self.coordinator.get_sensor_value(self._sensor_key, pv_energy_today)
         
         # Regular sensor - get value from data attribute
-        value = getattr(data, self._sensor_def["attr"], None)
+        attr = self._sensor_def["attr"]
+
+        # Report nothing when the register behind this sensor was not read this poll (#384).
+        #
+        # A failed block read used to publish 0, which is indistinguishable from a real zero
+        # and lands in long-term statistics as a measurement. A reporter's solar graph showed
+        # a vertical drop to 0 W and back within one poll, with no error anywhere, because
+        # from Home Assistant's side the poll had succeeded.
+        #
+        # Returning None makes the entity unknown for that poll, so history shows a gap. A
+        # gap is honest about what happened; a zero is a claim the inverter never made.
+        if attr in getattr(data, "unread_fields", ()):
+            return None
+
+        value = getattr(data, attr, None)
         
         if value is None:
             return None
@@ -1781,21 +2070,36 @@ class GrowattModbusSensor(CoordinatorEntity, SensorEntity):
         return None
 
 
-class GrowattWitModeStatusSensor(CoordinatorEntity, SensorEntity):
-    """WIT inverter mode status sensor with detailed attributes."""
+class GrowattWitModeStatusSensor(GrowattEntity, SensorEntity):
+    """WIT inverter mode status sensor with detailed attributes.
+
+    Not a plain register->field sensor: coordinator._compute_wit_mode_status derives
+    one effective mode string from three VPP holding blocks (30100, 30200-30201,
+    30407-30410), and this class publishes the supporting values as attributes. It is
+    therefore excluded from the SENSOR_DEFINITIONS loop in async_setup_entry via
+    custom_class_sensors, and it carries no _sensor_key.
+
+    unique_key MUST stay "wit_mode_status": the unique ID {entry_id}_wit_mode_status is
+    what anchors sensor.growatt_inverter_mode, which an external consumer polls for
+    mode compliance. Availability deliberately uses CoordinatorEntity's default rather
+    than GrowattModbusSensor's is_online gate - when a VPP block is not read the
+    coordinator already publishes "Unknown", which is more informative than the entity
+    disappearing, and never a fabricated "Passthrough".
+    """
 
     _attr_icon = "mdi:state-machine"
+    # Short name only; GrowattEntity sets has_entity_name = True, so Home Assistant
+    # prefixes the device name itself ("Growatt Inverter Mode").
+    _attr_name = "Inverter Mode"
 
-    def __init__(self, coordinator, config_entry):
-        super().__init__(coordinator)
-        entry_name = config_entry.data.get("name", config_entry.title)
-        self._attr_name = f"{entry_name} Inverter Mode"
-        self._attr_unique_id = f"{config_entry.entry_id}_wit_mode_status"
-
-    @property
-    def device_info(self):
-        from .const import DEVICE_TYPE_INVERTER
-        return self.coordinator.get_device_info(DEVICE_TYPE_INVERTER)
+    def __init__(self, coordinator, config_entry: ConfigEntry) -> None:
+        """Initialise the WIT mode status sensor."""
+        super().__init__(
+            coordinator,
+            config_entry,
+            "wit_mode_status",
+            get_device_type_for_sensor("wit_mode_status"),
+        )
 
     @property
     def native_value(self) -> str:
@@ -1805,7 +2109,7 @@ class GrowattWitModeStatusSensor(CoordinatorEntity, SensorEntity):
         return getattr(data, 'wit_mode_status', "Unknown")
 
     @property
-    def extra_state_attributes(self) -> dict:
+    def extra_state_attributes(self) -> dict[str, Any]:
         data = self.coordinator.data
         if data is None:
             return {}
@@ -1822,10 +2126,9 @@ class GrowattWitModeStatusSensor(CoordinatorEntity, SensorEntity):
 
         # Duration remaining from coordinator-tracked timestamp.
         # Only available while this HA instance has been running since the last
-        # set_wit_mode call — lost on restart (the inverter still tracks its own timer).
+        # set_wit_mode call - lost on restart (the inverter still tracks its own timer).
         coord = self.coordinator
-        if hasattr(coord, 'wit_direct_mode_timestamp') and coord.wit_direct_mode_timestamp:
-            from datetime import timedelta
+        if getattr(coord, 'wit_direct_mode_timestamp', None):
             elapsed = (datetime.now() - coord.wit_direct_mode_timestamp).total_seconds() / 60
             duration = getattr(coord, 'wit_direct_mode_duration', 0)
             remaining = max(0, int(duration - elapsed))
@@ -1834,7 +2137,9 @@ class GrowattWitModeStatusSensor(CoordinatorEntity, SensorEntity):
                 coord.wit_direct_mode_timestamp + timedelta(minutes=duration)
             ).isoformat()
 
-        # SOC limits
+        # SOC limits. Nothing reads 30404/30405 back into GrowattData yet, so these
+        # report the dataclass defaults; kept because the attribute keys are part of
+        # the published shape.
         attrs["charge_cutoff_soc"] = getattr(data, 'vpp_charge_cutoff_soc', None)
         attrs["discharge_cutoff_soc"] = getattr(data, 'vpp_discharge_cutoff_soc', None)
 

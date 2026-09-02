@@ -1,5 +1,8 @@
 """Device profiles for Growatt inverters."""
+import logging
 from typing import Dict, Set
+
+_LOGGER = logging.getLogger(__name__)
 
 # ============================================================================
 # SENSOR GROUPS
@@ -70,8 +73,18 @@ BATTERY_SENSORS: Set[str] = {
     "priority_mode",
     # WIT: Battery SOH and BMS voltage
     "battery_soh", "battery_voltage_bms",
-    # WIT/SPF/MOD: AC charge/discharge energy
-    "ac_charge_energy_today", "ac_charge_energy_total", "ac_discharge_energy_total",
+    # AC charge energy — SPH reads these from registers 112-115, SPF/SPE from their own
+    # off-grid range.
+    "ac_charge_energy_today", "ac_charge_energy_total",
+    # NOT here: ac_discharge_energy_total. Protocol V1.39 has no AC-discharge counter at
+    # all — there is an EACharge_Total but no EADischarge anywhere in the input table. Only
+    # the off-grid protocol defines one (registers 66/67), so it belongs to SPF and SPE and
+    # is listed in their own groups below.
+    #
+    # While it sat here, 21 grid-tied profiles created the sensor with nothing behind it.
+    # It read 0.0 every poll, and _protect_energy_totals latched a single garbage frame
+    # (3215 << 16) and restored it forever after — one reporter saw 21,069,824 kWh on a
+    # 12 kWh battery, a value the integration could never clear on its own (#390).
 }
 
 _EXTRA_BATTERY_FIELDS = (
@@ -84,6 +97,34 @@ BATTERY2_SENSORS: Set[str] = {f"battery2_{f}" for f in _EXTRA_BATTERY_FIELDS}
 BATTERY3_SENSORS: Set[str] = {f"battery3_{f}" for f in _EXTRA_BATTERY_FIELDS}
 BATTERY4_SENSORS: Set[str] = {f"battery4_{f}" for f in _EXTRA_BATTERY_FIELDS}
 
+# Subtracted from a profile's sensor set when the hardware has no battery temperature
+# available over Modbus.
+#
+# Removing the register is not enough on its own. battery_temp's sensor condition is
+# `hasattr(data, 'battery_temp')`, and battery_temp is a GrowattData field with a 0.0
+# default — so the attribute always exists and the gate can never fail. The sensor gets
+# created regardless of whether any register populated it, and reports 0.0 °C.
+#
+# That is worse than a missing sensor: a dashboard shows a battery sitting at zero
+# degrees rather than an entity that no longer exists (#362). The sensor set is the only
+# hard filter available, so exclusion has to happen here.
+NO_BATTERY_TEMP: Set[str] = {"battery_temp"}
+
+# dcdc_temp is NOT in TEMPERATURE_SENSORS, and must not be put back there.
+#
+# It was, briefly, and the consequences were the exact bug the change above exists to
+# prevent. The #362 fix identified register 3176 on MOD/MID as the DC-DC stage and added
+# "dcdc_temp" to the shared TEMPERATURE_SENSORS group — which almost every profile
+# includes. Only three register maps define the register at all, so every other model
+# gained a "DC-DC Temperature" entity reporting 0.0 °C: a phantom created while fixing a
+# phantom, verified on the two profiles that have the register and on none of the
+# twenty-six that don't.
+#
+# Opt in per profile instead. A sensor group shared by everything is the wrong home for
+# a sensor only a few models can populate, because adding to it is silent and the failure
+# is invisible — nothing errors, an entity simply reports freezing forever.
+DCDC_TEMP_SENSOR: Set[str] = {"dcdc_temp"}
+
 BMS_SENSORS: Set[str] = {
     "bms_status", "bms_error", "bms_warn_info",
     "bms_max_current", "bms_cycle_count", "bms_soh",
@@ -94,6 +135,11 @@ BMS_SENSORS: Set[str] = {
 
 TEMPERATURE_SENSORS: Set[str] = {
     "inverter_temp", "ipm_temp", "boost_temp",
+    # dcdc_temp deliberately absent — see DCDC_TEMP_SENSOR below. It was added here with
+    # the note "only appears where a profile actually defines the register, so this is a
+    # no-op elsewhere", which is the belief this whole file warns against: membership of
+    # the sensor set is what creates the entity, and the register only decides whether it
+    # has a value. It was not a no-op; it put 0.0 °C on twenty-six profiles.
 }
 
 STATUS_SENSORS: Set[str] = {
@@ -103,6 +149,8 @@ STATUS_SENSORS: Set[str] = {
     "dry_contact_state",
     # WIT debug/safety registers (read-only, disabled by default)
     "ntognd_detect", "nonstd_vac_enable", "enable_spec_set", "fast_mppt_enable",
+    # Insulation/leakage diagnostics (ISO/DCI/GFCI — reg 3087-3091, disabled by default)
+    "pv_iso", "dci_r", "gfci",
 }
 
 THREE_PHASE_SENSORS: Set[str] = {
@@ -111,6 +159,8 @@ THREE_PHASE_SENSORS: Set[str] = {
     "ac_current_r", "ac_current_s", "ac_current_t",  # Phase currents
     "ac_power_r", "ac_power_s", "ac_power_t",  # Phase powers
     "ac_frequency",
+    # S/T-phase DC injection — only meaningful on 3-phase inverters (reg 3089/3090)
+    "dci_s", "dci_t",
 }
 
 SYSTEM_OUTPUT_SENSORS: Set[str] = {
@@ -127,8 +177,10 @@ SPF_OFFGRID_SENSORS: Set[str] = {
     # Generator sensors (SPF with generator input)
     "generator_power", "generator_voltage",
     "generator_discharge_today", "generator_discharge_total",
-    # AC charge/discharge energy (from grid/generator)
-    "ac_charge_energy_today", "ac_discharge_energy_today",
+    # AC charge/discharge energy (from grid/generator). ac_discharge_energy_total is
+    # here rather than in BATTERY_SENSORS because only the off-grid protocol defines it
+    # (registers 66/67) — see the note there (#390).
+    "ac_charge_energy_today", "ac_discharge_energy_today", "ac_discharge_energy_total",
     # Operational discharge energy
     "op_discharge_energy_today", "op_discharge_energy_total",
     # Fan speeds
@@ -145,6 +197,7 @@ SPE_OFFGRID_SENSORS: Set[str] = {
     "grid_voltage",              # reg 20
     "grid_frequency",            # reg 21
     "ac_discharge_energy_today", # regs 64/65 (= grid import today on SPE)
+    "ac_discharge_energy_total", # regs 66/67 (= grid import total on SPE)
     "mppt_fan_speed",            # reg 81
     "inverter_fan_speed",        # reg 82
     "dcdc_temp",                 # reg 26
@@ -175,6 +228,32 @@ BACKUP_BOX_SENSORS: Set[str] = {
     "box_grid_power",
     "box_load_power",
     "box_relay_status",
+}
+
+
+# MOD TL3-XH peak shaving / demand management, holding 3307-3312 (#372), and the
+# read-only VPP remote power control state, holding 30100/30407-30409/30474 (#373).
+#
+# ADD THIS ONLY TO PROFILES WHOSE REGISTER MAP DEFINES THOSE ADDRESSES. It is deliberately
+# a standalone group rather than an addition to an existing one: the registers appear in no
+# public protocol document and are confirmed on exactly one firmware line (MOD 10KTL3-XH,
+# DN1.0). Folding them into a shared group is how dcdc_temp reached twenty-six profiles
+# that had no register for it and published 0.0 for months (v1.5.3).
+#
+# grid_charge_stopped_soc (3312) is absent here on purpose — it is writable and appears as
+# a number entity, not a sensor.
+MOD_PEAK_SHAVING_SENSORS: Set[str] = {
+    "demand_import_limit",
+    "demand_export_limit",
+    "peak_shaving_reserve_soc",
+    "ac_charge_max_power",
+}
+
+MOD_VPP_STATE_SENSORS: Set[str] = {
+    "control_authority",
+    "remote_power_control_enable",
+    "remote_charge_and_discharge_power",
+    "vpp_last_setpoint",
 }
 
 
@@ -402,6 +481,35 @@ INVERTER_PROFILES = {
     },
 
     # MIN TL-XH Hybrid - Uses MIN 3000+ range with VPP battery
+    # Second-generation TL-XH. Serves ONLY the VPP ranges — legacy 0-124, 1000-1124 and
+    # the whole 3000+ block return Illegal Function, so the first-gen profile below reads
+    # battery and PV from addresses that do not exist on this hardware (Issue #361).
+    # Shares DTC 5100 with the first generation, so auto-detection cannot tell them apart:
+    # this is a manual-selection profile.
+    "min_tl_xh2_3000_10000_v201": {
+        "name": "MIN TL-XH2 3000-10000",
+        "description": "MIN series TL-XH2 hybrid with battery (3-10kW), VPP-only (30000+/31000+)",
+        "register_map": "MIN_TL_XH2_3000_10000_V201",
+        "phases": 1,
+        "has_pv3": True,  # 3-6kW: 2 strings, 7-10kW: 3 strings
+        "has_battery": True,
+        "max_power_kw": 10.0,
+        "protocol_version": "v2.01",
+        "sensors": (
+            BASIC_PV_SENSORS |
+            PV3_SENSORS |
+            BASIC_AC_SENSORS |
+            GRID_SENSORS |          # active power (31100/31101) = net grid exchange on hybrids
+            BATTERY_SENSORS |
+            STATUS_SENSORS |
+            # Inverter Temperature, from VPP 31114 (#361). Added with the register in the
+            # same change: this profile deliberately omitted it while nothing could populate
+            # it, which is the correct handling of a sensor with no source and the reason
+            # this model never showed a phantom 0.0 degC.
+            {"inverter_temp"}
+        ),
+    },
+
     "min_tl_xh_3000_10000_v201": {
         "name": "MIN TL-XH 3000-10000",
         "description": "MIN series TL-XH hybrid with battery (3-10kW) using 3000+ and 31000+ ranges",
@@ -564,6 +672,11 @@ INVERTER_PROFILES = {
     # SPH TL3 SERIES - Hybrid Storage (Three Phase with Battery)
     # ========================================================================
     
+    # dcdc_temp is subtracted from both: it reads register 3176 (Bdc1Temp1), which
+    # exists on MOD/MID and nowhere in the SPH-TL3 map. It was in the sensor set anyway,
+    # so every SPH-TL3 install has been publishing a DC-DC temperature of 0.0 °C. Found
+    # while checking the same class of fault on SPA-TL3 (#360); the other two phantom
+    # temperatures here were fixable by adding registers 94/95, this one is not.
     "sph_tl3_3000_10000": {
         "name": "SPH-TL3 Series 3000-10000",
         "description": "Hybrid 3-phase inverter with battery storage (3-10kW)",
@@ -572,7 +685,7 @@ INVERTER_PROFILES = {
         "has_pv3": False,
         "has_battery": True,
         "max_power_kw": 10.0,
-        "sensors": HYBRID_3P_SENSORS,
+        "sensors": HYBRID_3P_SENSORS | BMS_SENSORS,
     },
 
     # SPH-TL3 V2.01 VPP Protocol
@@ -585,7 +698,7 @@ INVERTER_PROFILES = {
         "has_battery": True,
         "max_power_kw": 10.0,
         "protocol_version": "v2.01",
-        "sensors": HYBRID_3P_SENSORS,
+        "sensors": HYBRID_3P_SENSORS | BMS_SENSORS,
     },
 
     # ========================================================================
@@ -605,7 +718,74 @@ INVERTER_PROFILES = {
             GRID_SENSORS |
             POWER_FLOW_SENSORS |
             ENERGY_BREAKDOWN_SENSORS |
+            # Eac today/total, from registers 2053-2056 in the SPA extended range. An
+            # AC-coupled inverter has no solar to meter, but it does meter what it puts
+            # out while discharging. Absent from SPA-TL3, which cannot reach that range.
+            ENERGY_SENSORS |
             BATTERY_SENSORS |
+            # Inverter/IPM/boost temperature, registers 2093-2095. The profile carried
+            # no temperature sensor of any kind before, which looked like hardware that
+            # doesn't measure it rather than a gap in what we asked for.
+            #
+            # dcdc_temp is subtracted below: SPA has no register for it, and it is a
+            # GrowattData field, so a hasattr() gate cannot suppress it — the sensor
+            # would be created and publish 0.0 degrees forever. That is the v1.4.1
+            # battery-temp bug exactly, and the sensor set is the only hard filter.
+            TEMPERATURE_SENSORS |
+            # Every BMS sensor is gated on hasattr(), so only the four registers this
+            # profile actually defines (1083/1085/1095/1096) create entities (#360).
+            BMS_SENSORS |
+            STATUS_SENSORS
+        ),
+    },
+
+    # SPA-TL3 shares the SPH-TL3 *register map* but not its sensor set.
+    #
+    # #360: an SPA-TL3 owner found the single-phase SPA profile left every entity
+    # unavailable, because that profile reads only 1000-1124 and this hardware does not
+    # serve that range. Switching to sph_tl3_3000_10000_v201 made the data flow, which
+    # establishes the register layout on real hardware.
+    #
+    # It does not make the device an SPH. SPA is AC-coupled and has no MPPT inputs at
+    # all, so the PV sensor groups that sph_tl3_3000_10000_v201 carries can only ever
+    # read zero. Reusing the map while dropping those groups is the whole point of this
+    # entry — the alternative considered was renaming the SPH-TL3 option to mention SPA,
+    # which would have made phantom PV entities the documented behaviour.
+    #
+    # ENERGY_SENSORS was excluded on the assumption that energy_today/energy_total count
+    # PV generation on the SPH map, which an AC-coupled unit has none of. A full scan of
+    # the #360 device refuted that:
+    #
+    #   input 53/54 = 0/20     -> 2.0 kWh today
+    #   input 55/56 = 0/23139  -> 2313.9 kWh total
+    #
+    # and the SPA extended block agrees exactly at 2053-2056, which is a second address
+    # reporting the same quantity. These count what the inverter puts out, and a battery
+    # discharging through it produces output like anything else. Restored.
+    #
+    # Worth recording how close this came to shipping wrong: the reporter checked the
+    # same registers and said there were no real values there, because 53 and 55 are the
+    # HIGH words and both read zero. The data was in 54 and 56. The scan CSV settled in
+    # seconds what two rounds of asking could not.
+    "spa_tl3_4000_10000_v201": {
+        "name": "SPA-TL3 (AC Storage) 4-10kW",
+        "description": "Three-phase AC-coupled battery storage, no solar DC inputs (VPP V2.01)",
+        "register_map": "SPH_TL3_3000_10000_V201",  # shared — see note above
+        "phases": 3,
+        "has_pv3": False,
+        "has_battery": True,
+        "max_power_kw": 10.0,
+        "protocol_version": "v2.01",
+        "sensors": (
+            THREE_PHASE_SENSORS |
+            GRID_SENSORS |
+            POWER_FLOW_SENSORS |
+            CONSUMPTION_SENSORS |
+            ENERGY_BREAKDOWN_SENSORS |
+            ENERGY_SENSORS |
+            BATTERY_SENSORS |
+            BMS_SENSORS |
+            TEMPERATURE_SENSORS |
             STATUS_SENSORS
         ),
     },
@@ -687,7 +867,9 @@ INVERTER_PROFILES = {
         "has_pv3": True,
         "has_battery": True,
         "max_power_kw": 15.0,
-        "sensors": HYBRID_3P_SENSORS | PV3_SENSORS | BACKUP_BOX_SENSORS,
+        "sensors": ((HYBRID_3P_SENSORS | PV3_SENSORS | BACKUP_BOX_SENSORS | DCDC_TEMP_SENSOR
+                     | MOD_PEAK_SHAVING_SENSORS | MOD_VPP_STATE_SENSORS)
+                    - NO_BATTERY_TEMP),
     },
 
     "mod_6000_15000tl3_xh_v201": {
@@ -699,7 +881,9 @@ INVERTER_PROFILES = {
         "has_pv3": True,
         "has_battery": True,
         "max_power_kw": 15.0,
-        "sensors": HYBRID_3P_SENSORS | PV3_SENSORS | BACKUP_BOX_SENSORS,
+        "sensors": ((HYBRID_3P_SENSORS | PV3_SENSORS | BACKUP_BOX_SENSORS | DCDC_TEMP_SENSOR
+                     | MOD_PEAK_SHAVING_SENSORS | MOD_VPP_STATE_SENSORS)
+                    - NO_BATTERY_TEMP),
     },
 
     # MID 11-30KTL3-XH / MID 8-15KTL3-XHL/JP — three-phase commercial hybrid
@@ -717,7 +901,9 @@ INVERTER_PROFILES = {
         "has_pv3": True,
         "has_battery": True,
         "max_power_kw": 30.0,
-        "sensors": HYBRID_3P_SENSORS | PV3_SENSORS | BACKUP_BOX_SENSORS,
+        "sensors": ((HYBRID_3P_SENSORS | PV3_SENSORS | BACKUP_BOX_SENSORS | DCDC_TEMP_SENSOR
+                     | MOD_PEAK_SHAVING_SENSORS | MOD_VPP_STATE_SENSORS)
+                    - NO_BATTERY_TEMP),
     },
 
     # ========================================================================
@@ -924,7 +1110,71 @@ PROFILE_DISPLAY_NAMES = {
         "v201": "spe_8000_12000_es",  # Only one variant
         "description": "Hybrid with battery (8-12kW)",
     },
+
+    # AC-Coupled Storage (no PV inputs)
+    # Was missing from this dict until v1.1.6 — the profile existed in INVERTER_PROFILES
+    # but had no display name, so it never appeared in the config-flow dropdown and could
+    # not be selected by anyone (Issue #360).
+    # Both entries say the phase count, because the only distinguishing fact an SPA owner
+    # can check without a scan is how many phases their unit has. #360 spent weeks on an
+    # SPA-TL3 owner picking the one option with "SPA" in it, which was the single-phase
+    # profile, which reads a register range their hardware does not serve.
+    #
+    # These are display names, not profile keys: the options flow stores the resolved key
+    # and derives the dropdown default from it via get_display_name_for_profile(), so
+    # renaming here cannot strand an existing selection.
+    "SPA (AC Storage, 1-Phase) 3-6kW": {
+        "base": "spa_3000_6000_tl_bl",
+        "v201": "spa_3000_6000_tl_bl",  # Only one variant
+        "description": "AC-coupled battery storage, no solar DC inputs",
+    },
+    "SPA-TL3 (AC Storage, 3-Phase) 4-10kW": {
+        "base": "spa_tl3_4000_10000_v201",
+        "v201": "spa_tl3_4000_10000_v201",  # Only one variant
+        "description": "Three-phase AC-coupled battery storage, no solar DC inputs",
+    },
+
+    # TL-XH (non-MIN variants)
+    # Missing from this dict until v1.1.9 (Issue #361). Auto-detection assigns
+    # tl_xh_3000_10000_v201 for DTC 5100, but with no display-name entry the options flow
+    # could not render it: get_display_name_for_profile() fell through to the profile's
+    # technical `name`, which is not a valid dropdown key, so vol.In() rejected the default
+    # and the user was locked out of changing ANY option ("value must be one of [...]").
+    "TL-XH (3-10kW)": {
+        "base": "tl_xh_3000_10000",
+        "v201": "tl_xh_3000_10000_v201",
+        "description": "Single-phase hybrid with battery, legacy 0-124 + VPP ranges",
+    },
+    "TL-XH US (3-10kW)": {
+        "base": "tl_xh_us_3000_10000",
+        "v201": "tl_xh_us_3000_10000_v201",
+        "description": "US single-phase hybrid with battery (split-phase)",
+    },
+    # Second-generation TL-XH — shares DTC 5100 with the first generation, so
+    # auto-detection cannot distinguish them. Select this manually if your legacy and
+    # 3000-range registers return Illegal Function (Issue #361).
+    "MIN TL-XH2 (3-10kW)": {
+        "base": "min_tl_xh2_3000_10000_v201",
+        "v201": "min_tl_xh2_3000_10000_v201",  # VPP-only; no legacy variant exists
+        "description": "Second-gen MIN TL-XH2 hybrid, VPP registers only",
+    },
 }
+
+# Every INVERTER_PROFILES key MUST be reachable from PROFILE_DISPLAY_NAMES via 'base' or
+# 'v201'. A profile that isn't cannot be rendered by the options flow — see the TL-XH note
+# above. This has bitten twice (SPA in #360, TL-XH in #361), so assert it at import time
+# rather than waiting for a user to hit it.
+_ORPHANED_PROFILES = {
+    pid for pid in INVERTER_PROFILES
+    if not any(pid in (info["base"], info["v201"]) for info in PROFILE_DISPLAY_NAMES.values())
+}
+if _ORPHANED_PROFILES:  # pragma: no cover — guards a developer error, not runtime state
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "Profiles with no PROFILE_DISPLAY_NAMES entry — these cannot be selected or "
+        "reconfigured in the options flow: %s",
+        ", ".join(sorted(_ORPHANED_PROFILES)),
+    )
 
 
 def resolve_profile_alias(series: str) -> str:
@@ -937,9 +1187,70 @@ def resolve_profile_alias(series: str) -> str:
     return PROFILE_ALIASES.get(series, series)
 
 
+def profile_exists(series: str) -> bool:
+    """Whether a profile key resolves to a real profile rather than the fallback.
+
+    Callers that can surface a problem to the user should check this first: get_profile()
+    cannot distinguish "you asked for MIN 7-10kW" from "you asked for something that does
+    not exist", because both return the same profile.
+    """
+    return resolve_profile_alias(series) in INVERTER_PROFILES
+
+
+def fill_register_map(detection: dict) -> None:
+    """Fill a detection result's register map name from its profile key, if nothing set it.
+
+    Lives here rather than in `diagnostic.py` because it is a lookup against the profile
+    registry and nothing else — which also keeps it testable without Home Assistant.
+
+    The DTC branch is the *primary* detection path, and it sets `profile_key` and returns
+    without ever assigning `register_map`, so the field kept its "UNKNOWN" default. Every
+    heuristic fallback — PV3 probing, range checks, model-name matching — assigns it
+    explicitly. The field was therefore populated on the paths that matter least and blank
+    on the one used most, in exactly the scans people are asked to attach when confirming a
+    mapping (#379).
+
+    Resolved from the *final* profile key rather than where it is first set: a DTC read from
+    the V1.39 register is downgraded to a legacy profile afterwards, so deriving it earlier
+    would report the pre-downgrade map.
+
+    Only fills a missing value. The heuristic branches choose deliberately — PV3 probing
+    picks between maps that share a profile key — and recomputing would undo that.
+    """
+    if detection.get("register_map") not in (None, "", "UNKNOWN"):
+        return
+
+    profile = INVERTER_PROFILES.get(detection.get("profile_key") or "")
+    if profile and profile.get("register_map"):
+        detection["register_map"] = profile["register_map"]
+
+
 def get_profile(series: str):
-    """Get inverter profile by series name, resolving any alias first."""
-    return INVERTER_PROFILES.get(resolve_profile_alias(series), INVERTER_PROFILES["min_7000_10000_tl_x"])
+    """Get inverter profile by series name, resolving any alias first.
+
+    An unknown key falls back to min_7000_10000_tl_x. That keeps setup alive rather than
+    raising, but it is a single-phase profile reading the 3000 range, so on anything else
+    it produces an integration that loads cleanly and reports almost nothing — with no
+    error to trace it to.
+    #360 hit this: a user hand-edited a profile into the component directory, and updating
+    the integration replaced those files. Their entry still named the vanished profile, so
+    they silently became a MIN.
+
+    The warning below is why this is not silent any more; __init__ also raises a repair
+    issue, because a log line alone does not reach anyone.
+    """
+    resolved = resolve_profile_alias(series)
+    profile = INVERTER_PROFILES.get(resolved)
+    if profile is None:
+        _LOGGER.warning(
+            "Unknown inverter profile %r — falling back to 'min_7000_10000_tl_x'. "
+            "Sensors for your model will be missing or empty. Reconfigure the "
+            "integration and select your model. This usually means a hand-edited "
+            "profile was removed by an update.",
+            series,
+        )
+        return INVERTER_PROFILES["min_7000_10000_tl_x"]
+    return profile
 
 
 def get_available_profiles(legacy_only: bool = False, friendly_names: bool = True) -> Dict[str, str]:
@@ -954,18 +1265,20 @@ def get_available_profiles(legacy_only: bool = False, friendly_names: bool = Tru
         or profile ID to display name (if friendly_names=False)
     """
     if friendly_names:
-        # Return user-friendly names in alphabetical order
+        # One plain entry per family. The legacy/VPP V2.01 distinction is deliberately not
+        # surfaced here (#385): it is an implementation detail of the protocol, and most
+        # users neither know nor need to know which of the two register maps they run.
+        #
+        # It still has to be *correctable*, because a wrong stored flag used to be permanent
+        # short of deleting the config entry - that is what cost two days on #377. The
+        # options form carries a separate "Protocol variant" field for that, defaulting to
+        # Auto, so the concept only reaches someone who has a reason to look for it.
         profiles = {}
         for display_name in sorted(PROFILE_DISPLAY_NAMES.keys()):
             profile_info = PROFILE_DISPLAY_NAMES[display_name]
-            # Use base profile for legacy-only, otherwise use v201 as default
-            if legacy_only:
-                profile_id = profile_info["base"]
-            else:
-                # Prefer v201 if available and different from base
-                profile_id = profile_info["v201"]
-
-            profiles[display_name] = profile_id
+            profiles[display_name] = (
+                profile_info["base"] if legacy_only else profile_info["v201"]
+            )
 
         return profiles
     else:

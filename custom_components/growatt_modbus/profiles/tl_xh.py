@@ -330,6 +330,9 @@ MIN_TL_XH_3000_10000_V201 = {
 
         # Diagnostics
         3086: {'name': 'derating_mode', 'scale': 1, 'unit': '', 'desc': 'Derating status'},
+        3087: {'name': 'pv_iso', 'scale': 1, 'unit': 'kΩ', 'desc': 'PV insulation resistance'},
+        3088: {'name': 'dci_r', 'scale': 0.1, 'unit': 'mA', 'desc': 'DC injection current (R-phase / single-phase)'},
+        3091: {'name': 'gfci', 'scale': 1, 'unit': 'mA', 'desc': 'Residual/leakage current (GFCI)'},
         3092: {'name': 'bus_voltage', 'scale': 0.1, 'unit': 'V', 'desc': 'DC bus voltage'},
 
         # Temperatures
@@ -341,8 +344,13 @@ MIN_TL_XH_3000_10000_V201 = {
         3105: {'name': 'fault_code', 'scale': 1, 'unit': '', 'desc': 'Main fault code'},
         3106: {'name': 'warning_code', 'scale': 1, 'unit': '', 'desc': 'Main warning code'},
 
-        # Battery Extended Diagnostics
-        3136: {'name': 'battery_bms_temp', 'scale': 0.1, 'unit': '°C', 'signed': True, 'desc': 'Battery BMS/module temperature'},
+        # (Register 3136 was also defined here as 'battery_bms_temp'. It is the low word
+        # of the AC charge energy total pair 3135/3136, defined further down and confirmed
+        # against a real reading — the same correction mod.py records at its register 3135.
+        # Being a duplicate key in the same dict, the later definition always won, so
+        # 'battery_bms_temp' never existed at runtime: no sensor, no dataclass field, no
+        # way to notice. Removed. tests/test_profile_integrity.py now fails on duplicate
+        # register keys so a shadowed mapping can't hide again.)
 
         # === BATTERY STATE REGISTERS (3169-3176) - PRIMARY for MIN TL-XH ===
         # MIN TL-XH uses 3000+ range for battery state (not VPP 31200+ range)
@@ -350,7 +358,16 @@ MIN_TL_XH_3000_10000_V201 = {
         3169: {'name': 'battery_voltage', 'scale': 0.01, 'unit': 'V', 'desc': 'Battery voltage (primary source for MIN TL-XH)'},
         3170: {'name': 'battery_current', 'scale': 0.1, 'unit': 'A', 'signed': True, 'desc': 'Battery current (primary source for MIN TL-XH)'},
         3171: {'name': 'battery_soc', 'scale': 1, 'unit': '%', 'desc': 'Battery SOC (primary source for MIN TL-XH)'},
-        3176: {'name': 'battery_temp', 'scale': 0.1, 'unit': '°C', 'signed': True, 'desc': 'Battery temperature (primary source for MIN TL-XH)'},
+        # UNVERIFIED on TL-XH. On MOD/MID this same address is Bdc1Temp1 — the DC-DC
+        # converter stage, not the battery — confirmed against ShineApp in #362, where it
+        # read ~52 °C on cabinets that were cool to the touch. Same address, same protocol
+        # generation, so this is very likely the same thing here.
+        #
+        # Deliberately left as battery_temp: no TL-XH owner has compared it against the
+        # BMS reading, and changing it on another model's evidence is the overreach that
+        # #362 nearly caused. To settle it, compare this against the battery temperature
+        # in ShineApp at the same minute — an exact match to Bdc1Temp1 confirms the rename.
+        3176: {'name': 'battery_temp', 'scale': 0.1, 'unit': '°C', 'signed': True, 'desc': 'Battery temperature (primary source for MIN TL-XH) — see note above, likely Bdc1Temp1'},
 
         # === BATTERY ENERGY REGISTERS (3125-3136) ===
         # Battery energy today/total in fallback 3000 range (same layout as MOD series)
@@ -455,6 +472,164 @@ MIN_TL_XH_3000_10000_V201 = {
     }
 }
 
+# ============================================================================
+# MIN TL-XH2 — second-generation, VPP-only (Issue #361)
+# ============================================================================
+#
+# The TL-XH2 serves ONLY the VPP ranges. Every legacy range — base 0-124, storage
+# 1000-1124 and the whole 3000+ block — returns Modbus "Illegal Function". The
+# first-generation MIN_TL_XH_3000_10000_V201 profile above is therefore unusable on
+# this hardware: its PV and battery sensors read from 3000-range addresses that do
+# not exist, and it carries three legacy registers (91, 92, 97) that made the poll
+# abort entirely before v1.1.8.
+#
+# Mapping verified against the Growatt portal by Richardmarkink on a MIN 4200TL-XH2
+# (DTC 5100, protocol V2.01), rather than assumed from the V2.01 spec blocks:
+#
+#   31011 = 6.3 A   portal MPPT1 current 6.3 A
+#   31013 = 6.9 A   portal MPPT2 current 6.7 A
+#   31109 = 8.3 A   portal grid current L1 8.3 A
+#   31214 = 404.3 V matched the app's battery voltage
+#   31217 = 75 %    matched the app's battery SOC
+#   31059           total PV power, confirmed on two scans an order of magnitude
+#                   apart: 773.5 W vs 747 W computed, 2854.7 W vs 2843 W computed
+#
+# NOTE ON THE PV BLOCK: this does NOT match VPP_V201_PV2_INPUT, which defines
+# 31012/31013 as PV1 power high/low. On TL-XH2 they are PV2 voltage and current.
+# Unpacking that shared block here would report PV2 voltage as PV1 power — a
+# plausible-looking value that would be silently wrong. Defined inline for that
+# reason; do not "simplify" it back to **VPP_V201_PV2_INPUT.
+#
+# PV3 (31014/31015) reads zero on the 4200 because it is a two-string model. The
+# 7-10 kW variants have three strings, so it is defined here rather than omitted —
+# otherwise every larger unit would silently lose a string.
+MIN_TL_XH2_3000_10000_V201 = {
+    'name': 'MIN TL-XH2 3000-10000',
+    'description': 'MIN series TL-XH2 hybrid with battery (3-10kW), VPP-only (30000+/31000+)',
+    'notes': (
+        'Second-generation TL-XH. Serves ONLY the VPP ranges — legacy 0-124, 1000-1124 '
+        'and 3000+ all return Illegal Function. PV block layout differs from '
+        'VPP_V201_PV2_INPUT and is defined inline. Verified against the Growatt portal '
+        'on a MIN 4200TL-XH2 (Issue #361).'
+    ),
+    'input_registers': {
+        # === Status (31000-31004) ===
+        **VPP_V201_STATUS,
+
+        # === PV strings — inline, NOT VPP_V201_PV2_INPUT (see note above) ===
+        31010: {'name': 'pv1_voltage', 'scale': 0.1, 'unit': 'V', 'desc': 'PV1 DC voltage'},
+        31011: {'name': 'pv1_current', 'scale': 0.1, 'unit': 'A', 'desc': 'PV1 DC current'},
+        31012: {'name': 'pv2_voltage', 'scale': 0.1, 'unit': 'V', 'desc': 'PV2 DC voltage'},
+        31013: {'name': 'pv2_current', 'scale': 0.1, 'unit': 'A', 'desc': 'PV2 DC current'},
+        31014: {'name': 'pv3_voltage', 'scale': 0.1, 'unit': 'V',
+                'desc': 'PV3 DC voltage (7-10kW models only; 0 on 2-string units)'},
+        31015: {'name': 'pv3_current', 'scale': 0.1, 'unit': 'A',
+                'desc': 'PV3 DC current (7-10kW models only; 0 on 2-string units)'},
+
+        # === Total PV power (32-bit) ===
+        # 31058 reads 0 while 31059 carries the value, consistent with a high/low pair.
+        # Treated as 32-bit so output above 6.5 kW cannot overflow a single register.
+        31058: {'name': 'pv_total_power_high', 'scale': 1, 'unit': '', 'pair': 31059,
+                'desc': 'Total PV power HIGH word'},
+        31059: {'name': 'pv_total_power_low', 'scale': 1, 'unit': '', 'pair': 31058,
+                'combined_scale': 0.1, 'combined_unit': 'W',
+                'desc': 'Total PV power LOW word (confirmed on two scans, Issue #361)'},
+
+        # === AC output / grid ===
+        # Active power — VPP 2.03 spec item 45. INT32 signed, 0.1 W.
+        # Positive = export to grid, Negative = import from grid.
+        #
+        # On a HYBRID this is net grid exchange, not raw inverter output: the firmware
+        # already subtracts battery and load. Same reasoning as the MID design note in
+        # mid.py (confirmed there against the #242 scan) — the Meter Power caveat applies
+        # only to grid-tied MID models with no battery, which this is not. So it maps to
+        # power_to_grid rather than ac_power.
+        #
+        # Shipped as unsigned ac_power in v1.2.1: a negative reading surfaced as
+        # 429,496,471 W, the two's-complement value read as unsigned (Issue #361).
+        31100: {'name': 'power_to_grid_high', 'scale': 1, 'unit': '', 'pair': 31101,
+                'desc': 'Active power HIGH (INT32 signed — net grid exchange on hybrid)'},
+        31101: {'name': 'power_to_grid_low', 'scale': 1, 'unit': '', 'pair': 31100,
+                'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True,
+                'desc': 'Active power LOW — positive=export, negative=import'},
+        # Reactive power (INT32, 0.1 VAR) — deliberately NOT named ac_power.
+        # mic.py and min.py currently label this pair ac_power_*_vpp with maps_to
+        # ac_power, which is wrong: it is VAR, not W. Not replicated here.
+        31102: {'name': 'ac_reactive_power_high', 'scale': 1, 'unit': '', 'pair': 31103,
+                'desc': 'Reactive power HIGH (INT32 signed)'},
+        31103: {'name': 'ac_reactive_power_low', 'scale': 1, 'unit': '', 'pair': 31102,
+                'combined_scale': 0.1, 'combined_unit': 'VAR', 'signed': True,
+                'desc': 'Reactive power LOW'},
+        31105: {'name': 'ac_frequency', 'scale': 0.01, 'unit': 'Hz', 'desc': 'Grid frequency'},
+        31106: {'name': 'ac_voltage',   'scale': 0.1,  'unit': 'V',  'desc': 'Grid voltage'},
+        31109: {'name': 'ac_current',   'scale': 0.1,  'unit': 'A',  'desc': 'Grid current'},
+
+        # Inverter temperature (#361). Every other profile reads this from the base range -
+        # register 93, or 25/32/2093/3093 depending on family - but this one cannot: the
+        # TL-XH2 answers Illegal Function across the whole base block, which is what opened
+        # that issue. 31114 is the only source it has, so without this the profile had no
+        # inverter temperature at all and correctly left the sensor out of its set.
+        #
+        # VPP V2.01/V2.03: "31114 Inverter temperature, RO, INT16, 0.1 degC, [-400,1250]".
+        # Confirmed on hardware - a MIN 4200TL-XH2 read 339 while its app showed 33.9 degC.
+        #
+        # Signed because the protocol says INT16 and the documented range starts at -40 degC.
+        31114: {'name': 'inverter_temp', 'scale': 0.1, 'unit': '°C', 'signed': True,
+                'desc': 'Inverter temperature (VPP 31114). Only temperature source on this '
+                        'profile - the base range is unimplemented on TL-XH2 hardware'},
+
+        # === Battery (cluster 1) ===
+        # Unsuffixed on purpose. The first-gen profile names these *_vpp to stop them
+        # being used as fallbacks for its 3000-range battery registers. TL-XH2 has no
+        # 3000 range, so these ARE the battery sensors — suffixing them here would
+        # leave every battery entity empty.
+        31200: {'name': 'battery_power_high', 'scale': 1, 'unit': '', 'pair': 31201},
+        31201: {'name': 'battery_power_low',  'scale': 1, 'unit': '', 'pair': 31200,
+                'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
+        # Energy counters. Per VPP 2.03 §2.2 rows 66-69, 31202/31204/31206/31208 are ALL
+        # energy in 0.1 kWh — daily and cumulative, charge and discharge. v1.2.1 mapped
+        # 31204 and 31208 as charge/discharge POWER in watts, inherited from the first-gen
+        # MIN TL-XH profile. Confirmed wrong against a field scan: those registers read
+        # 37.9 and 29.2, coherent as cumulative kWh on a system with 72.7 kWh lifetime
+        # generation, nonsensical as 37.9 W / 29.2 W (Issue #361).
+        31202: {'name': 'charge_energy_today_high', 'scale': 1, 'unit': '', 'pair': 31203},
+        31203: {'name': 'charge_energy_today_low',  'scale': 1, 'unit': '', 'pair': 31202,
+                'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        31204: {'name': 'charge_energy_total_high', 'scale': 1, 'unit': '', 'pair': 31205},
+        31205: {'name': 'charge_energy_total_low',  'scale': 1, 'unit': '', 'pair': 31204,
+                'combined_scale': 0.1, 'combined_unit': 'kWh',
+                'desc': 'Cumulative battery charge (VPP 2.03 row 67)'},
+        31206: {'name': 'discharge_energy_today_high', 'scale': 1, 'unit': '', 'pair': 31207},
+        31207: {'name': 'discharge_energy_today_low',  'scale': 1, 'unit': '', 'pair': 31206,
+                'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        31208: {'name': 'discharge_energy_total_high', 'scale': 1, 'unit': '', 'pair': 31209},
+        31209: {'name': 'discharge_energy_total_low',  'scale': 1, 'unit': '', 'pair': 31208,
+                'combined_scale': 0.1, 'combined_unit': 'kWh',
+                'desc': 'Cumulative battery discharge (VPP 2.03 row 69)'},
+        31214: {'name': 'battery_voltage', 'scale': 0.1, 'unit': 'V', 'signed': True,
+                'desc': 'Battery voltage (INT16; verified against app, Issue #361)'},
+        # INT32 spanning 31215-31216, NOT a single register. Read as INT16 the value sits
+        # in the high word and decodes to ~0 — the same defect reported for WIT in #247,
+        # where -27.4 A appeared as -0.1 A. Verified here: battery power 2012 W over
+        # 403.7 V = 4.98 A, and 31216 reads 49 -> 4.9 A.
+        31215: {'name': 'battery_current_high', 'scale': 1, 'unit': '', 'pair': 31216},
+        31216: {'name': 'battery_current_low',  'scale': 1, 'unit': '', 'pair': 31215,
+                'combined_scale': 0.1, 'combined_unit': 'A', 'signed': True,
+                'desc': 'Battery current (INT32; positive=charging)'},
+        31217: {'name': 'battery_soc', 'scale': 1, 'unit': '%',
+                'desc': 'Battery SOC (verified against app, Issue #361)'},
+        # Spec puts battery temperature at 31223, not 31222 — 31222 is the low word of the
+        # reserved UINT32 at 31221 and reads 0. NOTE: 31223 also reads 0 on the MIN
+        # 4200TL-XH2, while 31224 ("reserved for maximum battery temperature") reads 365
+        # -> 36.5 °C. Awaiting a field comparison before preferring 31224 (Issue #361).
+        31223: {'name': 'battery_temp', 'scale': 0.1, 'unit': '°C', 'signed': True,
+                'desc': 'Battery temperature (VPP 2.03 row 78)'},
+    },
+    'holding_registers': {
+        **VPP_V201_HOLDING_1P,
+    },
+}
+
 # Export all TL-XH profiles
 TL_XH_REGISTER_MAPS = {
     'TL_XH_3000_10000': TL_XH_3000_10000,
@@ -462,4 +637,5 @@ TL_XH_REGISTER_MAPS = {
     'TL_XH_3000_10000_V201': TL_XH_3000_10000_V201,
     'TL_XH_US_3000_10000_V201': TL_XH_US_3000_10000_V201,
     'MIN_TL_XH_3000_10000_V201': MIN_TL_XH_3000_10000_V201,
+    'MIN_TL_XH2_3000_10000_V201': MIN_TL_XH2_3000_10000_V201,
 }
