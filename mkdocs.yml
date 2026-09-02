@@ -68,6 +68,10 @@ nav:
       - Off-Grid V0.26: developer/protocol-offgrid.md
       - ESS Protocol (BMS block): developer/protocol-ess.md
   - Release Notes: release-notes.md
+  - "Fork: WIT direct control":
+    - Direct Control Overview: DIRECT_CONTROL_OVERVIEW.md
+    - WIT Mode Presets: WIT_MODE_PRESETS.md
+    - WIT Register Matrix: WIT_REGISTER_MATRIX.md
 
 markdown_extensions:
   - admonition

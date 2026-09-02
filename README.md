@@ -12,6 +12,14 @@
 
 A native Home Assistant integration for Growatt solar inverters using **direct Modbus RTU/TCP communication**. Real-time data straight from your inverter — no cloud, no ShineWiFi, no dependency on Growatt's servers.
 
+> **This is the [jekmanis](https://github.com/jekmanis) fork of [0xAHA/Growatt_ModbusTCP](https://github.com/0xAHA/Growatt_ModbusTCP)**, tracking upstream **v1.8.14**. On top of upstream it adds direct real-time WIT battery control and a few hardening fixes carried across the rebase:
+>
+> - The `growatt_modbus.set_wit_mode` service and switch-based WIT direct control — see [Direct Control Overview](docs/DIRECT_CONTROL_OVERVIEW.md) and [WIT Mode Presets](docs/WIT_MODE_PRESETS.md)
+> - The full WIT register map behind every mode — see [WIT Register Matrix](docs/WIT_REGISTER_MATRIX.md)
+> - Expiry of the optional-holding-register blacklist, so one transient read failure no longer freezes a sensor forever
+> - Shared-TCP connection recovery after a silent connection loss
+> - Identify-the-inverter-once, instead of re-probing the device type on every setup
+
 ## 📖 [Full documentation → https://0xaha.github.io/Growatt_ModbusTCP/](https://0xaha.github.io/Growatt_ModbusTCP/)
 
 The documentation site covers supported models, sensor reference, inverter controls, energy dashboard setup, troubleshooting, and developer guides.

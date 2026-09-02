@@ -4,6 +4,82 @@
 
 ---
 
+## Fork: rebased on upstream v1.8.14 (2026-09-02)
+
+This is the [jekmanis](https://github.com/jekmanis) fork of
+[0xAHA/Growatt_ModbusTCP](https://github.com/0xAHA/Growatt_ModbusTCP). It last tracked
+upstream at v1.0.11; this rebase carries the fork's WIT direct-control additions forward
+onto everything upstream shipped between v1.0.11 and v1.8.14, merged at `802acb0`.
+
+**What upstream brought since v1.0.11**, skimmed from its commit history and from the
+v1.1.0-v1.8.14 sections below:
+
+- A `GrowattEntity` base class removing 22 duplicated copies of unique-ID composition and
+  device-info lookup across the sensor and binary_sensor platforms (v1.3.2).
+- Per-entry state moved onto the config entry's `runtime_data` instead of a shared
+  `hass.data[DOMAIN]` dict, plus `PARALLEL_UPDATES` declared per platform (v1.3.1).
+- Translatable entity names (`has_entity_name`) and a `strings.json`/`translations/en.json`
+  pass across the integration, rather than names baked into Python.
+- `growatt_modbus.sync_inverter_time` and an Inverter Clock sensor/button to correct the
+  inverter's own RTC drift, since TOU windows fire against that clock, not Home Assistant's
+  (v1.8.9/v1.8.8).
+- Shared and per-client connection hardening: writes now recover from a dropped socket the
+  way reads already did, a whole poll holds the bus rather than each transaction on serial,
+  and the shared hub validates response length the same way the non-shared path always did
+  (v1.3.7, v1.8.10, v1.8.12).
+- A no-op write guard: setting a control to the value it already holds no longer spends an
+  EEPROM write cycle, and writable settings became numeric inputs instead of sliders that
+  wrote on every drag step (v1.6.6, v1.8.14).
+- Failed reads now withhold the reading (`unknown`) instead of publishing a `0` that could
+  never afterwards be told apart from a real measurement — rolled out across PV, AC, grid,
+  load, temperature and every energy counter over several releases (v1.6.6-v1.6.9, v1.8.8).
+- A profile/protocol-variant re-check: a wrong auto-detected register map or protocol
+  variant can now be corrected from Configure instead of requiring the config entry to be
+  deleted and re-added (v1.6.6, v1.8.8 "Protocol variant" field).
+- New and corrected profiles and register maps: MOD/MID TL3-XH peak-shaving and VPP
+  controls, several SPH energy-counter and battery-current fixes, MIN TL-XH2 register
+  corrections, and an ESS Protocol reference page for the SPH BMS block (v1.6.0-v1.6.9,
+  v1.8.11-v1.8.13).
+- A 188+ test CI suite and a Download Diagnostics action, added as part of upstream's HA
+  integration-quality (Bronze tier) push (v1.3.0 onward).
+
+**What the fork keeps on top of that:** the `growatt_modbus.set_wit_mode` service and WIT
+direct control (`switch.py`'s grid-export and battery-optimizer switches, the
+`wit_mode_status` sensor — see [Direct Control Overview](docs/DIRECT_CONTROL_OVERVIEW.md),
+[WIT Mode Presets](docs/WIT_MODE_PRESETS.md) and [WIT Register Matrix](docs/WIT_REGISTER_MATRIX.md)),
+expiry of the optional-holding-register blacklist, shared-TCP silent-loss recovery, and
+identify-the-inverter-once.
+
+**Merge review fixes**, applied against the rebased tree in `802acb0..HEAD`:
+
+- Fixed a pre-existing upstream `NameError` (missing `issue_registry` import) that silently
+  swallowed the unknown-profile repair issue.
+- Gave the direct/serial write path the same all-or-nothing batch locking the shared path
+  already had, so a poll cannot interleave mid-`set_wit_mode` sequence.
+- Made register 30410's FC 0x06 refusal memoised per register instead of re-probed on every
+  15-minute slot, and made `set_wit_mode`'s write failures report the device's own reason
+  on a falsy return as well as a raised one.
+- Restored `set_battery_mode`'s `hold` option and `sync_tou_schedule`'s standby-power
+  documentation, both of which had drifted from the code that implements them.
+- Fixed missing translations for `wit_mode_status`, an orphaned `active_power_rate_vpp`
+  entity, and a `switch.py` WIT gate that missed one register-map name.
+- Widened the VPP-availability cleanup to require several consecutive missed polls (the
+  client's own give-up point) before deleting control entities, rather than deleting them
+  on the first missed one.
+- Widened `set_wit_mode`'s profile gate to list every register the command sequence
+  actually depends on, so an unsupported profile is refused up front instead of aborting
+  mid-sequence after control authority was already granted.
+- Stopped a refused 30100 (control-authority) write from being recorded as applied in
+  `set_wit_mode`'s response, which had been misreporting authority as granted for a write
+  the inverter had just refused.
+- Added contract tests pinning the `set_wit_mode`/`get_register_data` shapes the battery
+  optimizer depends on — response keys, `start_address` naming, and the exact registers
+  each WIT mode writes — on both the direct and the shared-connection bus, plus a replay of
+  entity setup against the live 134-row registry to confirm the merge renames or deletes
+  nothing undocumented.
+
+---
+
 ## Unreleased
 
 Staged for the next release. **Not yet published** — v1.8.14 is the current stable.
