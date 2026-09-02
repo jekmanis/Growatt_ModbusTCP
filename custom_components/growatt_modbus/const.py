@@ -797,6 +797,23 @@ DEVICE_TYPE_BACKUPBOX = "backup_box"
 
 # Sensor to Device Mapping
 # Each sensor is assigned to a logical device for better organization
+# Optional VPP holding blocks (30000+) are read best-effort: a Modbus error, or the
+# backoff window that follows repeated errors, makes a whole block miss a poll.
+# GrowattData is rebuilt per poll, so a missed block leaves dataclass defaults that
+# look exactly like a real "Disabled"/0 reading. Control entities backed by one of
+# these blocks must therefore report unavailable when its flag is False rather than
+# publishing the default.
+#
+# control name -> GrowattData flag set only when the block was actually read
+VPP_CONTROL_AVAILABILITY_FLAG = {
+    'control_authority': 'vpp_control_authority_available',            # 30100
+    'vpp_export_limit_enable': 'vpp_export_limit_available',           # 30200
+    'vpp_export_limit_power_rate': 'vpp_export_limit_available',       # 30201
+    'remote_power_control_enable': 'vpp_remote_power_available',       # 30407
+    'remote_power_control_charging_time': 'vpp_remote_power_available',  # 30408
+    'remote_charge_and_discharge_power': 'vpp_remote_power_available',   # 30409
+}
+
 SENSOR_DEVICE_MAP = {
     # Inverter device - system health and status
     DEVICE_TYPE_INVERTER: {

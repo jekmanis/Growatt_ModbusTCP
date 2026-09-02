@@ -58,6 +58,23 @@ except ImportError:
 # Configure logging
 logger = logging.getLogger(__name__)
 
+# --- Optional-register backoff tuning -------------------------------------------------
+# Optional VPP ranges/blocks are skipped for a while after they fail, so a firmware that
+# genuinely does not implement them doesn't get hammered every poll (each unanswered
+# request costs a timeout and can leave a stale response in the adapter buffer, which
+# shows up later as a transaction-ID mismatch).
+#
+# Both backoffs are *temporary*.  A permanent blacklist is wrong: registers 30100 /
+# 30200-30201 / 30407-30410 are read from live hardware and a single Modbus timeout is
+# a routine transient event, not proof the firmware lacks the register.
+_OPTIONAL_RANGE_RETRY_SECONDS = 300
+
+# Optional holding-register blocks (VPP 30000+) use the same retry window, but are only
+# skipped after several *consecutive* failures — one transient error must never take a
+# control block out of service.
+_OPTIONAL_HOLDING_RETRY_SECONDS = _OPTIONAL_RANGE_RETRY_SECONDS
+_OPTIONAL_HOLDING_FAIL_THRESHOLD = 3
+
 
 # =============================================================================
 # Custom Exceptions for better error reporting
@@ -299,6 +316,7 @@ class GrowattData:
     vpp_export_limit_power_rate: int = 0      # -100 to +100% (positive=export, 0=zero export)
     vpp_export_limit_available: bool = False  # True if inverter actually responded to registers 30200-30201
     vpp_control_authority_available: bool = False  # True if inverter actually responded to register 30100
+    vpp_remote_power_available: bool = False  # True if inverter actually responded to registers 30407-30410
 
     # MOD TL3-XH TOU periods (FC04 holding registers 3038-3045, raw packed values)
     # Start reg: bit15=enable, bit13-14=priority(0=Load,1=Batt,2=Grid), bit8-12=hour, bit0-7=min
@@ -420,6 +438,10 @@ class SharedModbusConnection:
         self._lock = threading.Lock()
         self._refcount = 0
         self._connected = False
+        # Incremented every time a *new* socket is established. Consumers use it to
+        # drop state that was derived from the previous session (see
+        # GrowattModbus._sync_optional_blacklists_with_connection).
+        self.connection_generation = 0
 
     # ------------------------------------------------------------------
     # Reference counting
@@ -457,6 +479,7 @@ class SharedModbusConnection:
         result = self._client.connect()
         if result:
             self._connected = True
+            self.connection_generation += 1
             self._flush_receive_buffer()
         return result
 
@@ -666,11 +689,25 @@ class GrowattModbus:
         # Entries expire after _OPTIONAL_RANGE_RETRY_SECONDS and are retried.
         self._failed_optional_ranges: dict = {}
 
-        # Track VPP holding register addresses that failed once this session.
-        # These are optional VPP-range registers (30000+) that some firmware variants
-        # don't implement.  After the first failure we skip them rather than retrying
-        # every poll and accumulating transaction-ID mismatches.
-        self._failed_optional_holding_addrs: set = set()
+        # Track failed optional VPP holding-register blocks (30000+ range) with
+        # timestamps, exactly like _failed_optional_ranges above.
+        # Format: dict mapping anchor_addr -> (last_fail_time, consecutive_fail_count)
+        # A block is skipped only after _OPTIONAL_HOLDING_FAIL_THRESHOLD consecutive
+        # failures, and even then only for _OPTIONAL_HOLDING_RETRY_SECONDS.  A single
+        # successful read clears the entry.
+        #
+        # This used to be a plain set that was never cleared: one transient Modbus
+        # error permanently blacklisted the block for the life of the process, so
+        # GrowattData kept reporting its dataclass defaults (remote_power_control_enable
+        # = 0 -> "Passthrough") while the inverter was actually running an override.
+        self._failed_optional_holding_addrs: dict = {}
+
+        # Generation of the shared TCP connection the blacklists above were built
+        # against. A reconnect invalidates them: whatever made the reads fail was
+        # very likely the connection itself.
+        self._optional_blacklist_conn_generation: int = (
+            getattr(shared_conn, 'connection_generation', 0) if shared_conn is not None else 0
+        )
 
         # Last successfully read battery SOC — used to hold value if VPP range is
         # temporarily unavailable rather than reporting a misleading 0%.
@@ -856,6 +893,83 @@ class GrowattModbus:
                     logger.error(f"[{self.register_map['name']}@{self.connection_id}] CRITICAL: File descriptor leak detected!")
                     raise
     
+    # ------------------------------------------------------------------
+    # Optional-register backoff bookkeeping
+    # ------------------------------------------------------------------
+
+    def clear_optional_blacklists(self, reason: str = "") -> None:
+        """Forget every optional range/holding-block backoff.
+
+        Called when the connection is (re-)established: a failed optional read is
+        evidence about the *link*, not about the firmware, so a fresh socket must
+        start from a clean slate.
+        """
+        if not self._failed_optional_ranges and not self._failed_optional_holding_addrs:
+            return
+        logger.info(
+            "[%s@%s] Clearing optional-register backoff (%d range(s), %d holding block(s))%s",
+            self.register_map['name'], self.connection_id,
+            len(self._failed_optional_ranges), len(self._failed_optional_holding_addrs),
+            f": {reason}" if reason else "",
+        )
+        self._failed_optional_ranges.clear()
+        self._failed_optional_holding_addrs.clear()
+
+    def _sync_optional_blacklists_with_connection(self) -> None:
+        """Drop the backoff state when the shared connection has been re-established.
+
+        The shared hub owns the socket and can reconnect underneath us (silent
+        connection loss recovery, see SharedModbusConnection.reset()). Its
+        connection_generation changes on every fresh connect, which is our signal
+        that the previous session's failures no longer say anything.
+
+        Only the shared path is handled here. The non-shared path reconnects on
+        *every* poll by design (_fetch_data disconnects before connecting), so
+        clearing there would disable the backoff entirely; that path relies on the
+        failure threshold and the retry window instead.
+        """
+        if self._shared_conn is None:
+            return
+        generation = getattr(self._shared_conn, 'connection_generation', 0)
+        if generation != self._optional_blacklist_conn_generation:
+            self._optional_blacklist_conn_generation = generation
+            self.clear_optional_blacklists("shared connection re-established")
+
+    def _optional_holding_blocked(self, anchor: int) -> bool:
+        """Whether an optional holding block should be skipped on this poll."""
+        entry = self._failed_optional_holding_addrs.get(anchor)
+        if not entry:
+            return False
+        last_fail, fail_count = entry
+        if fail_count < _OPTIONAL_HOLDING_FAIL_THRESHOLD:
+            # Not enough consecutive failures yet — a transient error must not
+            # take a control block out of service.
+            return False
+        if time.time() - last_fail >= _OPTIONAL_HOLDING_RETRY_SECONDS:
+            # Retry window expired. The entry is deliberately kept so the fail
+            # count keeps growing (and the WARNING stays suppressed) if the
+            # re-read fails again; a successful read clears it.
+            return False
+        return True
+
+    def _record_optional_holding_failure(self, anchor: int, label: str) -> None:
+        """Count a failed optional holding-block read and log the transition once."""
+        previous = self._failed_optional_holding_addrs.get(anchor)
+        fail_count = (previous[1] + 1) if previous else 1
+        self._failed_optional_holding_addrs[anchor] = (time.time(), fail_count)
+        if fail_count == _OPTIONAL_HOLDING_FAIL_THRESHOLD:
+            logger.warning(
+                "[VPP] %s failed %d consecutive polls — skipping for %ds. "
+                "Derived mode status and the matching controls report Unknown until it responds.",
+                label, fail_count, _OPTIONAL_HOLDING_RETRY_SECONDS,
+            )
+        else:
+            logger.debug("[VPP] %s read failed (attempt %d)", label, fail_count)
+
+    def _record_optional_holding_success(self, anchor: int) -> None:
+        """Clear the backoff for an optional holding block after a good read."""
+        self._failed_optional_holding_addrs.pop(anchor, None)
+
     def _track_read_success(self):
         """Track successful read and restore fast polling if we had backed off"""
         if self._consecutive_read_failures > 0:
@@ -1216,6 +1330,10 @@ class GrowattModbus:
 
     def read_all_data(self) -> Optional[GrowattData]:
         """Read all relevant data from inverter"""
+        # A reconnect invalidates the optional-register backoff built up on the
+        # previous socket (see _sync_optional_blacklists_with_connection).
+        self._sync_optional_blacklists_with_connection()
+
         data = GrowattData()
         
         # Determine register range based on map
@@ -1523,7 +1641,6 @@ class GrowattModbus:
                 )
 
                 # Check if this range recently failed — skip if within retry window
-                _OPTIONAL_RANGE_RETRY_SECONDS = 300
                 range_key = (min_addr_block, count_block)
                 if not is_wit_critical_range and range_key in self._failed_optional_ranges:
                     _fail_time, _fail_count = self._failed_optional_ranges[range_key]
@@ -3543,26 +3660,33 @@ class GrowattModbus:
 
         # --- VPP holding registers (30000+ range) ---
         # These are optional — some firmware variants don't implement them.
-        # On first failure the anchor address is added to _failed_optional_holding_addrs
-        # and the block is skipped for the rest of the session, avoiding repeated
-        # transaction-ID mismatches caused by unanswered requests.
+        # After _OPTIONAL_HOLDING_FAIL_THRESHOLD *consecutive* failures the anchor is
+        # backed off for _OPTIONAL_HOLDING_RETRY_SECONDS, avoiding repeated
+        # transaction-ID mismatches caused by unanswered requests. The backoff always
+        # expires, and any successful read clears it, so a transient Modbus error can
+        # no longer silence these control registers for the life of the process.
+        #
+        # Each block also sets a *_available flag. Consumers (coordinator mode status,
+        # select/number control entities) must use it instead of trusting the
+        # GrowattData defaults, which would otherwise read as a real "Disabled" state.
 
         # Control Authority (30100)
-        if 30100 in holding_map and 30100 not in self._failed_optional_holding_addrs:
+        if 30100 in holding_map and not self._optional_holding_blocked(30100):
             try:
                 vpp_ctrl_regs = self.read_holding_registers(30100, 1)
                 if vpp_ctrl_regs is not None and len(vpp_ctrl_regs) >= 1:
                     data.control_authority = int(vpp_ctrl_regs[0])
                     data.vpp_control_authority_available = True
+                    self._record_optional_holding_success(30100)
                     logger.debug("[VPP] control_authority=%s", data.control_authority)
                 else:
-                    self._failed_optional_holding_addrs.add(30100)
-                    logger.debug("[VPP] Register 30100 not supported by this firmware — skipping in future polls")
+                    self._record_optional_holding_failure(30100, "Register 30100 (control authority)")
             except Exception as e:
+                self._record_optional_holding_failure(30100, "Register 30100 (control authority)")
                 logger.debug(f"Could not read VPP control_authority register 30100: {e}")
 
         # VPP Export Limitation (30200-30201)
-        if any(reg in holding_map for reg in [30200, 30201]) and 30200 not in self._failed_optional_holding_addrs:
+        if any(reg in holding_map for reg in [30200, 30201]) and not self._optional_holding_blocked(30200):
             try:
                 vpp_export_regs = self.read_holding_registers(30200, 2)
                 if vpp_export_regs is not None and len(vpp_export_regs) >= 2:
@@ -3575,16 +3699,17 @@ class GrowattModbus:
                             raw_val = raw_val - 65536
                         data.vpp_export_limit_power_rate = int(raw_val)
                     data.vpp_export_limit_available = True
+                    self._record_optional_holding_success(30200)
                     logger.debug("[VPP] vpp_export_limit_enable=%s, vpp_export_limit_power_rate=%s%%",
                                data.vpp_export_limit_enable, data.vpp_export_limit_power_rate)
                 else:
-                    self._failed_optional_holding_addrs.add(30200)
-                    logger.debug("[VPP] Registers 30200-30201 not supported by this firmware — skipping in future polls")
+                    self._record_optional_holding_failure(30200, "Registers 30200-30201 (export limit)")
             except Exception as e:
+                self._record_optional_holding_failure(30200, "Registers 30200-30201 (export limit)")
                 logger.debug(f"Could not read VPP export limitation registers 30200-30201: {e}")
 
         # Remote Power Control (30407-30410)
-        if any(reg in holding_map for reg in [30407, 30408, 30409, 30410]) and 30407 not in self._failed_optional_holding_addrs:
+        if any(reg in holding_map for reg in [30407, 30408, 30409, 30410]) and not self._optional_holding_blocked(30407):
             try:
                 vpp_power_regs = self.read_holding_registers(30407, 4)
                 if vpp_power_regs is not None and len(vpp_power_regs) >= 3:
@@ -3600,13 +3725,15 @@ class GrowattModbus:
                         data.remote_charge_and_discharge_power = int(raw_val)
                     if 30410 in holding_map and len(vpp_power_regs) >= 4:
                         data.vpp_ac_charge_enable = int(vpp_power_regs[3])
+                    data.vpp_remote_power_available = True
+                    self._record_optional_holding_success(30407)
                     logger.debug("[VPP] remote_power_control_enable=%s, charging_time=%s min, charge_discharge_power=%s%%, ac_charge_enable=%s",
                                data.remote_power_control_enable, data.remote_power_control_charging_time,
                                data.remote_charge_and_discharge_power, data.vpp_ac_charge_enable)
                 else:
-                    self._failed_optional_holding_addrs.add(30407)
-                    logger.debug("[VPP] Registers 30407-30410 not supported by this firmware — skipping in future polls")
+                    self._record_optional_holding_failure(30407, "Registers 30407-30410 (remote power control)")
             except Exception as e:
+                self._record_optional_holding_failure(30407, "Registers 30407-30410 (remote power control)")
                 logger.debug(f"Could not read VPP remote power control registers 30407-30410: {e}")
 
         # VPP AC Charge Mode (30410)

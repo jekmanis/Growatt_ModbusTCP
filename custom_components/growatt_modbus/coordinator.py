@@ -523,12 +523,39 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         return raw_value
 
     def _compute_wit_mode_status(self, data) -> None:
-        """Compute effective WIT mode from control register states."""
+        """Compute effective WIT mode from control register states.
+
+        The VPP holding blocks behind these fields are optional reads that can be
+        skipped for a poll (transient Modbus error, backoff window). GrowattData is
+        recreated per poll, so a skipped block leaves the dataclass *defaults*
+        (remote_power_control_enable = 0), which are indistinguishable from a real
+        "no override active" reading — that is how sensor.growatt_inverter_mode sat
+        on "Passthrough" for 30 h while the inverter was running a discharge
+        override. Never derive a mode from a block that was not read; report
+        "Unknown" instead.
+        """
+        remote_available = getattr(data, 'vpp_remote_power_available', False)
+        export_available = getattr(data, 'vpp_export_limit_available', False)
+
         remote_enable = getattr(data, 'remote_power_control_enable', 0)
         power_raw = getattr(data, 'remote_charge_and_discharge_power', 0)
         export_enable = getattr(data, 'vpp_export_limit_enable', 0)
         export_rate = getattr(data, 'vpp_export_limit_power_rate', 0)
         ac_charge = getattr(data, 'vpp_ac_charge_enable', 0)
+
+        if not remote_available:
+            # Registers 30407-30410 were not read this poll — nothing can be said
+            # about the override state.
+            data.wit_mode_status = "Unknown"
+            data.wit_mode_power_percent = 0
+            data.wit_mode_export_rate = -1
+            data.wit_mode_ac_charge = 0
+            data.wit_mode_override_active = False
+            _LOGGER.debug(
+                "WIT mode status unknown: remote power control block (30407-30410) "
+                "was not read this poll"
+            )
+            return
 
         # Decode signed power (two's complement)
         if power_raw > 32767:
@@ -539,8 +566,10 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         data.wit_mode_override_active = bool(remote_enable)
         data.wit_mode_ac_charge = ac_charge
 
-        # Determine export rate
-        if export_enable:
+        # Determine export rate (-1 = unknown, block not read this poll)
+        if not export_available:
+            data.wit_mode_export_rate = -1
+        elif export_enable:
             data.wit_mode_export_rate = export_rate
         else:
             data.wit_mode_export_rate = 100  # No limiter = full export
@@ -557,6 +586,13 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             data.wit_mode_status = "Preserve SOC"
             data.wit_mode_power_percent = 0
         elif power_signed < 0:
+            if not export_available:
+                # Discharging, but registers 30200-30201 were not read this poll —
+                # "to grid" vs "to load" is decided by the export limiter alone, so
+                # naming the mode here would be a guess.
+                data.wit_mode_status = "Unknown"
+                data.wit_mode_power_percent = abs(power_signed)
+                return
             export_allowed = (not export_enable) or (export_rate > 0)
             if export_allowed and abs(power_signed) == 100:
                 data.wit_mode_status = "Max Export"

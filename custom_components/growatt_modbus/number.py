@@ -15,6 +15,7 @@ from .const import (
     WRITABLE_REGISTERS,
     CONF_REGISTER_MAP,
     get_device_type_for_control,
+    VPP_CONTROL_AVAILABILITY_FLAG,
 )
 from .coordinator import GrowattModbusCoordinator
 from .growatt_modbus import ModbusWriteError
@@ -230,10 +231,34 @@ class GrowattGenericNumber(CoordinatorEntity, NumberEntity):
         return self.coordinator.get_device_info(device_type)
 
     @property
+    def available(self) -> bool:
+        """Unavailable while the backing VPP block was not read this poll.
+
+        Registers 30100 / 30200-30201 / 30407-30410 are optional best-effort reads.
+        When a block is missed, GrowattData carries its dataclass default (0), which
+        would otherwise be published as a real "Disabled"/0 setting. Reporting
+        unavailable keeps a stale-but-honest state in HA instead. Controls not backed
+        by such a block are unaffected.
+        """
+        if not super().available:
+            return False
+        flag = VPP_CONTROL_AVAILABILITY_FLAG.get(self._control_name)
+        if flag is None:
+            return True
+        data = self.coordinator.data
+        return bool(data is not None and getattr(data, flag, False))
+
+    @property
     def native_value(self) -> float | None:
         """Return the current value."""
         data = self.coordinator.data
         if data is None:
+            return None
+
+        # A block that was not read this poll carries dataclass defaults — report
+        # unknown rather than a fabricated value (see available()).
+        flag = VPP_CONTROL_AVAILABILITY_FLAG.get(self._control_name)
+        if flag is not None and not getattr(data, flag, False):
             return None
 
         raw_value = getattr(data, self._control_name, None)
