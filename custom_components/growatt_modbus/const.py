@@ -279,6 +279,7 @@ WRITABLE_REGISTERS = {
     },
     'vpp_export_limit_enable': {
         'register': 30200,
+        'label': 'VPP Export Limit Enable',
         'scale': 1,
         'valid_range': (0, 1),
         'options': {
@@ -322,6 +323,7 @@ WRITABLE_REGISTERS = {
     },
     'vpp_ac_charge_enable': {
         'register': 30410,
+        'label': 'VPP AC Charge Enable',
         'scale': 1,
         'valid_range': (0, 2),
         'options': {
@@ -374,6 +376,7 @@ WRITABLE_REGISTERS = {
     },
     'ac_input_mode': {
         'register': 8,
+        'label': 'AC Input Mode',
         'scale': 1,
         'valid_range': (0, 2),
         'options': {
@@ -458,6 +461,7 @@ WRITABLE_REGISTERS = {
     },
     'ac_charge_current': {
         'register': 38,
+        'label': 'AC Charge Current',
         'scale': 1,
         'valid_range': (0, 80),
         'unit': 'A',
@@ -473,6 +477,7 @@ WRITABLE_REGISTERS = {
     # Battery-type-dependent registers (special handling required)
     'bat_low_to_uti': {
         'register': 37,
+        'label': 'Battery to Utility Voltage',
         'scale': 0.1,
         'valid_range': (0, 1000),  # Full range: Lithium 0-100%, Non-Lithium 20.0-64.0V
         'unit': 'V/%',  # Unit depends on battery_type
@@ -481,6 +486,7 @@ WRITABLE_REGISTERS = {
     },
     'ac_to_bat_volt': {
         'register': 95,
+        'label': 'Utility to Battery Voltage',
         'scale': 0.1,
         'valid_range': (0, 1000),  # Full range: Lithium 0-100%, Non-Lithium 20.0-64.0V
         'unit': 'V/%',  # Unit depends on battery_type
@@ -492,6 +498,7 @@ WRITABLE_REGISTERS = {
     # These registers are SPE-only (only_profiles guard prevents cross-profile contamination).
     'spe_grid_export_enable': {
         'register': 115,
+        'label': 'SPE Grid Export Enable',
         'only_profiles': ['SPE_8000_12000_ES'],
         'scale': 1,
         'valid_range': (0, 1),
@@ -500,6 +507,7 @@ WRITABLE_REGISTERS = {
     },
     'spe_battery_export_enable': {
         'register': 118,
+        'label': 'SPE Battery Export Enable',
         'only_profiles': ['SPE_8000_12000_ES'],
         'scale': 1,
         'valid_range': (0, 1),
@@ -508,6 +516,7 @@ WRITABLE_REGISTERS = {
     },
     'spe_export_limit_power': {
         'register': 119,
+        'label': 'SPE Export Limit Power',
         'only_profiles': ['SPE_8000_12000_ES'],
         'scale': 0.1,
         'valid_range': (0, 120),
@@ -516,6 +525,7 @@ WRITABLE_REGISTERS = {
     },
     'spe_output_priority': {
         'register': 116,
+        'label': 'SPE Output Priority',
         'only_profiles': ['SPE_8000_12000_ES'],
         'scale': 1,
         'valid_range': (0, 2),
@@ -524,6 +534,7 @@ WRITABLE_REGISTERS = {
     },
     'spe_feed_range': {
         'register': 117,
+        'label': 'SPE Feed Range',
         'only_profiles': ['SPE_8000_12000_ES'],
         'scale': 1,
         'options': {0: 'Asia', 1: 'Europe', 2: 'South America', 3: 'South Africa', 7: 'South Africa (Alt)'},
@@ -531,6 +542,7 @@ WRITABLE_REGISTERS = {
     },
     'spe_battery_export_max_current': {
         'register': 120,
+        'label': 'SPE Battery Export Max Current',
         'only_profiles': ['SPE_8000_12000_ES'],
         'scale': 1,
         'valid_range': (0, 280),
@@ -539,6 +551,7 @@ WRITABLE_REGISTERS = {
     },
     'spe_bat_feed_vloss': {
         'register': 121,
+        'label': 'SPE Battery Feed Cutoff Voltage',
         'only_profiles': ['SPE_8000_12000_ES'],
         'scale': 0.1,
         'valid_range': (420, 540),
@@ -547,6 +560,7 @@ WRITABLE_REGISTERS = {
     },
     'spe_bat_feed_vback': {
         'register': 122,
+        'label': 'SPE Battery Feed Resume Voltage',
         'only_profiles': ['SPE_8000_12000_ES'],
         'scale': 0.1,
         'valid_range': (440, 560),
@@ -558,6 +572,7 @@ WRITABLE_REGISTERS = {
     # Protocol V0.26 valid range is 5-90, not 0-100.
     'spe_export_min_soc': {
         'register': 123,
+        'label': 'SPE Export Min SOC',
         'only_profiles': ['SPE_8000_12000_ES'],
         'scale': 1,
         'valid_range': (5, 90),
@@ -567,6 +582,7 @@ WRITABLE_REGISTERS = {
     # Protocol V0.26 valid range is 15-100.
     'spe_export_back_soc': {
         'register': 124,
+        'label': 'SPE Export Back SOC',
         'only_profiles': ['SPE_8000_12000_ES'],
         'scale': 1,
         'valid_range': (15, 100),
@@ -583,6 +599,7 @@ WRITABLE_REGISTERS = {
     },
     'discharge_stopped_soc': {
         'register': 1071,
+        'label': 'Discharge Stopped SOC',
         'scale': 1,
         'valid_range': (0, 100),
         'unit': '%',
@@ -600,6 +617,7 @@ WRITABLE_REGISTERS = {
     },
     'charge_power_rate': {
         'register': 1090,
+        'label': 'AC Charge Power Rate',
         'scale': 1,
         'valid_range': (0, 100),
         'unit': '%',
@@ -607,6 +625,7 @@ WRITABLE_REGISTERS = {
     },
     'charge_stopped_soc': {
         'register': 1091,
+        'label': 'AC Charge Stop SOC',
         'scale': 1,
         'valid_range': (0, 100),
         'unit': '%',
@@ -614,6 +633,7 @@ WRITABLE_REGISTERS = {
     },
     'ac_charge_enable': {
         'register': 1092,
+        'label': 'AC Charge Enable',
         'scale': 1,
         'valid_range': (0, 1),
         'options': {
