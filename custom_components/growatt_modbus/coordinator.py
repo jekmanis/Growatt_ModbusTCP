@@ -36,9 +36,37 @@ from .const import (
 
 from .const import REGISTER_MAPS
 
-from .growatt_modbus import GrowattModbus, GrowattData, SharedModbusConnection
+from .growatt_modbus import (
+    GrowattModbus,
+    GrowattData,
+    SharedModbusConnection,
+    optional_read_limits,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+# Device identification (serial / firmware / inverter type / protocol / clock) is a
+# ONE-SHOT.  It used to be gated on ``not self._serial_number``, which is not a
+# "have we tried?" flag but a "did it work?" flag: on a WIT the serial register never
+# answers, so the gate never closed and all five reads were repeated on every single
+# poll for the life of the process.  Once the socket was healthy that cost ~40s per
+# unanswered register — a 205s poll (2026-09-02 10:29:48 / 10:33:13) during which the
+# shared bus lock was held and every set_wit_mode write timed out.
+#
+# The reads are therefore attempted a bounded number of times and each individual read
+# that comes back unanswered is remembered and never repeated this session.
+_IDENTIFICATION_MAX_ATTEMPTS = 3
+_IDENTIFICATION_RETRY_SECONDS = 300
+
+
+class _IdentificationDeferred(Exception):
+    """The shared bus was busy, so this identification read never reached the inverter.
+
+    Raised rather than returned so the whole pass aborts at the first contended read:
+    continuing would queue up to five more SHARED_LOCK_TIMEOUT (60s) waits behind a poll
+    that is already running.
+    """
+
 
 def test_connection(config: dict) -> dict:
     """Test the connection to the Growatt inverter (TCP or Serial)."""
@@ -115,6 +143,17 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         self._inverter_type = None
         self._model_name = None
         self._protocol_version = None  # VPP Protocol version (from register 30099)
+
+        # One-shot device identification bookkeeping (see the module docstring above
+        # _IDENTIFICATION_MAX_ATTEMPTS).  _identification_failed_reads caches the reads
+        # the inverter did not answer so they are never paid for twice, and
+        # _identification_complete stops the whole pass for good.
+        self._identification_complete = False
+        self._identification_attempts = 0
+        self._identification_next_attempt = 0.0  # time.monotonic() deadline
+        self._identification_failed_reads: set[str] = set()
+        self._identification_pending = False
+        self._identification_deferred = False
 
         # Handle register map key (might be dict or string due to old bug)
         raw_register_map = entry.data.get(CONF_REGISTER_MAP, 'MIN_7000_10000TL_X')
@@ -968,6 +1007,12 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 if hasattr(self, 'wit_mode_preset_last'):
                     self.wit_mode_preset_last = None
 
+            # Run the one-shot identification off the poll path so a slow or unanswered
+            # read can never inflate the poll duration or block the next scheduled fetch.
+            if self._identification_pending:
+                self._identification_pending = False
+                self.hass.async_add_executor_job(self._run_identification)
+
             return data
 
         except Exception as err:
@@ -1068,8 +1113,13 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                         # starts from a clean connect instead of a stale session.
                         hub.reset("retry poll returned no data")
 
-            if data is not None and not self._serial_number:
-                self._read_device_identification()
+            # Device identification deliberately does NOT run here.  It reads registers
+            # this inverter may never answer, and doing that inside the poll — with the
+            # shared bus lock held for the whole fetch — is what turned a 5s poll into a
+            # 205s one and starved set_wit_mode of the lock.  Flag it instead; the event
+            # loop dispatches it as its own executor job (see _async_update_data).
+            if data is not None and self._identification_due():
+                self._identification_pending = True
 
             time.sleep(inter_slave_delay)
             return data
@@ -1130,8 +1180,10 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                     # Previously called during async_config_entry_first_refresh, but that
                     # blocked the HA bootstrap executor and triggered a CancelledError on
                     # slow/offline inverters. Called here while the connection is still open.
-                    if not self._serial_number:
-                        self._read_device_identification()
+                    # Legacy (non-shared) path: no shared bus lock to starve, and the
+                    # client is disconnected right after this block, so identification
+                    # still runs inline here — but now bounded to one pass.
+                    self._run_identification()
                     self._client.disconnect()
                     return data
 
@@ -1182,8 +1234,9 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         empty GrowattData placeholder, and let the regular poll schedule handle the
         first real inverter read. All sensors show unavailable until then.
 
-        Device identification (serial, firmware, model) is read lazily on the first
-        successful poll inside _fetch_data when _serial_number is still empty.
+        Device identification (serial, firmware, model) is a one-shot dispatched
+        after the first successful poll (_run_identification), never inside the poll
+        itself - see _IDENTIFICATION_MAX_ATTEMPTS.
         """
         # Restore persisted energy totals (local storage only — never blocks on network)
         await self._async_load_energy_totals()
@@ -1236,108 +1289,211 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         except Exception as err:
             _LOGGER.debug("Failed to save energy totals: %s", err)
 
+    # ------------------------------------------------------------------
+    # Device identification (one-shot, off the poll path)
+    # ------------------------------------------------------------------
+
+    def _identification_due(self) -> bool:
+        """Whether an identification pass should still be attempted."""
+        if self._identification_complete:
+            return False
+        if self._identification_attempts >= _IDENTIFICATION_MAX_ATTEMPTS:
+            self._identification_complete = True
+            _LOGGER.debug(
+                "Device identification giving up after %d attempts - the inverter does "
+                "not answer these registers",
+                self._identification_attempts,
+            )
+            return False
+        return time.monotonic() >= self._identification_next_attempt
+
+    def _run_identification(self) -> None:
+        """Execute one identification pass (executor thread, outside the poll)."""
+        if not self._identification_due():
+            return
+        self._identification_attempts += 1
+        self._identification_next_attempt = time.monotonic() + _IDENTIFICATION_RETRY_SECONDS
+        self._identification_deferred = False
+        started = time.monotonic()
+        try:
+            self._read_device_identification()
+        except Exception as err:  # never let a background job raise into the loop
+            _LOGGER.debug("Device identification pass failed: %s", err)
+        finally:
+            if not self._identification_deferred:
+                # Every read either answered or is now cached as unanswered - there is
+                # nothing left for a second pass to discover.
+                self._identification_complete = True
+            _LOGGER.debug(
+                "Device identification pass %d/%d finished in %.1fs "
+                "(complete=%s, unanswered reads=%s)",
+                self._identification_attempts, _IDENTIFICATION_MAX_ATTEMPTS,
+                time.monotonic() - started, self._identification_complete,
+                sorted(self._identification_failed_reads) or "none",
+            )
+
+    def _identification_modbus_read(self, address: int, count: int):
+        """Read holding registers for identification, cheaply and on the right socket.
+
+        Two things matter here:
+
+        * When a shared hub is in use the reads MUST go through it.  ``self._client.client``
+          is a private ModbusTcpClient that ``GrowattModbus`` creates but never connects
+          in shared mode, so using it opened a *second* TCP session to the RS485 gateway
+          that the gateway does not service - every request on it timed out while the
+          hub's own socket was reading the very same register range successfully.
+        * Optional reads get a short timeout and no retries, so an unanswered register
+          costs a couple of seconds instead of ~40.
+
+        The hub lock is taken per read, not for the whole pass, so a queued set_wit_mode
+        write only ever waits for one read.
+        """
+        client = self._client
+        if client is None:
+            return None
+
+        hub = self._hub
+        if hub is not None:
+            if not hub._lock.acquire(timeout=SHARED_LOCK_TIMEOUT):
+                _LOGGER.debug(
+                    "Identification read of holding %d skipped - shared bus busy", address
+                )
+                raise _IdentificationDeferred(address)
+            try:
+                if not hub.ensure_connected():
+                    raise _IdentificationDeferred(address)
+                with hub.optional_read_limits():
+                    return hub.read_holding_registers(address, count, self._slave_id)
+            finally:
+                hub._lock.release()
+
+        raw = getattr(client, "client", None)
+        if raw is None:
+            return None
+        with optional_read_limits(raw):
+            try:
+                try:
+                    response = raw.read_holding_registers(
+                        address=address, count=count, device_id=self._slave_id
+                    )
+                except TypeError:
+                    try:
+                        response = raw.read_holding_registers(
+                            address=address, count=count, slave=self._slave_id
+                        )
+                    except TypeError:
+                        response = raw.read_holding_registers(address=address, count=count)
+            except Exception as err:
+                _LOGGER.debug("Identification read of holding %d failed: %s", address, err)
+                return None
+        if response is None:
+            return None
+        if hasattr(response, "isError") and callable(response.isError) and response.isError():
+            _LOGGER.debug("Identification read of holding %d returned %r", address, response)
+            return None
+        registers = getattr(response, "registers", None)
+        return list(registers) if registers else None
+
+    def _read_identification_registers(self, label: str, address: int, count: int):
+        """One identification read, with the per-register failure cache applied.
+
+        A register the inverter ignored once will ignore us again, and each repeat costs
+        a full timeout.  Caching the failure for the session is the whole point: it is
+        the difference between a 5s poll and a 205s one.
+        """
+        if label in self._identification_failed_reads:
+            return None
+        # A _IdentificationDeferred here propagates: the read never reached the inverter,
+        # so it must not be cached as unanswered.
+        registers = self._identification_modbus_read(address, count)
+        if registers is None:
+            # Genuinely unanswered (as opposed to "the bus was busy") - never repeat it.
+            self._identification_failed_reads.add(label)
+            _LOGGER.debug(
+                "Identification read '%s' (holding %d, %d regs) unanswered - "
+                "not retried this session",
+                label, address, count,
+            )
+        return registers
+
     def _read_device_identification(self):
-        """Read device identification info (serial, firmware, inverter type)."""
+        """Read device identification info (serial, firmware, inverter type).
+
+        Called only from _run_identification(), which bounds how often this happens.
+        Every read goes through _read_identification_registers so an unanswered register
+        is paid for once, not once per poll.
+        """
         try:
             if not self._client:
                 _LOGGER.warning("Cannot read device ID - client not initialized")
-                return
-            
+                raise _IdentificationDeferred("no client")
+
             profile_key = self._register_map_key
             profile = REGISTER_MAPS.get(profile_key, {})
-            
+
             # Determine which serial number registers to use
             # TL-X and TL-XH models use 3000-3015, others use 23-27
             is_tl_x_model = 'tl_x' in profile_key or 'tl_xh' in profile_key
-            
-            # Read serial number
-            try:
-                if is_tl_x_model:
-                    # TL-X/TL-XH: registers 3000-3015 (30 characters)
-                    result = self._client.client.read_holding_registers(address=3000, count=15, device_id=self._slave_id)
-                else:
-                    # Standard: registers 23-27 (10 characters)
-                    result = self._client.client.read_holding_registers(address=23, count=5, device_id=self._slave_id)
-                
-                if not result.isError():
-                    self._serial_number = self._registers_to_ascii(result.registers)
-                    _LOGGER.debug(f"Read serial number: {self._serial_number}")
-            except Exception as e:
-                _LOGGER.debug(f"Could not read serial number: {e}")
-            
-            # Read firmware version (registers 9-11)
-            try:
-                result = self._client.client.read_holding_registers(address=9, count=3, device_id=self._slave_id)
-                if not result.isError():
-                    self._firmware_version = self._registers_to_ascii(result.registers)
-                    _LOGGER.debug(f"Read firmware version: {self._firmware_version}")
-            except Exception as e:
-                _LOGGER.debug(f"Could not read firmware version: {e}")
-            
-            # Read inverter type (registers 125-132)
-            try:
-                result = self._client.client.read_holding_registers(address=125, count=8, device_id=self._slave_id)
-                if not result.isError():
-                    self._inverter_type = self._registers_to_ascii(result.registers)
-                    _LOGGER.debug(f"Read inverter type: {self._inverter_type}")
 
-                    # Parse model name from inverter type
-                    self._model_name = self._parse_model_name(self._inverter_type, profile)
-            except Exception as e:
-                _LOGGER.debug(f"Could not read inverter type: {e}")
+            # Read serial number
+            if is_tl_x_model:
+                registers = self._read_identification_registers("serial", 3000, 15)
+            else:
+                registers = self._read_identification_registers("serial", 23, 5)
+            if registers:
+                self._serial_number = self._registers_to_ascii(registers)
+                _LOGGER.debug("Read serial number: %s", self._serial_number)
+
+            # Read firmware version (registers 9-11)
+            registers = self._read_identification_registers("firmware", 9, 3)
+            if registers:
+                self._firmware_version = self._registers_to_ascii(registers)
+                _LOGGER.debug("Read firmware version: %s", self._firmware_version)
+
+            # Read inverter type (registers 125-132)
+            registers = self._read_identification_registers("inverter_type", 125, 8)
+            if registers:
+                self._inverter_type = self._registers_to_ascii(registers)
+                _LOGGER.debug("Read inverter type: %s", self._inverter_type)
+                # Parse model name from inverter type
+                self._model_name = self._parse_model_name(self._inverter_type, profile)
+            elif not self._model_name:
                 # Fallback to profile name
                 self._model_name = profile.get("name", "Unknown Model")
 
-            # Read Protocol version (register 30099 for VPP, 73 for offgrid)
-            # If readable, shows actual protocol version (e.g., 2.01, 2.02, etc.)
+            # Read Protocol version (register 30099 for VPP, 73 for offgrid).
+            # If readable, shows actual protocol version (e.g. 2.01, 2.02).
             if not profile.get("offgrid_protocol", False):
-                try:
-                    result = self._client.client.read_holding_registers(address=30099, count=1, device_id=self._slave_id)
-                    if not result.isError() and len(result.registers) > 0:
-                        version_value = result.registers[0]
-                        if version_value > 0:
-                            # Format as version string (e.g., 201 -> "Protocol 2.01", 202 -> "Protocol 2.02")
-                            major = version_value // 100
-                            minor = version_value % 100
-                            self._protocol_version = f"Protocol {major}.{minor:02d}"
-                            _LOGGER.info(f"Detected protocol version: {self._protocol_version} (register 30099 = {version_value})")
-                        else:
-                            self._protocol_version = "Protocol Legacy"
-                            _LOGGER.info("Protocol version register returned 0, using Protocol Legacy")
-                    else:
-                        # Register not available - likely legacy protocol
-                        self._protocol_version = "Protocol Legacy"
-                        _LOGGER.debug("Could not read register 30099, assuming Protocol Legacy")
-                except Exception as e:
-                    _LOGGER.debug(f"Could not read protocol version (30099): {e}")
-                    self._protocol_version = "Protocol Legacy"
+                registers = self._read_identification_registers("protocol_version", 30099, 1)
+                legacy_label = "Protocol Legacy"
+                version_prefix = "Protocol"
             else:
-                # OffGrid profile selected
-                try:
-                    result = self._client.client.read_holding_registers(address=73, count=1, device_id=self._slave_id)
-                    if not result.isError() and len(result.registers) > 0:
-                        version_value = result.registers[0]
-                        if version_value > 0:
-                            # Format as version string (e.g., 201 -> "Protocol 2.01", 202 -> "Protocol 2.02")
-                            major = version_value // 100
-                            minor = version_value % 100
-                            self._protocol_version = f"Modbus {major}.{minor:02d}"
-                            _LOGGER.info(f"Detected protocol version: {self._protocol_version} (register 73 = {version_value})")
-                        else:
-                            self._protocol_version = "OffGrid Modbus"
-                            _LOGGER.info("Protocol version register returned 0, using OffGrid Modbus")
-                    else:
-                        # Register not available - likely legacy protocol
-                        self._protocol_version = "OffGrid Modbus"
-                        _LOGGER.debug("Could not read register 73, assuming OffGrid Modbus")
-                except Exception as e:
-                    _LOGGER.debug(f"Could not read protocol version (73): {e}")
-                    self._protocol_version = "OffGrid Modbus"
+                registers = self._read_identification_registers("protocol_version", 73, 1)
+                legacy_label = "OffGrid Modbus"
+                version_prefix = "Modbus"
 
-            # Consolidated identification summary — replaces scattered debug lines
+            if registers:
+                version_value = registers[0]
+                if version_value > 0:
+                    # Format as version string (e.g. 201 -> "Protocol 2.01")
+                    major = version_value // 100
+                    minor = version_value % 100
+                    self._protocol_version = f"{version_prefix} {major}.{minor:02d}"
+                    _LOGGER.info(
+                        "Detected protocol version: %s (register value %s)",
+                        self._protocol_version, version_value,
+                    )
+                else:
+                    self._protocol_version = legacy_label
+                    _LOGGER.info("Protocol version register returned 0, using %s", legacy_label)
+            else:
+                # Register not available - likely legacy protocol
+                self._protocol_version = legacy_label
+
+            # Consolidated identification summary - replaces scattered debug lines
             # with one INFO-level line visible in the default HA log.
             _LOGGER.info(
-                "Inverter identified — model: %s | serial: %s | firmware: %s | %s",
+                "Inverter identified - model: %s | serial: %s | firmware: %s | %s",
                 self._model_name or "unknown",
                 self._serial_number or "unknown",
                 self._firmware_version or "unknown",
@@ -1347,8 +1503,13 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             # Check inverter clock drift (stores notification if drift > threshold)
             self._check_inverter_clock(profile)
 
+        except _IdentificationDeferred:
+            # Nothing was learned and nothing was cached - leave the pass incomplete so
+            # a later poll can try again.
+            self._identification_deferred = True
+            _LOGGER.debug("Device identification deferred - shared bus busy")
         except Exception as e:
-            _LOGGER.error(f"Error reading device identification: {e}")
+            _LOGGER.error("Error reading device identification: %s", e)
 
     def _check_inverter_clock(self, profile: dict) -> None:
         """Read inverter system time registers and compare to HA clock.
@@ -1358,12 +1519,12 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         deliver a persistent HA notification on the event loop.
 
         Runs in the executor thread (called from _read_device_identification).
-        Notification delivery MUST happen back on the event loop — do not call
+        Notification delivery MUST happen back on the event loop - do not call
         hass.services.async_call() directly from here.
 
         Register layout:
-          VPP 2.01  — holding 30104–30109  [Year(2-digit), Month, Day, Hour, Min, Sec]
-          V1.39/SPF — holding 45–50        [Year(2-digit), Month, Day, Hour, Min, Sec]
+          VPP 2.01  - holding 30104-30109  [Year(2-digit), Month, Day, Hour, Min, Sec]
+          V1.39/SPF - holding 45-50        [Year(2-digit), Month, Day, Hour, Min, Sec]
         """
         _CLOCK_DRIFT_THRESHOLD_S = 300  # 5 minutes
 
@@ -1375,22 +1536,17 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
 
         try:
             if is_vpp:
-                result = self._client.client.read_holding_registers(
-                    address=30104, count=6, device_id=self._slave_id
-                )
+                raw = self._read_identification_registers("clock", 30104, 6)
             else:
-                result = self._client.client.read_holding_registers(
-                    address=45, count=6, device_id=self._slave_id
-                )
+                raw = self._read_identification_registers("clock", 45, 6)
 
-            if result.isError() or len(result.registers) < 6:
+            if not raw or len(raw) < 6:
                 _LOGGER.debug(
                     "Inverter clock registers not readable (protocol: %s)",
                     self._protocol_version,
                 )
                 return
 
-            raw = result.registers  # [Year, Month, Day, Hour, Minute, Second]
             year = raw[0] + 2000 if raw[0] < 100 else raw[0]
             month, day, hour, minute, second = raw[1], raw[2], raw[3], raw[4], raw[5]
 
@@ -1431,6 +1587,8 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                     "notification_id": "growatt_clock_drift",
                 }
 
+        except _IdentificationDeferred:
+            raise
         except Exception as err:
             _LOGGER.debug("Could not check inverter clock: %s", err)
 

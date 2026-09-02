@@ -371,3 +371,163 @@ def test_control_entities_consult_the_availability_map():
         # Both the availability property and the value property must gate on it.
         assert src.count("VPP_CONTROL_AVAILABILITY_FLAG.get(self._control_name)") == 2, filename
         assert "def available(self) -> bool:" in src, filename
+
+
+# ---------------------------------------------------------------------------
+# Why a read failed decides whether a reconnect re-arms it
+# ---------------------------------------------------------------------------
+
+
+class KindedHoldingReads(FakeHoldingReads):
+    """FakeHoldingReads that also reports *why* a read failed, like the real method."""
+
+    def __init__(self, fail=(), values=None, kind=None, client=None):
+        super().__init__(fail=fail, values=values)
+        self.kind = kind
+        self.client = client
+
+    def __call__(self, start_address, count):
+        result = super().__call__(start_address, count)
+        if self.client is not None:
+            self.client._last_read_error_kind = self.kind if result is None else None
+        return result
+
+
+def _fail_block_until_blocked(growatt_modbus, client, anchor, kind):
+    """Fail ``anchor`` enough consecutive polls that the backoff engages."""
+    for _ in range(growatt_modbus._OPTIONAL_HOLDING_FAIL_THRESHOLD):
+        reads = KindedHoldingReads(fail={anchor}, kind=kind, client=client)
+        _read_device_info(growatt_modbus, client, reads)
+    assert client._optional_holding_blocked(anchor) is True
+
+
+def _shared_client(growatt_modbus, hub):
+    return growatt_modbus.GrowattModbus(
+        connection_type="tcp", host="10.0.0.1", port=502,
+        register_map=WIT_MAP, shared_conn=hub,
+    )
+
+
+def test_no_response_backoff_survives_a_reconnect(growatt_modbus):
+    """A register the inverter ignores must stay backed off across reconnects.
+
+    This is the loop that made a poll cost a full timeout per unanswered register over
+    and over: a timed-out read closes the pymodbus socket ("...CLOSING CONNECTION"), the
+    next poll reconnects, the reconnect cleared the backoff, and the expensive read was
+    armed again for the very next poll.
+    """
+    hub = FakeHub()
+    client = _shared_client(growatt_modbus, hub)
+    _fail_block_until_blocked(
+        growatt_modbus, client, 30407, growatt_modbus.ERROR_KIND_NO_RESPONSE
+    )
+
+    hub.reconnect()
+    client._sync_optional_blacklists_with_connection()
+
+    assert client._optional_holding_blocked(30407) is True
+    # And the very next poll issues no read for it.
+    reads = KindedHoldingReads(fail={30407}, kind=growatt_modbus.ERROR_KIND_NO_RESPONSE,
+                               client=client)
+    _read_device_info(growatt_modbus, client, reads)
+    assert 30407 not in reads.starts()
+
+
+def test_link_failure_backoff_is_cleared_by_a_reconnect(growatt_modbus):
+    """The earlier fix's intent: a dead socket must not silence the VPP blocks."""
+    hub = FakeHub()
+    client = _shared_client(growatt_modbus, hub)
+    _fail_block_until_blocked(growatt_modbus, client, 30407, growatt_modbus.ERROR_KIND_LINK)
+
+    hub.reconnect()
+    client._sync_optional_blacklists_with_connection()
+
+    assert client._optional_holding_blocked(30407) is False
+    reads = KindedHoldingReads(values={30407: [1, 20, 65436, 1]}, client=client)
+    data = _read_device_info(growatt_modbus, client, reads)
+    assert 30407 in reads.starts()
+    assert data.vpp_remote_power_available is True
+    assert data.remote_power_control_enable == 1
+
+
+def test_unclassified_failure_is_treated_as_a_link_failure(growatt_modbus):
+    """Unknown provenance stays conservative — a transient error never sticks."""
+    hub = FakeHub()
+    client = _shared_client(growatt_modbus, hub)
+    _fail_block_until_blocked(growatt_modbus, client, 30407, None)
+
+    hub.reconnect()
+    client._sync_optional_blacklists_with_connection()
+    assert client._optional_holding_blocked(30407) is False
+
+
+def test_a_poll_with_every_optional_block_backed_off_reads_none_of_them(growatt_modbus):
+    """The whole point: a poll must not pay for reads that are known not to answer."""
+    hub = FakeHub()
+    client = _shared_client(growatt_modbus, hub)
+    for anchor in (30100, 30200, 30407):
+        _fail_block_until_blocked(
+            growatt_modbus, client, anchor, growatt_modbus.ERROR_KIND_NO_RESPONSE
+        )
+
+    hub.reconnect()
+    client._sync_optional_blacklists_with_connection()
+
+    reads = KindedHoldingReads(fail={30100, 30200, 30407},
+                               kind=growatt_modbus.ERROR_KIND_NO_RESPONSE, client=client)
+    data = _read_device_info(growatt_modbus, client, reads)
+
+    assert not ({30100, 30200, 30407} & set(reads.starts()))
+    # The poll still completed, and the controls correctly report "not read".
+    assert data.vpp_remote_power_available is False
+    assert data.vpp_export_limit_available is False
+    assert data.vpp_control_authority_available is False
+
+
+# ---------------------------------------------------------------------------
+# The hub classifies the two failure modes
+# ---------------------------------------------------------------------------
+
+
+class _ErrorResponse:
+    def isError(self):
+        return True
+
+
+class _GoodResponse:
+    registers = [7]
+
+    def isError(self):
+        return False
+
+
+def test_hub_reports_no_response_for_an_error_response(growatt_modbus):
+    hub = growatt_modbus.SharedModbusConnection("10.0.0.1", 502)
+    hub.ensure_connected()
+    hub._client.read_holding_registers = lambda **kw: _ErrorResponse()
+
+    assert hub.read_holding_registers(30099, 1, 1) is None
+    assert hub.last_error_kind == growatt_modbus.ERROR_KIND_NO_RESPONSE
+
+
+def test_hub_reports_link_for_a_transport_exception(growatt_modbus):
+    hub = growatt_modbus.SharedModbusConnection("10.0.0.1", 502)
+    hub.ensure_connected()
+
+    def boom(**kw):
+        raise OSError(32, "Broken pipe")
+
+    hub._client.read_holding_registers = boom
+
+    assert hub.read_holding_registers(30099, 1, 1) is None
+    assert hub.last_error_kind == growatt_modbus.ERROR_KIND_LINK
+
+
+def test_hub_clears_the_error_kind_on_success(growatt_modbus):
+    hub = growatt_modbus.SharedModbusConnection("10.0.0.1", 502)
+    hub.ensure_connected()
+    hub.last_error_kind = growatt_modbus.ERROR_KIND_LINK
+    hub._client.read_holding_registers = lambda **kw: _GoodResponse()
+
+    assert hub.read_holding_registers(30099, 1, 1) == [7]
+    assert hub.last_error_kind is None

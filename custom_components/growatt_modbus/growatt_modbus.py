@@ -17,6 +17,7 @@ Hardware Setup:
 """
 
 import time
+import contextlib
 import logging
 import threading
 from dataclasses import dataclass
@@ -74,6 +75,26 @@ _OPTIONAL_RANGE_RETRY_SECONDS = 300
 # control block out of service.
 _OPTIONAL_HOLDING_RETRY_SECONDS = _OPTIONAL_RANGE_RETRY_SECONDS
 _OPTIONAL_HOLDING_FAIL_THRESHOLD = 3
+
+# Why an optional read came back empty.  The two cases need opposite treatment when the
+# shared socket is re-established:
+#
+#   ERROR_KIND_LINK        the transport raised (broken pipe, connection reset, connect
+#                          failure).  Says nothing about the register, and a reconnect
+#                          makes it worth retrying immediately.
+#   ERROR_KIND_NO_RESPONSE pymodbus returned an error *response*: the request went out on
+#                          a working socket and the inverter never answered (or answered
+#                          with an exception code).  That is evidence about the register
+#                          itself, and repeating it costs a full timeout x retries every
+#                          poll, so it must survive a reconnect and stay backed off.
+ERROR_KIND_LINK = "link"
+ERROR_KIND_NO_RESPONSE = "no-response"
+
+# Optional reads (identification, VPP blocks) are allowed to fail. Giving them the full
+# connection timeout and pymodbus's default retry count means a single unanswered register
+# costs ~40s; these limits cap it at a couple of seconds without touching critical reads.
+OPTIONAL_READ_TIMEOUT_SECONDS = 3.0
+OPTIONAL_READ_RETRIES = 0
 
 
 # =============================================================================
@@ -422,6 +443,44 @@ class GrowattData:
     firmware_version: str = ""
     serial_number: str = ""
 
+
+@contextlib.contextmanager
+def optional_read_limits(client, timeout: float = OPTIONAL_READ_TIMEOUT_SECONDS,
+                         retries: int = OPTIONAL_READ_RETRIES):
+    """Temporarily shorten a pymodbus client's timeout/retries for optional reads.
+
+    An optional read that the inverter simply does not answer costs
+    ``timeout * (retries + 1)`` seconds.  With the connection defaults (10s, 3 retries)
+    that is ~40s *per register*; five such reads in a row stalled a poll for 205s on a
+    WIT (2026-09-02 10:29:48 "Finished fetching ... in 205.827 seconds").
+
+    Attribute names differ across pymodbus versions, so every write is best-effort and
+    is always restored — critical reads keep the configured timeout.
+    """
+    saved = []
+    comm_params = getattr(client, "comm_params", None)
+    for obj, attr, value in (
+        (comm_params, "timeout_connect", timeout),
+        (client, "timeout", timeout),
+        (client, "retries", retries),
+    ):
+        if obj is None or not hasattr(obj, attr):
+            continue
+        try:
+            saved.append((obj, attr, getattr(obj, attr)))
+            setattr(obj, attr, value)
+        except Exception:  # pragma: no cover - read-only attribute on some versions
+            pass
+    try:
+        yield
+    finally:
+        for obj, attr, value in reversed(saved):
+            try:
+                setattr(obj, attr, value)
+            except Exception:  # pragma: no cover
+                pass
+
+
 class SharedModbusConnection:
     """Single ModbusTcpClient shared across multiple GrowattModbus instances on the same host:port.
 
@@ -442,6 +501,9 @@ class SharedModbusConnection:
         # drop state that was derived from the previous session (see
         # GrowattModbus._sync_optional_blacklists_with_connection).
         self.connection_generation = 0
+        # Why the most recent read on this hub failed:
+        # ERROR_KIND_LINK / ERROR_KIND_NO_RESPONSE / None on success.
+        self.last_error_kind: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Reference counting
@@ -537,12 +599,19 @@ class SharedModbusConnection:
         except Exception as exc:
             logger.debug("[SharedConn %s:%s] Buffer flush failed (non-critical): %s", self.host, self.port, exc)
 
+    def optional_read_limits(self):
+        """Context manager applying the short optional-read timeout to the hub client."""
+        if self._client is None:
+            return contextlib.nullcontext()
+        return optional_read_limits(self._client)
+
     # ------------------------------------------------------------------
     # Register access (slave_id passed per call, not stored on hub)
     # ------------------------------------------------------------------
 
     def read_input_registers(self, start: int, count: int, slave_id: int) -> Optional[list]:
         if self._client is None:
+            self.last_error_kind = ERROR_KIND_LINK
             return None
         try:
             try:
@@ -556,15 +625,19 @@ class SharedModbusConnection:
                     except TypeError:
                         resp = self._client.read_input_registers(start, count)
             if hasattr(resp, 'isError') and callable(resp.isError) and resp.isError():
+                self.last_error_kind = ERROR_KIND_NO_RESPONSE
                 return None
+            self.last_error_kind = None
             return resp.registers if hasattr(resp, 'registers') else None
         except Exception as exc:
+            self.last_error_kind = ERROR_KIND_LINK
             logger.debug("[SharedConn %s:%s] read_input_registers(%d, %d, slave=%d) error: %s",
                          self.host, self.port, start, count, slave_id, exc)
             return None
 
     def read_holding_registers(self, start: int, count: int, slave_id: int) -> Optional[list]:
         if self._client is None:
+            self.last_error_kind = ERROR_KIND_LINK
             return None
         try:
             try:
@@ -575,9 +648,12 @@ class SharedModbusConnection:
                 except TypeError:
                     resp = self._client.read_holding_registers(address=start, count=count)
             if hasattr(resp, 'isError') and callable(resp.isError) and resp.isError():
+                self.last_error_kind = ERROR_KIND_NO_RESPONSE
                 return None
+            self.last_error_kind = None
             return resp.registers if hasattr(resp, 'registers') else None
         except Exception as exc:
+            self.last_error_kind = ERROR_KIND_LINK
             logger.debug("[SharedConn %s:%s] read_holding_registers(%d, %d, slave=%d) error: %s",
                          self.host, self.port, start, count, slave_id, exc)
             return None
@@ -708,6 +784,16 @@ class GrowattModbus:
         self._optional_blacklist_conn_generation: int = (
             getattr(shared_conn, 'connection_generation', 0) if shared_conn is not None else 0
         )
+
+        # Why each backed-off optional read last failed, so a reconnect can re-arm the
+        # ones that were only ever a symptom of a dead socket while leaving the ones the
+        # inverter genuinely refuses to answer backed off.  Keys are ('range', range_key)
+        # and ('holding', anchor); values are ERROR_KIND_LINK / ERROR_KIND_NO_RESPONSE.
+        self._optional_failure_kinds: dict = {}
+
+        # Classification of the most recent read (set by read_holding_registers /
+        # read_input_registers, consumed by the optional-read bookkeeping).
+        self._last_read_error_kind: Optional[str] = None
 
         # Last successfully read battery SOC — used to hold value if VPP range is
         # temporarily unavailable rather than reporting a misleading 0%.
@@ -897,23 +983,44 @@ class GrowattModbus:
     # Optional-register backoff bookkeeping
     # ------------------------------------------------------------------
 
-    def clear_optional_blacklists(self, reason: str = "") -> None:
-        """Forget every optional range/holding-block backoff.
+    def clear_optional_blacklists(self, reason: str = "", link_failures_only: bool = True) -> None:
+        """Re-arm optional reads that were only backed off because the link was down.
 
-        Called when the connection is (re-)established: a failed optional read is
-        evidence about the *link*, not about the firmware, so a fresh socket must
-        start from a clean slate.
+        Called when the connection is (re-)established.  A read that failed because the
+        transport raised (ERROR_KIND_LINK) says nothing about the register, so a fresh
+        socket must retry it.  A read that failed with ERROR_KIND_NO_RESPONSE went out on
+        a working socket and was ignored by the inverter; re-arming that on every
+        reconnect is how a poll ends up paying a full timeout per unanswered register
+        again and again, so those entries survive and keep counting down their retry
+        window.
+
+        ``link_failures_only=False`` clears everything (used by tests and by an explicit
+        operator-driven reset).
         """
-        if not self._failed_optional_ranges and not self._failed_optional_holding_addrs:
+        def _keep(key) -> bool:
+            if not link_failures_only:
+                return False
+            # Unknown kind is treated as a link failure: that is the conservative
+            # behaviour the earlier fix intended — a transient error must never take a
+            # control block out of service for the life of the process.
+            return self._optional_failure_kinds.get(key) == ERROR_KIND_NO_RESPONSE
+
+        dropped_ranges = [k for k in self._failed_optional_ranges if not _keep(('range', k))]
+        dropped_holdings = [a for a in self._failed_optional_holding_addrs if not _keep(('holding', a))]
+        if not dropped_ranges and not dropped_holdings:
             return
         logger.info(
             "[%s@%s] Clearing optional-register backoff (%d range(s), %d holding block(s))%s",
             self.register_map['name'], self.connection_id,
-            len(self._failed_optional_ranges), len(self._failed_optional_holding_addrs),
+            len(dropped_ranges), len(dropped_holdings),
             f": {reason}" if reason else "",
         )
-        self._failed_optional_ranges.clear()
-        self._failed_optional_holding_addrs.clear()
+        for key in dropped_ranges:
+            self._failed_optional_ranges.pop(key, None)
+            self._optional_failure_kinds.pop(('range', key), None)
+        for anchor in dropped_holdings:
+            self._failed_optional_holding_addrs.pop(anchor, None)
+            self._optional_failure_kinds.pop(('holding', anchor), None)
 
     def _sync_optional_blacklists_with_connection(self) -> None:
         """Drop the backoff state when the shared connection has been re-established.
@@ -957,6 +1064,7 @@ class GrowattModbus:
         previous = self._failed_optional_holding_addrs.get(anchor)
         fail_count = (previous[1] + 1) if previous else 1
         self._failed_optional_holding_addrs[anchor] = (time.time(), fail_count)
+        self._note_optional_failure_kind(('holding', anchor))
         if fail_count == _OPTIONAL_HOLDING_FAIL_THRESHOLD:
             logger.warning(
                 "[VPP] %s failed %d consecutive polls — skipping for %ds. "
@@ -969,6 +1077,14 @@ class GrowattModbus:
     def _record_optional_holding_success(self, anchor: int) -> None:
         """Clear the backoff for an optional holding block after a good read."""
         self._failed_optional_holding_addrs.pop(anchor, None)
+        self._optional_failure_kinds.pop(('holding', anchor), None)
+
+    def _note_optional_failure_kind(self, key) -> None:
+        """Remember why an optional read last failed (see clear_optional_blacklists)."""
+        kind = self._last_read_error_kind
+        if kind is None and self._shared_conn is not None:
+            kind = getattr(self._shared_conn, 'last_error_kind', None)
+        self._optional_failure_kinds[key] = kind or ERROR_KIND_LINK
 
     def _track_read_success(self):
         """Track successful read and restore fast polling if we had backed off"""
@@ -1019,9 +1135,12 @@ class GrowattModbus:
             log_errors: If False, downgrade Modbus errors to DEBUG (for optional ranges expected to fail on some models)
         """
         self._enforce_read_interval()
+        self._last_read_error_kind = None
 
         if self._shared_conn is not None:
-            return self._shared_conn.read_input_registers(start_address, count, self.slave_id)
+            registers = self._shared_conn.read_input_registers(start_address, count, self.slave_id)
+            self._last_read_error_kind = self._shared_conn.last_error_kind
+            return registers
 
         try:
             # Try keyword arguments with different parameter names for pymodbus versions
@@ -1060,12 +1179,14 @@ class GrowattModbus:
                 if response.isError():
                     _log = logger.warning if log_errors else logger.debug
                     _log(f"Modbus error reading input registers {start_address}-{start_address+count-1}: {response}")
+                    self._last_read_error_kind = ERROR_KIND_NO_RESPONSE
                     self._track_read_failure()
                     return None
             elif hasattr(response, 'is_error') and callable(response.is_error):
                 if response.is_error():
                     _log = logger.warning if log_errors else logger.debug
                     _log(f"Modbus error reading input registers {start_address}-{start_address+count-1}: {response}")
+                    self._last_read_error_kind = ERROR_KIND_NO_RESPONSE
                     self._track_read_failure()
                     return None
 
@@ -1077,6 +1198,7 @@ class GrowattModbus:
                         "(adapter online but inverter not responding — likely night-time sleep)",
                         start_address, start_address + count - 1
                     )
+                    self._last_read_error_kind = ERROR_KIND_NO_RESPONSE
                     self._track_read_failure()
                     return None
                 if len(registers) < count:
@@ -1084,6 +1206,7 @@ class GrowattModbus:
                         "Inverter returned only %d of %d requested registers at %d — treating as failure",
                         len(registers), count, start_address
                     )
+                    self._last_read_error_kind = ERROR_KIND_NO_RESPONSE
                     self._track_read_failure()
                     return None
                 logger.info("Successfully read %d registers from %d", len(registers), start_address)
@@ -1091,20 +1214,25 @@ class GrowattModbus:
                 return registers
 
             logger.warning(f"Unknown response type: {type(response)}, response: {response}")
+            self._last_read_error_kind = ERROR_KIND_NO_RESPONSE
             self._track_read_failure()
             return None
 
         except Exception as e:
             logger.debug(f"Exception reading input registers: {e}")
+            self._last_read_error_kind = ERROR_KIND_LINK
             self._track_read_failure()
             return None
     
     def read_holding_registers(self, start_address: int, count: int) -> Optional[list]:
         """Read holding registers with error handling and slave_id compatibility fallback."""
         self._enforce_read_interval()
+        self._last_read_error_kind = None
 
         if self._shared_conn is not None:
-            return self._shared_conn.read_holding_registers(start_address, count, self.slave_id)
+            registers = self._shared_conn.read_holding_registers(start_address, count, self.slave_id)
+            self._last_read_error_kind = self._shared_conn.last_error_kind
+            return registers
 
         try:
             try:
@@ -1116,16 +1244,19 @@ class GrowattModbus:
                     response = self.client.read_holding_registers(address=start_address, count=count)
             if hasattr(response, "isError") and callable(response.isError) and response.isError():
                 logger.debug("Modbus error reading holding registers %d-%d: %r", start_address, start_address + count - 1, response)
+                self._last_read_error_kind = ERROR_KIND_NO_RESPONSE
                 self._track_read_failure()
                 return None
             if hasattr(response, "registers"):
                 self._track_read_success()
                 return response.registers
             logger.debug("Unexpected response type from read_holding_registers(%d, %d): %r", start_address, count, response)
+            self._last_read_error_kind = ERROR_KIND_NO_RESPONSE
             self._track_read_failure()
             return None
         except Exception as e:
             logger.debug("Exception reading holding registers %d-%d: %s", start_address, start_address + count - 1, e)
+            self._last_read_error_kind = ERROR_KIND_LINK
             self._track_read_failure()
             return None
 
@@ -1553,6 +1684,7 @@ class GrowattModbus:
                     _prev = self._failed_optional_ranges.get(_3000_key)
                     _count = (_prev[1] + 1) if _prev else 1
                     self._failed_optional_ranges[_3000_key] = (time.time(), _count)
+                    self._note_optional_failure_kind(('range', _3000_key))
                     if _count == 1:
                         logger.warning(
                             f"Failed to read 3000 register block (extended data may be unavailable). "
@@ -1562,6 +1694,7 @@ class GrowattModbus:
                         logger.debug(f"3000 register block still failing (attempt {_count})")
                 elif _3000_any_ok:
                     self._failed_optional_ranges.pop(_3000_key, None)
+                    self._optional_failure_kinds.pop(('range', _3000_key), None)
 
         # Read 8000 range if needed - WIT/WIS battery/storage data
         if has_8000_range:
@@ -1661,6 +1794,7 @@ class GrowattModbus:
                         _prev = self._failed_optional_ranges.get(range_key)
                         _fail_count = (_prev[1] + 1) if _prev else 1
                         self._failed_optional_ranges[range_key] = (time.time(), _fail_count)
+                        self._note_optional_failure_kind(('range', range_key))
                         if _fail_count == 1:
                             logger.warning(
                                 f"Optional VPP range ({min_addr_block}-{max_addr_block}) failed — "
@@ -1677,6 +1811,7 @@ class GrowattModbus:
                     # Range succeeded — clear any previous failure record so the
                     # next failure is treated as fresh (warn again on first failure).
                     self._failed_optional_ranges.pop(range_key, None)
+                    self._optional_failure_kinds.pop(('range', range_key), None)
                     # Populate cache
                     for i, value in enumerate(registers):
                         self._register_cache[min_addr_block + i] = value
