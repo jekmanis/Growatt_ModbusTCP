@@ -1299,3 +1299,130 @@ def test_every_reported_register_actually_reached_the_device(wired, mode):
         f"mode '{mode}' reported registers it did not write "
         f"(register: (claimed, actual)): {lied}"
     )
+
+
+# ---------------------------------------------------------------------------
+# (j) The registers the optimizer CANNOT verify
+# ---------------------------------------------------------------------------
+
+# RegisterVerifier reads exactly two blocks - 30407+4 and 30200+2 - because each
+# read is a blocking service call on the AppDaemon callback thread and 30100 and
+# 30476 "neither change the verdict" (direct_control.py, RegisterVerifier
+# docstring). That is a sound trade, but it means the sequence writes four
+# registers no consumer ever checks, and each has the same failure shape: the
+# verified six read back exactly as predicted, the verification passes, and the
+# battery does not do what the schedule says.
+#
+#   30476 = 1 (Battery First) is REQUIRED for grid charging. With 0 (Load First)
+#           or 2 (Grid First) the inverter accepts 30407=1 / 30409=+100 and
+#           charges at 0 W - confirmed on WIT 8000TL3-HU V1.39, and the reason
+#           profiles/wit.py marks the register RW at all.
+#   30411 = 0 clears any leftover TOU period. A stale period drives the battery
+#           on its own schedule against the override; it is exactly what the
+#           fork removed GrowattWitVppBatteryModeSelect's Hold path for.
+#   30100 = 1 grants VPP control authority, without which 30407 is a no-op on
+#           some profiles.
+#   30404/30405 are the SOC cutoffs. Nothing reads them back into GrowattData
+#           either, so the mode sensor's cutoff attributes report dataclass
+#           defaults - the registers themselves are only ever observable here.
+#
+# So this section is the only place any of them is checked at all.
+
+VPP_PRIORITY_MODE = 30476
+VPP_TOU_NUM_PERIODS = 30411
+VPP_CHARGE_CUTOFF_SOC = 30404
+VPP_DISCHARGE_CUTOFF_SOC = 30405
+
+
+@pytest.mark.parametrize("mode", sorted(_const.WIT_MODES))
+def test_battery_first_is_written_for_every_mode_that_moves_the_battery(wired, mode):
+    """30476: 1 for everything except passthrough, which releases to Load First.
+
+    Bank seeded with a value no command produces, so a pass cannot come from a
+    leftover 1 - which is what the register would hold on a real inverter for as
+    long as the schedule kept working, hiding the regression until the first
+    restart or manual write.
+    """
+    client = _client(seed=dict(UNWRITTEN_BANK))
+    _, _, _, handlers = wired(client)
+
+    _set_wit_mode(handlers, device_id=DEVICE_ID, mode=mode,
+                  duration_minutes=20, power_percent=100)
+
+    expected = 0 if mode == "passthrough" else 1
+    assert client._fake.registers[VPP_PRIORITY_MODE] == expected, (
+        f"mode '{mode}' left 30476 at "
+        f"{client._fake.registers[VPP_PRIORITY_MODE]}, not {expected}; a "
+        f"grid_charge slot would verify perfectly and charge at 0 W"
+    )
+
+
+@pytest.mark.parametrize("mode", sorted(_const.WIT_MODES))
+def test_leftover_tou_periods_are_cleared_for_every_mode(wired, mode):
+    """30411=0 before the power command, for every mode without exception."""
+    client = _client(seed=dict(UNWRITTEN_BANK))
+    _, _, _, handlers = wired(client)
+
+    _set_wit_mode(handlers, device_id=DEVICE_ID, mode=mode,
+                  duration_minutes=20, power_percent=100)
+
+    assert client._fake.registers[VPP_TOU_NUM_PERIODS] == 0, (
+        f"mode '{mode}' did not clear 30411; a stale TOU period runs the "
+        f"battery on its own schedule underneath the override"
+    )
+
+
+@pytest.mark.parametrize("mode", sorted(_const.WIT_MODES))
+def test_control_authority_is_granted_for_every_mode(wired, mode):
+    """30100=1 is attempted for every mode. It is the one warn-and-continue
+    step, so this asserts the device received it, not that the action insisted
+    on it."""
+    client = _client(seed=dict(UNWRITTEN_BANK))
+    _, _, _, handlers = wired(client)
+
+    _set_wit_mode(handlers, device_id=DEVICE_ID, mode=mode,
+                  duration_minutes=20, power_percent=100)
+
+    assert client._fake.registers[REG_CONTROL_AUTHORITY] == 1, mode
+
+
+def test_the_soc_cutoffs_reach_their_registers_unscaled(wired):
+    """30404/30405 carry the optimizer's max_soc / min_soc verbatim.
+
+    They are write-only in this integration - no poll reads them back - so a
+    scaling or swap error here is invisible everywhere else. Sent on different
+    calls because the optimizer sends the charge cutoff only for CHARGE slots
+    and the discharge cutoff only for DISCHARGE slots.
+    """
+    client = _client(seed=dict(UNWRITTEN_BANK))
+    _, _, _, handlers = wired(client)
+
+    _set_wit_mode(handlers, device_id=DEVICE_ID, mode="grid_charge",
+                  duration_minutes=20, power_percent=100,
+                  ac_charge_mode="ac_priority", charge_cutoff_soc=95)
+    assert client._fake.registers[VPP_CHARGE_CUTOFF_SOC] == 95
+    assert client._fake.registers[VPP_DISCHARGE_CUTOFF_SOC] == UNWRITTEN, (
+        "a charge slot sends no discharge cutoff and must not invent one"
+    )
+
+    _set_wit_mode(handlers, device_id=DEVICE_ID, mode="discharge_to_load",
+                  duration_minutes=20, power_percent=100,
+                  ac_charge_mode="disabled", discharge_cutoff_soc=15)
+    assert client._fake.registers[VPP_DISCHARGE_CUTOFF_SOC] == 15
+
+
+@pytest.mark.parametrize("mode", sorted(_const.WIT_MODES))
+def test_the_duration_the_optimizer_sends_reaches_30408(wired, mode):
+    """30408 is read by the verifier but deliberately NOT compared (it does not
+    count down), so nothing on either side would notice it being dropped. It is
+    still the override's dead-man switch: the inverter releases the override
+    when it expires, and the optimizer sends slot_minutes + buffer for exactly
+    that reason."""
+    client = _client(seed=dict(UNWRITTEN_BANK))
+    _, _, _, handlers = wired(client)
+
+    _set_wit_mode(handlers, device_id=DEVICE_ID, mode=mode,
+                  duration_minutes=20, power_percent=100)
+
+    expected = 0 if mode == "passthrough" else 20
+    assert client._fake.registers[REG_REMOTE_DURATION] == expected, mode
