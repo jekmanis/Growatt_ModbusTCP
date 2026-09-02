@@ -68,6 +68,27 @@ CURRENT_DEVICE_STRUCTURE_VERSION = 2
 SHARED_LOCK_TIMEOUT = 60       # seconds to wait for shared bus lock before giving up
 DEFAULT_INTER_SLAVE_DELAY_MS = 50  # ms pause after each slave poll to let RS485 bus settle
 
+# A service call is not a poll and must not wait like one.
+#
+# #398 put every read and write behind the bus lock, and `_fetch_data` holds that lock
+# for a WHOLE poll. A service call that lands mid-poll therefore queues, and with the
+# poll-sized SHARED_LOCK_TIMEOUT it could queue for a minute. Its caller has already
+# given up long before that: battery_optimizer sets `hass_timeout = 15 s` on both
+# `set_wit_mode` and `get_register_data`, so anything returning after 15 s is reported
+# as an unconfirmed timeout while the handler is still running - the worst of both
+# outcomes, because a write can still land after the caller decided it had not.
+#
+# Failing cleanly inside the caller's window is strictly better: `write_batch` fails
+# before the first register is written, so "bus busy" means "nothing was applied", which
+# the optimizer records as a confirmed failure and retries on the next slot.
+SERVICE_BUS_TIMEOUT = 10       # seconds a service call waits for the bus
+
+# The two profiles carrying the WIT VPP control block. Every platform that offers a
+# WIT-only entity gates on this same tuple; switch.py used to compare against the first
+# entry alone, so on WIT_29900_50000TL3_XHU the mode sensor, the Mode Preset select and
+# the VPP numbers were created while the two switches silently were not.
+WIT_REGISTER_MAPS = ("WIT_4000_15000TL3", "WIT_29900_50000TL3_XHU")
+
 # ============================================================================
 # PROTOCOL VARIANT OVERRIDE (#385)
 # ============================================================================

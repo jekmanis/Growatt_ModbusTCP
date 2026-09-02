@@ -91,3 +91,60 @@ def test_the_vpp_charge_paths_use_it():
     assert "client.write_register(self.VPP_AC_CHARGE_ENABLE" not in source, (
         "a bare FC 0x06 write to 30410 remains"
     )
+
+
+def test_a_refusal_is_remembered_so_fc06_is_probed_once_per_register():
+    """The probe is cheap once and expensive every time.
+
+    30410 is written by every `set_wit_mode` call - once per 15-minute schedule slot on
+    the reference installation. On firmware that refuses FC 0x06 for it, an unconditional
+    probe is a rejected Modbus transaction with the bus held, plus a WARNING from the write
+    path, on every command: tens a day for a condition that is known, expected and already
+    handled. This project's logging rule is warn once, then be quiet.
+    """
+    c = _Client(single_ok=False)
+    assert c.write_single_register_any_fc(REG, 1) is True
+    assert c.calls == ["fc06", "fc10"]
+    assert REG in c._fc10_only_registers
+
+    c.calls.clear()
+    for _ in range(5):
+        assert c.write_single_register_any_fc(REG, 1) is True
+    assert c.calls == ["fc10"] * 5, "FC 0x06 was probed again after a known refusal"
+
+
+def test_the_memo_is_per_register():
+    """Another register must not inherit 30410's verdict."""
+    c = _Client(single_ok=False)
+    c.write_single_register_any_fc(REG, 1)
+    c.calls.clear()
+    c._single_ok = True
+    assert c.write_single_register_any_fc(30407, 1) is True
+    assert c.calls == ["fc06"]
+
+
+def test_a_later_fc06_success_clears_the_memo():
+    """Nothing here is authoritative about firmware. If FC 0x06 starts working - a
+    firmware update, or a different unit behind the same client - the memo must not
+    keep the register on the slower path forever."""
+    c = _Client(single_ok=False)
+    c.write_single_register_any_fc(REG, 1)
+    assert REG in c._fc10_only_registers
+
+    c._fc10_only_registers.discard(REG)  # as a reconnect/rebuild would
+    c._single_ok = True
+    c.calls.clear()
+    assert c.write_single_register_any_fc(REG, 1) is True
+    assert c.calls == ["fc06"]
+    assert REG not in c._fc10_only_registers
+
+
+def test_a_register_refused_on_both_codes_is_not_memoised():
+    """Only a SUCCESSFUL FC 0x10 is evidence. Memoising a double refusal would silently
+    stop trying the code that might start working."""
+    c = _Client(single_ok=False, multi_ok=False)
+    assert c.write_single_register_any_fc(REG, 1) is False
+    assert REG not in c._fc10_only_registers
+    c.calls.clear()
+    assert c.write_single_register_any_fc(REG, 1) is False
+    assert c.calls == ["fc06", "fc10"]

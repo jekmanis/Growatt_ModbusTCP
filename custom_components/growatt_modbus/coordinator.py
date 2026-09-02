@@ -34,6 +34,7 @@ from .const import (
     DEVICE_TYPE_BACKUPBOX,
     SHARED_LOCK_TIMEOUT,
     DEFAULT_INTER_SLAVE_DELAY_MS,
+    WIT_MODE_DISPLAY_NAMES,
 )
 
 from .const import REGISTER_MAPS, resolve_block_size
@@ -806,6 +807,13 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         on "Passthrough" for 30 h while the inverter was running a discharge
         override. Never derive a mode from a block that was not read; report
         "Unknown" instead.
+
+        The strings come from const.WIT_MODE_DISPLAY_NAMES rather than from literals here.
+        They are not free-form: `select.WIT_MODE_PRESETS` is keyed by them, and they are
+        what `sensor.growatt_inverter_mode` publishes to battery_optimizer's
+        SlotOutcomeTracker, so the same mode must spell the same way in all three places.
+        "Unknown" is deliberately not in the table - it is not a mode, it is the absence
+        of an answer.
         """
         remote_available = getattr(data, 'vpp_remote_power_available', False)
         export_available = getattr(data, 'vpp_export_limit_available', False)
@@ -850,13 +858,13 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         if not remote_enable:
             # No remote override active — this is Passthrough
             # (Preserve SOC now uses 30407=1 with 30409=1, so it won't hit this branch)
-            data.wit_mode_status = "Passthrough"
+            data.wit_mode_status = WIT_MODE_DISPLAY_NAMES["passthrough"]
             data.wit_mode_power_percent = 0
         elif power_signed > 1:
-            data.wit_mode_status = "Grid Charge"
+            data.wit_mode_status = WIT_MODE_DISPLAY_NAMES["grid_charge"]
             data.wit_mode_power_percent = power_signed
         elif power_signed in (0, 1):
-            data.wit_mode_status = "Preserve SOC"
+            data.wit_mode_status = WIT_MODE_DISPLAY_NAMES["preserve_soc"]
             data.wit_mode_power_percent = 0
         elif power_signed < 0:
             if not export_available:
@@ -868,14 +876,14 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 return
             export_allowed = (not export_enable) or (export_rate > 0)
             if export_allowed and abs(power_signed) == 100:
-                data.wit_mode_status = "Max Export"
+                data.wit_mode_status = WIT_MODE_DISPLAY_NAMES["max_export"]
             elif export_allowed:
-                data.wit_mode_status = "Discharge to Grid"
+                data.wit_mode_status = WIT_MODE_DISPLAY_NAMES["discharge_to_grid"]
             else:
-                data.wit_mode_status = "Discharge to Load"
+                data.wit_mode_status = WIT_MODE_DISPLAY_NAMES["discharge_to_load"]
             data.wit_mode_power_percent = abs(power_signed)
         else:
-            data.wit_mode_status = "Passthrough"
+            data.wit_mode_status = WIT_MODE_DISPLAY_NAMES["passthrough"]
             data.wit_mode_power_percent = 0
 
     @property

@@ -10,6 +10,11 @@ from homeassistant.helpers.typing import ConfigType
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import device_registry as dr
+# Used by the unknown-profile repair issue below. It was missing, so that block raised
+# NameError into its own `except Exception` and logged a debug line: a user on a
+# retired/renamed profile key silently got no repair issue at all - the exact
+# fails-invisibly shape the block was written to prevent.
+from homeassistant.helpers import issue_registry as ir
 
 
 from .const import (
@@ -22,6 +27,7 @@ from .const import (
     REGISTER_MAPS,
     WRITABLE_REGISTERS,
     DEVICE_TYPE_INVERTER,
+    WIT_REGISTER_MAPS,
     is_read_only_register,
 )
 from .coordinator import GrowattConfigEntry, GrowattModbusCoordinator
@@ -47,6 +53,12 @@ PLATFORMS: list[Platform] = [
     Platform.TIME,
     Platform.SWITCH,
 ]
+
+# Consecutive polls a VPP holding block must miss before its control entities are removed
+# from the registry. Deliberately equal to growatt_modbus._OPTIONAL_HOLDING_FAIL_THRESHOLD:
+# at that point the client itself has stopped asking for the block, so "did not answer" is
+# a property of the inverter rather than of one dropped frame.
+VPP_CLEANUP_CONSECUTIVE_POLLS = 3
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -256,6 +268,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.info("Removing stale number entity %s (WIT export_limit_w reg 203 not writable)", _stale_export_eid)
         entity_registry.async_remove(_stale_export_eid)
 
+    # Remove the generic active_power_rate control on WIT, where a bespoke entity
+    # supersedes it.
+    #
+    # number.py's WIT branch creates GrowattWitActivePowerRateNumber
+    # (`{entry}_active_power_rate_vpp`) and returns before the generic WRITABLE_REGISTERS
+    # loop that would create `{entry}_active_power_rate`. Installations that predate that
+    # branch still carry the generic row, and the blanket control cleanup below cannot
+    # reach it: register 201 IS in the WIT holding map and IS writable, so the "not in
+    # the profile" test passes and the row is kept - permanently unavailable, with no code
+    # path that could either recreate or remove it.
+    if str(entry.data.get(CONF_REGISTER_MAP, "")).upper() in WIT_REGISTER_MAPS:
+        _stale_apr_eid = entity_registry.async_get_entity_id(
+            "number", DOMAIN, f"{entry.entry_id}_active_power_rate"
+        )
+        if _stale_apr_eid:
+            _LOGGER.info(
+                "Removing %s — on WIT the VPP variant (Active Power Rate (VPP %%)) "
+                "replaces it, so nothing can populate this entity",
+                _stale_apr_eid,
+            )
+            entity_registry.async_remove(_stale_apr_eid)
+
     # Shared connection hub: all TCP entries on the same host:port share one ModbusTcpClient
     # and a threading.Lock to serialize reads/writes and prevent RS485 cross-talk on the
     # gateway. This is transparent for single-entry setups (hub refcount=1, no sharing).
@@ -310,24 +344,41 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # removals was dead code — silently, because a cleanup that does nothing looks
     # exactly like a cleanup with nothing to do.
     #
-    # Hooked to the coordinator instead, running once on the first poll that actually
-    # reached the inverter, then unsubscribing.
-    _vpp_cleanup_done = False
+    # Hooked to the coordinator instead, so it sees polls that actually reached the
+    # inverter.
+    #
+    # One missed poll must not delete a control entity.
+    #
+    # `vpp_export_limit_available` / `vpp_control_authority_available` are PER-POLL flags:
+    # growatt_modbus sets them only inside the successful branch of that poll's
+    # 30200 / 30100 read, and GrowattData is rebuilt every poll. A single unanswered read -
+    # below the optional-holding backoff's own threshold, so not even a skipped block -
+    # leaves them False. Sampling one poll and latching the answer therefore turned one
+    # dropped frame into the permanent removal of a registry row, complete with its name,
+    # area and dashboard references. That is the same one-transient-read-decides-a-
+    # long-lived-state defect the backoff work exists to close, arriving through a path
+    # the fork never exercised: this block was dead code before v1.8.14 moved it onto the
+    # coordinator listener, which is why the reference installation still has all three
+    # rows.
+    #
+    # Corroboration instead: the block has to miss VPP_CLEANUP_CONSECUTIVE_POLLS polls in
+    # a row, which is exactly the point at which growatt_modbus itself gives up on it and
+    # starts skipping it. A single answer at any time settles the question the other way -
+    # a register that replied once is supported - and only then is the decision latched.
+    _vpp_absent_polls = {"export": 0, "authority": 0}
+    _vpp_settled: set[str] = set()
 
     @callback
     def _cleanup_unsupported_vpp_entities() -> None:
-        nonlocal _vpp_cleanup_done
-        if _vpp_cleanup_done:
-            return
         data = coordinator.data
         # An empty placeholder means no successful poll yet — we cannot tell an
         # unsupported register from an inverter that is simply offline (#255).
         if data is None or not data.serial_number:
             return
-        _vpp_cleanup_done = True
 
         registry = er.async_get(hass)
-        if not data.vpp_export_limit_available:
+
+        def _remove_export() -> None:
             for control_name in ('vpp_export_limit_enable', 'vpp_export_limit_power_rate'):
                 stale_uid = f"{entry.entry_id}_{control_name}"
                 for platform in ('select', 'number'):
@@ -339,7 +390,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         )
                         registry.async_remove(stale_eid)
 
-        if not data.vpp_control_authority_available:
+        def _remove_authority() -> None:
             stale_uid = f"{entry.entry_id}_control_authority"
             stale_eid = registry.async_get_entity_id("select", DOMAIN, stale_uid)
             if stale_eid:
@@ -348,6 +399,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "(register 30100 not responsive)", stale_eid,
                 )
                 registry.async_remove(stale_eid)
+
+        for group, available, remove in (
+            ("export", data.vpp_export_limit_available, _remove_export),
+            ("authority", data.vpp_control_authority_available, _remove_authority),
+        ):
+            if group in _vpp_settled:
+                continue
+            if available:
+                # The register answered: it exists. Nothing to remove, ever.
+                _vpp_absent_polls[group] = 0
+                _vpp_settled.add(group)
+                continue
+            _vpp_absent_polls[group] += 1
+            if _vpp_absent_polls[group] < VPP_CLEANUP_CONSECUTIVE_POLLS:
+                _LOGGER.debug(
+                    "VPP %s block missed poll %d/%d — not removing anything yet",
+                    group, _vpp_absent_polls[group], VPP_CLEANUP_CONSECUTIVE_POLLS,
+                )
+                continue
+            remove()
+            _vpp_settled.add(group)
 
     entry.async_on_unload(coordinator.async_add_listener(_cleanup_unsupported_vpp_entities))
 

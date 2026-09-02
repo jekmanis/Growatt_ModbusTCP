@@ -482,7 +482,11 @@ class GrowattData:
     # WIT Direct Control Mode Status (computed from VPP control registers)
     wit_mode_status: str = ""
     wit_mode_power_percent: int = 0
-    wit_mode_duration_remaining: int = 0
+    # No wit_mode_duration_remaining here: nothing ever wrote it, so it published a
+    # constant 0 into the diagnostics dump. The mode sensor's
+    # `duration_remaining_minutes` attribute is derived from
+    # coordinator.wit_direct_mode_timestamp + wit_direct_mode_duration, which are the
+    # only values this process actually knows - 30408 counts nothing down.
     wit_mode_export_rate: int = -1
     wit_mode_ac_charge: int = 0
     wit_mode_override_active: bool = False
@@ -1078,6 +1082,11 @@ class GrowattModbus:
         # here opens the port - the client still owns its own socket. It only stops two
         # callers using that socket at once.
         self._local_bus_lock = threading.RLock()
+        # Registers observed to refuse Write Single Register. write_single_register_any_fc
+        # skips the FC 0x06 probe for these, so the refusal (and its WARNING) is paid once
+        # per process rather than on every write. 30410 is written by EVERY set_wit_mode
+        # call, i.e. once per 15-minute schedule slot.
+        self._fc10_only_registers: set = set()
 
         # Battery temperature scale detection (#397). Latched per connection so the
         # decision cannot flap between polls as the temperature moves.
@@ -1522,9 +1531,14 @@ class GrowattModbus:
             time.sleep(sleep_time)
         self.last_read_time = time.time()
     
-    def read_input_registers(self, start_address: int, count: int, log_errors: bool = True) -> Optional[list]:
-        """Read registers, holding the bus for the transaction (#398)."""
-        with self._bus("read"):
+    def read_input_registers(self, start_address: int, count: int, log_errors: bool = True,
+                             bus_timeout: Optional[float] = None) -> Optional[list]:
+        """Read registers, holding the bus for the transaction (#398).
+
+        `bus_timeout` caps how long the caller is prepared to queue behind a poll; see
+        const.SERVICE_BUS_TIMEOUT. Left None the poll-sized SHARED_LOCK_TIMEOUT applies.
+        """
+        with self._bus("read", timeout=bus_timeout):
             return self._read_input_registers_locked(start_address, count, log_errors)
 
     def _read_input_registers_locked(self, start_address: int, count: int, log_errors: bool = True) -> Optional[list]:
@@ -1635,9 +1649,14 @@ class GrowattModbus:
             self._track_read_failure()
             return None
     
-    def read_holding_registers(self, start_address: int, count: int) -> Optional[list]:
-        """Read registers, holding the bus for the transaction (#398)."""
-        with self._bus("read"):
+    def read_holding_registers(self, start_address: int, count: int,
+                               bus_timeout: Optional[float] = None) -> Optional[list]:
+        """Read registers, holding the bus for the transaction (#398).
+
+        `bus_timeout` caps how long the caller is prepared to queue behind a poll; see
+        const.SERVICE_BUS_TIMEOUT. Left None the poll-sized SHARED_LOCK_TIMEOUT applies.
+        """
+        with self._bus("read", timeout=bus_timeout):
             return self._read_holding_registers_locked(start_address, count)
 
     def _read_holding_registers_locked(self, start_address: int, count: int) -> Optional[list]:
@@ -3139,23 +3158,29 @@ class GrowattModbus:
             logger.info(f"{tag} Reconnect successful (no is_socket_open available)")
 
     @contextmanager
-    def _bus(self, what: str = "bus operation"):
+    def _bus(self, what: str = "bus operation", timeout: Optional[float] = None):
         """Hold the bus for the duration of the block.
 
         Returns the hub's lock when a shared connection is in use and the per-client lock
         otherwise, so both transports serialise the same way. Both are RLocks, so the
         nested acquisition inside the individual read/write methods re-enters rather than
         deadlocking.
+
+        `timeout` overrides SHARED_LOCK_TIMEOUT. The poll wants the long, poll-sized wait;
+        a service call does not - its caller has its own, much shorter deadline, and
+        returning after that deadline is worse than failing inside it (see
+        const.SERVICE_BUS_TIMEOUT).
         """
         from .const import SHARED_LOCK_TIMEOUT
 
+        wait = SHARED_LOCK_TIMEOUT if timeout is None else timeout
         lock = (
             self._shared_conn._lock if self._shared_conn is not None
             else self._local_bus_lock
         )
-        if not lock.acquire(timeout=SHARED_LOCK_TIMEOUT):
+        if not lock.acquire(timeout=wait):
             raise ModbusWriteError(
-                0, [], f"Modbus bus busy (lock timeout after {SHARED_LOCK_TIMEOUT}s on {what})"
+                0, [], f"Modbus bus busy (lock timeout after {wait}s on {what})"
             )
         try:
             yield
@@ -3163,7 +3188,7 @@ class GrowattModbus:
             lock.release()
 
     @contextmanager
-    def write_batch(self, what: str = "write sequence"):
+    def write_batch(self, what: str = "write sequence", timeout: Optional[float] = None):
         """Hold the shared bus for a sequence of writes that must not be interleaved.
 
         Some controls are not one register. The WIT VPP mode select writes six to eight —
@@ -3187,28 +3212,42 @@ class GrowattModbus:
         2. Keep the block short. The poll waits on this same lock, so a long batch delays
            polling for every entity on the connection.
 
-        A no-op when there is no shared connection: the client owns its socket outright and
-        there is nothing to contend with.
-        """
-        if self._shared_conn is None:
-            yield
-            return
+        It is NOT a no-op without a shared connection. That was the original shape, on the
+        reasoning that a direct client "owns its socket outright and there is nothing to
+        contend with" - true when it was written, false since #398 gave the direct path a
+        `_local_bus_lock` and made `_fetch_data` hold it for a whole poll. With the no-op,
+        each write inside the batch took and released that lock on its own, so a poll could
+        slot in between two registers of the sequence, and a mid-sequence acquisition could
+        time out with authority already granted and no setpoint written - exactly the
+        half-applied command this method exists to prevent, reached on the one transport
+        that was supposed to be exempt from it. Both locks are RLocks, so holding the local
+        one here and re-entering it per write behaves identically to the shared path.
 
+        `timeout` overrides the poll-sized SHARED_LOCK_TIMEOUT for callers with their own,
+        shorter deadline (see const.SERVICE_BUS_TIMEOUT). Failing here is the safe failure:
+        the bus is taken before the first write, so "busy" means nothing was applied.
+        """
         from .const import SHARED_LOCK_TIMEOUT
-        acquired = self._shared_conn._lock.acquire(timeout=SHARED_LOCK_TIMEOUT)
-        if not acquired:
+
+        wait = SHARED_LOCK_TIMEOUT if timeout is None else timeout
+        lock = (
+            self._shared_conn._lock if self._shared_conn is not None
+            else self._local_bus_lock
+        )
+        scope = "shared" if self._shared_conn is not None else "local"
+        if not lock.acquire(timeout=wait):
             raise ModbusWriteError(
-                0, [], f"Shared connection busy (lock timeout on {what})"
+                0, [], f"Modbus bus busy (lock timeout after {wait}s on {what})"
             )
         try:
-            logger.debug("[BATCH] Holding shared bus for %s", what)
+            logger.debug("[BATCH] Holding %s bus for %s", scope, what)
             yield
         finally:
             # Released even if a write inside raised. A leaked lock would stall every
             # subsequent poll on this connection — a worse failure than the one this
             # method exists to prevent.
-            self._shared_conn._lock.release()
-            logger.debug("[BATCH] Released shared bus after %s", what)
+            lock.release()
+            logger.debug("[BATCH] Released %s bus after %s", scope, what)
 
     def write_register(self, register: int, value: int) -> bool:
         """Write, holding the bus for the transaction (#398)."""
@@ -3339,9 +3378,27 @@ class GrowattModbus:
         what most hardware expects; switching everything to FC 0x10 would risk the opposite
         failure on devices that only accept the single-register form. This only adds a second
         attempt where the first is refused outright, so it cannot make a working write worse.
+
+        The refusal is remembered, though. On the reference WIT the probe is refused every
+        time, and 30410 is written by every `set_wit_mode` call, so an unconditional probe
+        costs an extra rejected transaction with the bus held plus one WARNING per schedule
+        slot - tens a day for a condition that is known, expected and handled, which is the
+        log pattern this project explicitly designs against. After the first fallback the
+        register is written with FC 0x10 directly; a later FC 0x06 success (different
+        firmware behind the same client) clears the memo.
         """
+        if register in self._fc10_only_registers:
+            try:
+                return bool(self.write_registers(register, [value]))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[FC FALLBACK] register %d refused FC 0x10: %s", register, exc
+                )
+                return False
+
         try:
             if self.write_register(register, value):
+                self._fc10_only_registers.discard(register)
                 return True
             logger.debug(
                 "[FC FALLBACK] register %d refused FC 0x06 (no exception) — trying FC 0x10",
@@ -3355,8 +3412,10 @@ class GrowattModbus:
 
         try:
             if self.write_registers(register, [value]):
+                self._fc10_only_registers.add(register)
                 logger.info(
-                    "[FC FALLBACK] register %d accepted FC 0x10 after refusing FC 0x06",
+                    "[FC FALLBACK] register %d accepted FC 0x10 after refusing FC 0x06 — "
+                    "FC 0x06 will not be tried again for it",
                     register,
                 )
                 return True

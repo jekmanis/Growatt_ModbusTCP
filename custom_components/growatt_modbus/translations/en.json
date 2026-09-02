@@ -662,6 +662,9 @@
       },
       "inverter_clock": {
         "name": "Inverter Clock"
+      },
+      "wit_mode_status": {
+        "name": "Inverter Mode"
       }
     },
     "button": {

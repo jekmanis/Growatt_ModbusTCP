@@ -13,6 +13,7 @@ from .const import (
     REGISTER_MAPS,
     DEVICE_TYPE_GRID,
     DEVICE_TYPE_INVERTER,
+    WIT_REGISTER_MAPS,
 )
 from .coordinator import GrowattModbusCoordinator
 from .entity import GrowattEntity
@@ -47,7 +48,13 @@ async def async_setup_entry(
     holding_registers = register_map.get('holding_registers', {})
 
     entities: list[SwitchEntity] = []
-    is_wit = str(register_map_name).upper() == "WIT_4000_15000TL3"
+    # The same tuple select.py, number.py and time.py gate on. Comparing against the
+    # first map alone meant that on WIT_29900_50000TL3_XHU - which carries 30201 and
+    # 30411 exactly like the 4000-15000 map - the mode sensor, the Mode Preset select and
+    # the VPP numbers were created while these two switches silently were not. The
+    # per-register checks below are what actually decides; the profile test only scopes
+    # the branch.
+    is_wit = str(register_map_name).upper() in WIT_REGISTER_MAPS
 
     if is_wit:
         # Grid Export switch (register 30201)
@@ -69,10 +76,13 @@ class GrowattWitExportSwitch(GrowattEntity, SwitchEntity):
 
     _attr_icon = "mdi:transmission-tower-export"
     _attr_entity_category = EntityCategory.CONFIG
-    # has_entity_name is inherited from GrowattEntity, so HA prefixes the device name.
+    # "Export", not "Grid Export". has_entity_name is inherited from GrowattEntity, so HA
+    # composes the friendly name as device + entity, and this entity sits on the Grid
+    # sub-device ("Growatt Grid") - "Grid Export" rendered as "Growatt Grid Grid Export"
+    # where the pre-merge entity read "Growatt Grid Export".
     # The unique_id suffix must stay `grid_export_switch` - switch.growatt_grid_export
     # is an existing registry row.
-    _attr_name = "Grid Export"
+    _attr_name = "Export"
 
     def __init__(
         self,
@@ -84,11 +94,28 @@ class GrowattWitExportSwitch(GrowattEntity, SwitchEntity):
         )
 
     @property
-    def is_on(self) -> bool:
-        """Return True if export is enabled (30201 > 0)."""
-        data = self.coordinator.data
-        if data is None:
+    def available(self) -> bool:
+        """Unavailable while 30200-30201 has not been read.
+
+        Same rule as GrowattGenericNumber/GrowattGenericSelect, and for the same reason:
+        the VPP holding blocks are best-effort reads, GrowattData is rebuilt per poll, and
+        a missed block leaves the dataclass default 0. Published as `off` that is not "we
+        do not know" but "export is blocked" - a fabricated state for a limiter the
+        inverter has not touched, which is the defect class that froze the mode sensor at
+        "Passthrough". `vpp_export_limit_available` is set only on a successful read of
+        the block.
+        """
+        if not super().available:
             return False
+        data = self.coordinator.data
+        return bool(data is not None and getattr(data, 'vpp_export_limit_available', False))
+
+    @property
+    def is_on(self) -> bool | None:
+        """True if export is enabled (30201 > 0); None when the block was not read."""
+        data = self.coordinator.data
+        if data is None or not getattr(data, 'vpp_export_limit_available', False):
+            return None
         return getattr(data, 'vpp_export_limit_power_rate', 0) > 0
 
     async def async_turn_on(self, **kwargs: Any) -> None:

@@ -28,6 +28,44 @@ Staged for the next release. **Not yet published** — v1.8.14 is the current st
   worth one line - but the fault can recur on every poll, and it appears in Home Assistant's
   error log, so repeating it says the integration is broken rather than the inverter.
   Raised by @dinkalin-ux. (#384)
+- **`set_battery_mode`'s standby option works again.** The action's dropdown offered
+  `preserve_soc`, which the registered schema rejected - so the only non-charge/discharge
+  entry in the list could not be submitted. The option is back to `hold`, and
+  `preserve_soc` is now accepted as an alias so anything already written against it keeps
+  working.
+- **`sync_tou_schedule`'s documentation no longer contradicts the code.** It told you to
+  use `power=0` for a standby period. On this hardware +1% is standby and -1% is a full
+  discharge; every path that actually writes a TOU standby period writes 1.
+- **A single dropped Modbus frame no longer deletes control entities.** The VPP
+  availability flags are per-poll, so one unanswered 30100 / 30200 read left them at their
+  defaults - and that was enough to remove Control Authority and the two Export Limit
+  controls from the entity registry, permanently, along with their names, areas and
+  dashboard references. A removal now needs the block to miss three consecutive polls,
+  which is the point at which the client itself stops asking for it, and a single answer
+  settles the question the other way for good.
+- **Grid Export no longer reports "off" for a limiter nobody has touched.** When the
+  30200-30201 block misses a poll the switch reports unavailable instead of publishing the
+  dataclass default as a real reading - the same rule the VPP number and select entities
+  already follow.
+- **Register 30410 stops paying for a refused function code on every command.** Firmware
+  that rejects Write Single Register for it is now remembered after the first fallback, so
+  a WIT mode change costs one write instead of a rejected one plus a warning. A later
+  FC 0x06 success clears the memo.
+- **A service call no longer waits a poll-length for the bus.** `set_wit_mode` and
+  `get_register_data` give up after 10 s rather than 60. Their callers time out well
+  before that, and failing inside the caller's window is the safe failure: the batch takes
+  the bus before the first write, so "bus busy" means nothing was applied.
+- **`set_wit_mode` refuses an unsupported profile instead of aborting halfway.** The gate
+  now lists every register the sequence cannot continue without (30200/30201, 30407,
+  30409, 30410, 30411, 30476). Three profiles carried the first few without the rest, so
+  they passed the check and then failed after control authority had already been granted.
+- **The unknown-profile repair notice can actually appear.** It referenced the issue
+  registry without importing it, so it raised into its own error handler and logged a debug
+  line; a config entry on a retired profile key got no notice at all.
+- **Note for existing WIT installations:** `sensor.growatt_battery_ac_discharge_energy_total`
+  is removed from the entity registry on the next setup. Protocol V1.39 has no AC-discharge
+  counter, so the sensor never had a register behind it; use Battery Discharge Today. Export
+  its long-term statistics first if that history matters to you.
 - **A setting re-entered after it failed to apply is no longer skipped.** The check that
   avoids rewriting a register that already holds the requested value compared against
   cached data, up to a poll interval old. So if something else changed the register — the

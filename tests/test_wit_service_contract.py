@@ -36,6 +36,7 @@ action calls. Only pymodbus itself is faked.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib
 import re
@@ -46,6 +47,7 @@ import pytest
 
 _diag = importlib.import_module("growatt_under_test.diagnostic")
 _gm = importlib.import_module("growatt_under_test.growatt_modbus")
+_const = importlib.import_module("growatt_under_test.const")
 
 WIT_MAP = "WIT_4000_15000TL3"
 DIAGNOSTIC_SRC = (
@@ -571,8 +573,8 @@ def test_the_whole_sequence_runs_inside_one_write_batch(wired):
     real_batch = client.write_batch
 
     @contextmanager
-    def _spy(what="write sequence"):
-        with real_batch(what):
+    def _spy(what="write sequence", timeout=None):
+        with real_batch(what, timeout=timeout):
             seen.append(("enter", what, len(client._fake.calls)))
             yield
             seen.append(("exit", what, len(client._fake.calls)))
@@ -631,7 +633,7 @@ def test_a_bus_lock_timeout_reaches_the_caller_as_a_failure(wired):
     escape unclassified or, worse, be swallowed into a success response."""
     _, _, client, handlers = wired()
 
-    def _busy(what="write sequence"):
+    def _busy(what="write sequence", timeout=None):
         raise _gm.ModbusWriteError(0, [], f"Modbus bus busy (lock timeout on {what})")
 
     client.write_batch = _busy
@@ -811,3 +813,185 @@ def test_both_actions_are_registered_with_a_response(wired):
     for service in ("set_wit_mode", "get_register_data"):
         assert handlers[service]["domain"] == "growatt_modbus"
         assert handlers[service]["supports_response"] is _diag.SupportsResponse.OPTIONAL
+
+
+# ---------------------------------------------------------------------------
+# (e) Both actions must fail inside the caller's deadline, not after it
+# ---------------------------------------------------------------------------
+
+# battery_optimizer's DirectControl passes hass_timeout=15 to both actions
+# (SET_WIT_MODE_TIMEOUT_SECONDS, reused by RegisterVerifier). Anything the handler does
+# after that lands on nobody: the optimizer has already recorded an unconfirmed timeout
+# and released its own I/O lock.
+OPTIMIZER_DEADLINE_S = 15
+
+
+def test_the_service_bus_wait_is_shorter_than_the_optimizers_deadline():
+    """#398 made every read and write queue behind a whole poll, at SHARED_LOCK_TIMEOUT.
+
+    That is a poll-sized wait (60 s) on a call whose caller gives up after 15 s. A service
+    call has to fail INSIDE the window instead: for the batch that means nothing was
+    written, which is a confirmed failure the optimizer retries; for the verify read it
+    means UNVERIFIABLE rather than an answer produced long after the question expired.
+    """
+    assert _const.SERVICE_BUS_TIMEOUT < OPTIMIZER_DEADLINE_S
+    assert _const.SERVICE_BUS_TIMEOUT < _const.SHARED_LOCK_TIMEOUT
+
+
+def test_set_wit_mode_takes_the_bus_with_the_service_timeout(wired):
+    _, _, client, handlers = wired()
+    seen = []
+    real_batch = client.write_batch
+
+    @contextmanager
+    def _spy(what="write sequence", timeout=None):
+        seen.append(timeout)
+        with real_batch(what, timeout=timeout):
+            yield
+
+    client.write_batch = _spy
+    _set_wit_mode(handlers, device_id=DEVICE_ID, mode="hold",
+                  duration_minutes=20, power_percent=100)
+    assert seen == [_const.SERVICE_BUS_TIMEOUT]
+
+
+def test_get_register_data_takes_the_bus_with_the_service_timeout(wired):
+    _, _, client, handlers = wired()
+    seen = []
+    real_read = client.read_holding_registers
+
+    def _spy(start_address=None, count=None, bus_timeout=None):
+        seen.append(bus_timeout)
+        return real_read(start_address, count)
+
+    client.read_holding_registers = _spy
+    assert _get_register_data(handlers, *REG_BLOCK_CONTROL)["success"] is True
+    assert seen == [_const.SERVICE_BUS_TIMEOUT]
+
+
+def test_a_busy_bus_makes_the_verify_read_unverifiable_not_an_exception(wired):
+    """DirectControl's RegisterVerifier reads {"success", "values"} and treats an unclean
+    read as UNVERIFIABLE - never as a MISMATCH. A ModbusWriteError from the bus lock has
+    to arrive in that shape, not as a raised service call, which the caller would classify
+    as a confirmed failure of a read that changed nothing."""
+    _, _, client, handlers = wired()
+
+    def _busy(start_address=None, count=None, bus_timeout=None):
+        raise _gm.ModbusWriteError(0, [], "Modbus bus busy (lock timeout after 10s on read)")
+
+    client.read_holding_registers = _busy
+    result = _get_register_data(handlers, *REG_BLOCK_CONTROL)
+    assert result["success"] is False
+    assert result["values"] == []
+    assert "busy" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# (f) 30410 pays the FC 0x06 probe once, not once per schedule slot
+# ---------------------------------------------------------------------------
+
+
+def test_the_fc06_probe_on_30410_is_paid_once_not_on_every_command(wired):
+    """The optimizer sends a mode command every 15-minute slot, and every mode writes
+    30410. On firmware that refuses FC 0x06 for it, an unconditional probe is a rejected
+    transaction with the bus held plus a WARNING per slot - tens a day for a condition
+    that is known, expected and handled.
+    """
+    client = _client(refuse_fc06=[30410])
+    _, _, _, handlers = wired(client)
+
+    def _fc_calls():
+        return [c[0] for c in client._fake.calls if c[1] == 30410]
+
+    _set_wit_mode(handlers, device_id=DEVICE_ID, mode="grid_charge",
+                  duration_minutes=20, power_percent=100)
+    first = _fc_calls()
+    assert first == ["fc06", "fc10"], first
+    assert 30410 in client._fc10_only_registers
+
+    client._fake.calls.clear()
+    for _ in range(3):
+        _set_wit_mode(handlers, device_id=DEVICE_ID, mode="grid_charge",
+                      duration_minutes=20, power_percent=100)
+    later = _fc_calls()
+    assert later == ["fc10", "fc10", "fc10"], later
+    assert client._fake.registers[30410] == 1
+
+
+def test_a_refused_register_is_not_blamed_on_the_rate_limiter(wired, caplog):
+    """`_write` reported a falsy return and a raised write differently: only the raised
+    path backed off and named the device's own reason, while a False fell through to
+    "(rate limited?)" - a cause the batch clears at the top with
+    `_wit_control_last_write.clear()`. Routing 30410 through write_single_register_any_fc,
+    which swallows the ModbusWriteError and returns False, made that the normal path for
+    the one register most likely to be refused.
+    """
+    client = _client(refuse=[(30410, 0)], refuse_fc06=[30410])
+    _, _, _, handlers = wired(client)
+
+    with caplog.at_level("DEBUG"):
+        with pytest.raises(ValueError):
+            _set_wit_mode(handlers, device_id=DEVICE_ID, mode="hold",
+                          duration_minutes=20, power_percent=100)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("rate limited?" in m for m in messages), messages
+    assert any("Register 30410 write failed after 2 attempts" in m for m in messages), messages
+    # Both attempts were made, i.e. the refusal did not short-circuit the retry.
+    # Two attempts, each probing both function codes: the memo is only set by a
+    # SUCCESSFUL FC 0x10, so a register refused on both is not silently downgraded.
+    assert len([c for c in client._fake.calls if c[1] == 30410 and c[0] == "fc06"]) == 2
+    assert len([c for c in client._fake.calls if c[1] == 30410 and c[0] == "fc10"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# (g) The gate must list every register the sequence raises on
+# ---------------------------------------------------------------------------
+
+# Registers set_wit_mode writes unconditionally-or-nearly and RAISES on, i.e. a profile
+# without them passes the gate and then aborts mid-sequence, after 30100=1 has already
+# granted control authority with nothing behind it.
+HARD_REQUIRED = (30200, 30201, 30407, 30409, 30410, 30411, 30476)
+
+
+def _handler_source(name: str) -> str:
+    """The literal body of a handler defined inside async_setup_services."""
+    tree = ast.parse(DIAGNOSTIC_SRC)
+    func = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+    )
+    return ast.get_source_segment(DIAGNOSTIC_SRC, func)
+
+
+@pytest.mark.parametrize("register", HARD_REQUIRED)
+def test_the_gate_names_every_register_the_sequence_raises_on(register):
+    body = _handler_source("set_wit_mode")
+    gate = body[:body.index("def _apply()")]
+    assert str(register) in gate, (
+        f"set_wit_mode raises when {register} cannot be written but does not gate on it, "
+        f"so an unsupported profile aborts mid-sequence instead of being refused"
+    )
+
+
+def test_the_profiles_the_gate_now_refuses_would_have_aborted_mid_sequence():
+    """Three shipped profiles carry 30407/30409/30410 without 30411 or 30476. Under the
+    narrower gate they were accepted and then failed at the priority-mode write - with
+    30100=1 already applied."""
+    partial = sorted(
+        name for name, m in _const.REGISTER_MAPS.items()
+        if all(r in m.get("holding_registers", {}) for r in (30407, 30409, 30410))
+        and not all(r in m.get("holding_registers", {}) for r in HARD_REQUIRED)
+    )
+    assert partial == [
+        "MOD_6000_15000TL3_XH", "SPH_3000_6000_V201", "SPH_7000_10000_V201",
+    ], partial
+
+
+def test_both_wit_profiles_still_pass_the_gate():
+    """A gate tight enough to exclude the hardware this action exists for is a silent
+    removal of the feature."""
+    for name in _const.WIT_REGISTER_MAPS:
+        holding = _const.REGISTER_MAPS[name].get("holding_registers", {})
+        missing = [r for r in HARD_REQUIRED if r not in holding]
+        assert not missing, f"{name} would be refused: missing {missing}"

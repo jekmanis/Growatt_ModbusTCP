@@ -14,7 +14,14 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 import homeassistant.helpers.config_validation as cv
 
-from .const import DOMAIN, CONF_INVERTER_SERIES, resolve_block_size
+from .const import (
+    DOMAIN,
+    CONF_INVERTER_SERIES,
+    SERVICE_BUS_TIMEOUT,
+    WIT_AC_CHARGE_MODES,
+    WIT_MODES,
+    resolve_block_size,
+)
 from .device_profiles import fill_register_map, get_display_name_for_profile, get_profile
 from .auto_detection import ASSUMED, CONFIRMED, DTC_REGISTRY, convert_to_legacy_profile
 
@@ -241,7 +248,12 @@ SERVICE_READ_REGISTER_SCHEMA = vol.Schema(
 SERVICE_SET_BATTERY_MODE_SCHEMA = vol.Schema(
     {
         vol.Required("device_id"): cv.string,
-        vol.Required("mode"): vol.In(["charge", "discharge", "hold"]),
+        # "preserve_soc" is an accepted alias for "hold". services.yaml offered it as
+        # the only standby option while the schema rejected it, so selecting the
+        # dropdown's third entry raised vol.Invalid and the action never ran. The
+        # selector is back to upstream's "hold"; the alias stays so anything written
+        # against the fork's wording keeps working.
+        vol.Required("mode"): vol.In(["charge", "discharge", "hold", "preserve_soc"]),
         vol.Optional("power_percent", default=100): vol.All(vol.Coerce(int), vol.Range(min=1, max=100)),
     }
 )
@@ -281,21 +293,12 @@ SERVICE_GET_REGISTER_DATA_SCHEMA = vol.Schema(
     }
 )
 
-WIT_MODE_CHOICES = [
-    "grid_charge",
-    "discharge_to_load",
-    "discharge_to_grid",
-    "max_export",
-    "preserve_soc",
-    "hold",
-    "passthrough",
-]
-
-AC_CHARGE_MODE_MAP = {
-    "disabled": 0,
-    "pv_priority": 1,
-    "ac_priority": 2,
-}
+# The mode list and the AC-charge map are the service's public contract
+# (battery_optimizer sends these exact strings), so they live in const.py and are only
+# aliased here. They used to be a second, independent copy: editing const.WIT_MODES
+# changed nothing, and the two could drift apart silently in either direction.
+WIT_MODE_CHOICES = WIT_MODES
+AC_CHARGE_MODE_MAP = WIT_AC_CHARGE_MODES
 
 SERVICE_SET_WIT_MODE_SCHEMA = vol.Schema({
     vol.Required("device_id"): cv.string,
@@ -1232,6 +1235,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         """
         device_id = call.data["device_id"]
         mode = call.data["mode"]
+        # Normalised, not branched on twice: the handler below has exactly one standby
+        # branch and it is keyed "hold".
+        if mode == "preserve_soc":
+            mode = "hold"
         power_percent = call.data.get("power_percent", 100)
 
         _LOGGER.info("Set battery mode service called: device=%s, mode=%s, power=%d%%", device_id, mode, power_percent)
@@ -1377,12 +1384,30 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         client = coordinator._client
 
         def _read():
+            # SERVICE_BUS_TIMEOUT, not the poll-sized default: this read is
+            # battery_optimizer's verification path and it gives up after 15 s. Waiting
+            # a minute behind a poll returns an answer nobody is listening for any more,
+            # while a clean failure inside the window is classified UNVERIFIABLE and
+            # retried on the next slot.
             if register_type == "holding":
-                return client.read_holding_registers(start_address=start_address, count=count)
+                return client.read_holding_registers(
+                    start_address=start_address, count=count,
+                    bus_timeout=SERVICE_BUS_TIMEOUT,
+                )
             else:
-                return client.read_input_registers(start_address=start_address, count=count)
+                return client.read_input_registers(
+                    start_address=start_address, count=count,
+                    bus_timeout=SERVICE_BUS_TIMEOUT,
+                )
 
-        result = await hass.async_add_executor_job(_read)
+        try:
+            result = await hass.async_add_executor_job(_read)
+        except Exception as err:  # noqa: BLE001
+            # A bus-lock timeout arrives as ModbusWriteError. Reported as a failed read
+            # rather than raised: the caller's contract is {"success": bool, "values": []},
+            # and an unclean read must read as UNVERIFIABLE, never as a mismatch.
+            _LOGGER.debug("Register read failed: %s", err)
+            return {"success": False, "values": [], "error": str(err)}
 
         if result is not None:
             values = list(result) if not isinstance(result, list) else result
@@ -1556,23 +1581,35 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         VPP_TOU_PERIOD1_BASE = 30412  # 3 regs: start_min, end_min, power%
         VPP_PRIORITY_MODE = 30476     # 0=Load First, 1=Battery First, 2=Grid First
 
-        # Gate on register presence, not on model family. Every mode this action can
-        # produce ends in a remote-power command (30407/30409) and every mode writes the
-        # AC-charge enable (30410); a profile without them would take the writes and
-        # report success while the inverter ignored them. Family checks are what produced
+        # Gate on register presence, not on model family. Family checks are what produced
         # #373 - MOD carries the VPP control block and a WIT-only gate excluded it.
-        # 30100/30200/30201/30476 are deliberately NOT gated: their failures are already
-        # warn-and-continue or mode-specific.
+        #
+        # The gate lists every register the sequence below RAISES on, which is all of them
+        # except 30100 and the two SOC cutoffs. An earlier version gated only
+        # 30407/30409/30410 on the claim that "30100/30200/30201/30476 failures are
+        # warn-and-continue or mode-specific"; only 30100 is. 30476 and 30411 are written
+        # for every mode and raise, and every branch of the export step writes 30200. Three
+        # shipped profiles (MOD_6000_15000TL3_XH, SPH_3000_6000_V201, SPH_7000_10000_V201)
+        # carry 30407/30409/30410 without them, so they passed the gate and then aborted
+        # mid-sequence - after 30100=1 had already granted control authority with no
+        # setpoint behind it, the half-applied state write_batch exists to prevent (#331).
+        # 30201 is included with 30200: it is only written on some paths, but no shipped
+        # profile carries one without the other, so demanding both costs nothing and keeps
+        # discharge_to_load (which cannot be safe without 30201=0) inside the gate.
         holding = client.register_map.get('holding_registers', {})
         missing = [
-            r for r in (VPP_REMOTE_POWER_ENABLE, VPP_REMOTE_POWER_PERCENT, VPP_AC_CHARGE_ENABLE)
+            r for r in (
+                VPP_EXPORT_LIMIT_ENABLE, VPP_EXPORT_LIMIT_RATE, VPP_REMOTE_POWER_ENABLE,
+                VPP_REMOTE_POWER_PERCENT, VPP_AC_CHARGE_ENABLE, VPP_TOU_NUM_PERIODS,
+                VPP_PRIORITY_MODE,
+            )
             if r not in holding
         ]
         if missing:
             raise HomeAssistantError(
                 f"Set WIT Mode is not available on this model. Its profile "
                 f"({client.register_map.get('name', 'unknown')}) does not carry the VPP "
-                f"remote-power registers {missing}. This action is for WIT and WIS "
+                f"control registers {missing}. This action is for WIT and WIS "
                 f"inverters."
             )
 
@@ -1599,7 +1636,11 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             """
             registers_written = {}
 
-            with client.write_batch(f"set_wit_mode -> {mode}"):
+            # SERVICE_BUS_TIMEOUT, not the poll-sized default: battery_optimizer abandons
+            # the call after 15 s, so a batch that only starts after that has nobody left
+            # to report to while still writing to the inverter. Failing here writes
+            # nothing at all, which the caller records as a confirmed failure.
+            with client.write_batch(f"set_wit_mode -> {mode}", timeout=SERVICE_BUS_TIMEOUT):
                 # Atomic composite write - bypass the per-register 30s rate limiter that
                 # exists to stop dashboard users toggling individual controls.
                 # set_wit_mode is a coordinated multi-register operation, not rapid
@@ -1609,32 +1650,46 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     client._wit_control_last_write.clear()
 
                 def _write(reg, val, retries=2):
-                    """Write a single register. Returns False on failure (never raises)."""
+                    """Write a single register. Returns False on failure (never raises).
+
+                    A refused write and a raised one take the SAME path. They did not:
+                    only the `except` arm backed off and reported the device's own reason,
+                    while a falsy return fell straight through to a retry with no pause and
+                    ended at a fixed "(rate limited?)" message - a cause the batch has
+                    explicitly cleared. That split became reachable for 30410 the moment it
+                    was routed through write_single_register_any_fc, which swallows the
+                    ModbusWriteError and returns False.
+                    """
                     for attempt in range(retries):
+                        reason = None
                         try:
                             if reg in FC10_REGISTERS:
                                 result = client.write_single_register_any_fc(reg, val)
                             else:
                                 result = client.write_register(reg, val)
-                            if result is not None:
-                                if hasattr(result, 'isError'):
-                                    if not result.isError():
-                                        return True
-                                elif result is not False:
+                            if result is None:
+                                reason = "write returned None"
+                            elif hasattr(result, 'isError'):
+                                if not result.isError():
                                     return True
-                        except Exception as err:
-                            if attempt < retries - 1:
-                                _LOGGER.debug("[WIT] Register %d write attempt %d failed: %s", reg, attempt + 1, err)
-                                # Blocking sleep, not asyncio.sleep: this runs in the
-                                # executor with the bus held. Only reached after a failed
-                                # write, and the alternative - releasing the bus between
-                                # attempts - is the half-applied command write_batch
-                                # exists to prevent.
-                                time.sleep(0.5)
-                                continue
-                            _LOGGER.warning("[WIT] Register %d write failed after %d attempts: %s", reg, retries, err)
-                            return False
-                    _LOGGER.warning("[WIT] Register %d write returned False (rate limited?)", reg)
+                                reason = f"device refused the write ({result!r})"
+                            elif result is not False:
+                                return True
+                            else:
+                                reason = "write refused (or suppressed by the rate limiter)"
+                        except Exception as err:  # noqa: BLE001
+                            reason = err
+                        if attempt < retries - 1:
+                            _LOGGER.debug("[WIT] Register %d write attempt %d failed: %s", reg, attempt + 1, reason)
+                            # Blocking sleep, not asyncio.sleep: this runs in the
+                            # executor with the bus held. Only reached after a failed
+                            # write, and the alternative - releasing the bus between
+                            # attempts - is the half-applied command write_batch
+                            # exists to prevent.
+                            time.sleep(0.5)
+                            continue
+                        _LOGGER.warning("[WIT] Register %d write failed after %d attempts: %s", reg, retries, reason)
+                        return False
                     return False
 
                 # ---- Step 1: Ensure VPP control authority + safe base mode ----

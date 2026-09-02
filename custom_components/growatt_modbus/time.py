@@ -10,7 +10,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.entity import EntityCategory
 
-from .const import DOMAIN, WRITABLE_REGISTERS, CONF_REGISTER_MAP, get_device_type_for_control, DEVICE_TYPE_BATTERY, MOD_TOU_PERIODS
+from .const import DOMAIN, WRITABLE_REGISTERS, CONF_REGISTER_MAP, get_device_type_for_control, DEVICE_TYPE_BATTERY, MOD_TOU_PERIODS, WIT_REGISTER_MAPS
 from .coordinator import GrowattModbusCoordinator
 from .entity import GrowattEntity
 from .growatt_modbus import ModbusWriteError
@@ -48,7 +48,7 @@ async def async_setup_entry(
         _LOGGER.info("%s time control enabled (register %d)", control_name, control_config['register'])
 
     # WIT VPP TOU time pickers (periods 1-10, start + end each = up to 20 entities)
-    is_wit = str(register_map_name).upper() in ("WIT_4000_15000TL3", "WIT_29900_50000TL3_XHU")
+    is_wit = str(register_map_name).upper() in WIT_REGISTER_MAPS
     if is_wit:
         for _period in range(1, 11):
             _start_reg = 30412 + (_period - 1) * 3

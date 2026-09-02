@@ -27,12 +27,17 @@ GATED_ACTIONS = {
     "set_battery_mode": (30100, 30407, 30409),
     "sync_tou_schedule": (30411, 30412),
     # `set_wit_mode` is the fork's coordinated VPP write and the battery optimizer's
-    # only write path. Every mode it can produce ends in a remote-power command
-    # (30407/30409) and every mode writes the AC-charge enable (30410); on a profile
-    # without them the writes would be accepted and silently ignored. 30100/30200/
-    # 30201/30476 stay out of the gate - those failures are warn-and-continue or
-    # mode-specific, exactly as in set_battery_mode.
-    "set_wit_mode": (30407, 30409, 30410),
+    # only write path. The gate lists every register the sequence RAISES on, which is
+    # all of them except 30100 (warn-and-continue) and the two SOC cutoffs (only written
+    # when the caller supplies them).
+    #
+    # It used to list only 30407/30409/30410, justified as "30100/30200/30201/30476 are
+    # warn-and-continue or mode-specific". Only 30100 is: 30476 and 30411 are written for
+    # every mode and raise, and every branch of the export step writes 30200. Three
+    # shipped profiles carry the first three without the rest, so they passed the gate and
+    # then aborted mid-sequence - with 30100=1 already granting control authority and no
+    # setpoint behind it, which is the half-applied state write_batch exists to prevent.
+    "set_wit_mode": (30200, 30201, 30407, 30409, 30410, 30411, 30476),
 }
 
 

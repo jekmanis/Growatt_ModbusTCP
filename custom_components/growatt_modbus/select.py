@@ -20,6 +20,7 @@ from .const import (
     DEVICE_TYPE_BATTERY,
     MOD_TOU_PERIODS,
     VPP_CONTROL_AVAILABILITY_FLAG,
+    WIT_REGISTER_MAPS,
 )
 from .coordinator import GrowattModbusCoordinator
 from .entity import GrowattEntity
@@ -87,7 +88,7 @@ async def async_setup_entry(
     # WIT-specific control (VPP remote work_mode) - only when WIT register map
     # is selected. This avoids relying on global WRITABLE_REGISTERS collisions.
     # ---------------------------------------------------------------------
-    is_wit = str(register_map_name).upper() in ("WIT_4000_15000TL3", "WIT_29900_50000TL3_XHU")
+    is_wit = str(register_map_name).upper() in WIT_REGISTER_MAPS
     if is_wit:
         # WIT Mode Preset select — thin dashboard front-end for the set_wit_mode service.
         entities.append(GrowattWitModePresetSelect(coordinator, config_entry))
