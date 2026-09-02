@@ -1693,10 +1693,27 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     return False
 
                 # ---- Step 1: Ensure VPP control authority + safe base mode ----
+                # Recorded only when it lands. 30100 is the one step that warns and
+                # carries on rather than raising - the authority may already be granted,
+                # and a profile that ignores the register can still do the useful part -
+                # but the record was written unconditionally, so `registers_written`
+                # claimed 30100=1 for a write the inverter had just refused. That is the
+                # one machine-readable account of what the action did, and 30100 is the
+                # register whose absence makes 30407 a no-op on some profiles, so a slot
+                # that quietly failed to charge would be diagnosed from a response saying
+                # authority was granted. Every other step records after its own success.
+                #
+                # It cannot be reported as attempted-and-refused instead: the response key
+                # set is the fork's published contract, and `registers_written` is read as
+                # {int(register): value}, so neither an extra top-level key nor a non-numeric
+                # one is available. Omission is unambiguous here anyway - 30100 is written
+                # by every call, so a response without it is a refusal, and the WARNING
+                # below carries the device's own reason.
                 success = _write(VPP_CONTROL_AUTHORITY, 1)
-                if not success:
+                if success:
+                    registers_written[VPP_CONTROL_AUTHORITY] = 1
+                else:
                     _LOGGER.warning("[WIT] Failed to enable VPP control authority, continuing anyway...")
-                registers_written[VPP_CONTROL_AUTHORITY] = 1
 
                 # Set priority mode based on operating mode.
                 # 30476 affects behavior BOTH with and without remote control:

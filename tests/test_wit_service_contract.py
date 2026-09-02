@@ -1208,3 +1208,94 @@ def test_every_offered_mode_writes_all_four_verified_registers(wired, mode):
         f"mode '{mode}' reported success without writing {missing}; "
         f"it is missing from a step's mode tuple in set_wit_mode"
     )
+
+
+# ---------------------------------------------------------------------------
+# (i) `registers_written` records what landed, not what was attempted
+# ---------------------------------------------------------------------------
+
+# Every register the sequence touches, pre-seeded with a value no command in this
+# module produces. A register recorded in the response but never actually written
+# therefore reads back as 4242, so `bank[reg] == recorded` can only hold for a
+# write that happened — the STALE_BANK seed would let 30407=1 pass on a stale 1.
+UNWRITTEN = 4242
+UNWRITTEN_BANK = {
+    reg: UNWRITTEN
+    for reg in (30100, 30200, 30201, 30404, 30405,
+                30407, 30408, 30409, 30410, 30411, 30476)
+}
+
+REG_CONTROL_AUTHORITY = 30100
+
+
+def test_a_refused_control_authority_is_not_reported_as_written(wired):
+    """30100 is the one step that warns and carries on instead of raising, and its
+    record was written unconditionally — so the response claimed 30100=1 for a write
+    the inverter had just refused.
+
+    `registers_written` is the only machine-readable account of what the action did,
+    and 30100 is the register whose absence makes 30407 a no-op on some profiles. A
+    slot that quietly failed to charge would then be diagnosed from a response saying
+    control authority was granted.
+    """
+    client = _client(seed=dict(UNWRITTEN_BANK), refuse=[(REG_CONTROL_AUTHORITY, 1)])
+    _, _, _, handlers = wired(client)
+
+    response = _set_wit_mode(handlers, device_id=DEVICE_ID, mode="grid_charge",
+                             duration_minutes=20, power_percent=100,
+                             ac_charge_mode="ac_priority")
+
+    # The warn-and-continue is intact: the rest of the sequence still ran and the
+    # action still reports success. Only the false record is gone.
+    assert response["success"] is True
+    assert client._fake.registers[REG_CONTROL_AUTHORITY] == UNWRITTEN, (
+        "the device refused the write; the bank must be untouched"
+    )
+    assert str(REG_CONTROL_AUTHORITY) not in response["registers_written"], (
+        "30100 was reported as written after the device refused it"
+    )
+    # Omission is the whole signal, so the steps that did land must still be there.
+    for reg in (30476, REG_AC_CHARGE_ENABLE, REG_REMOTE_ENABLE, REG_REMOTE_POWER):
+        assert str(reg) in response["registers_written"], reg
+
+
+def test_control_authority_is_reported_when_it_lands(wired):
+    """The other half: omission only means "refused" while a successful write is
+    always recorded."""
+    client = _client(seed=dict(UNWRITTEN_BANK))
+    _, _, _, handlers = wired(client)
+
+    response = _set_wit_mode(handlers, device_id=DEVICE_ID, mode="grid_charge",
+                             duration_minutes=20, power_percent=100)
+
+    assert response["registers_written"][str(REG_CONTROL_AUTHORITY)] == 1
+    assert client._fake.registers[REG_CONTROL_AUTHORITY] == 1
+
+
+@pytest.mark.parametrize("mode", sorted(_const.WIT_MODES))
+def test_every_reported_register_actually_reached_the_device(wired, mode):
+    """The general invariant, asserted from the mode list rather than for 30100 alone:
+    nothing may appear in `registers_written` that the bank did not receive.
+
+    Every step except 30100 raises on failure, so today they cannot lie — but that is
+    a property of each `if not success: raise`, and the next warn-and-continue step
+    added would silently reintroduce the same defect.
+    """
+    client = _client(seed=dict(UNWRITTEN_BANK))
+    _, _, _, handlers = wired(client)
+
+    response = _set_wit_mode(handlers, device_id=DEVICE_ID, mode=mode,
+                             duration_minutes=20, power_percent=100,
+                             ac_charge_mode="ac_priority", charge_cutoff_soc=95,
+                             discharge_cutoff_soc=10)
+
+    claimed = {int(k): v for k, v in response["registers_written"].items()}
+    lied = {
+        reg: (val, client._fake.registers.get(reg))
+        for reg, val in claimed.items()
+        if client._fake.registers.get(reg) != val
+    }
+    assert not lied, (
+        f"mode '{mode}' reported registers it did not write "
+        f"(register: (claimed, actual)): {lied}"
+    )
