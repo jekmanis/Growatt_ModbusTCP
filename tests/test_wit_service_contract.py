@@ -40,6 +40,7 @@ import ast
 import asyncio
 import importlib
 import re
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -208,7 +209,13 @@ class _FakeModbus:
         self.refuse_fc06 = set(refuse_fc06)
         self.calls = []  # (function_code, address, values)
 
-    # -- connection surface GrowattModbus._ensure_connection touches
+    # -- connection surface GrowattModbus._ensure_connection and
+    # SharedModbusConnection.ensure_connected touch
+    socket = object()
+
+    def connect(self):
+        return True
+
     def is_socket_open(self):
         return True
 
@@ -995,3 +1002,184 @@ def test_both_wit_profiles_still_pass_the_gate():
         holding = _const.REGISTER_MAPS[name].get("holding_registers", {})
         missing = [r for r in HARD_REQUIRED if r not in holding]
         assert not missing, f"{name} would be refused: missing {missing}"
+
+
+# ---------------------------------------------------------------------------
+# (h) The shared-connection path — the one the reference installation runs
+# ---------------------------------------------------------------------------
+#
+# Everything above drives a `GrowattModbus` with `_shared_conn = None`. That is not
+# what runs in production: `__init__.py` creates a `SharedModbusConnection` for every
+# TCP entry (a hub is built even for a single one) and `coordinator.py` passes it as
+# `shared_conn=`, so the reference WIT takes the shared branch of every read and write.
+#
+# The two branches are genuinely different code, not a wrapper:
+#   * `write_batch` holds `hub._lock` instead of `_local_bus_lock`, and each write
+#     inside then re-acquires that same RLock — reentrant only because it is the same
+#     thread, which is exactly the constraint `_apply`'s docstring rests on.
+#   * `SharedModbusConnection.write_register` returns a bool where the direct path
+#     returns a pymodbus response, and `_write_register_locked` turns a False into a
+#     raised `ModbusWriteError`. The handler's `_write` has to classify both.
+#   * reads go through `_validate_registers`, which the direct path does not have.
+#
+# So the register sequence the optimizer verifies against is re-proved here on the
+# branch that actually executes, and the handler is dispatched on a real worker thread
+# rather than inline, because per-thread RLock reentrancy is the whole reason the
+# sequence must not be split across executor jobs.
+
+
+class _ThreadedHass(_Hass):
+    """Runs the executor job on a different thread, as Home Assistant does.
+
+    Inline execution would hide a split-sequence deadlock: the batch lock is an RLock,
+    so a second acquisition succeeds on the calling thread and models nothing.
+    """
+
+    async def async_add_executor_job(self, func, *args):
+        box = {}
+
+        def _run():
+            try:
+                box["value"] = func(*args)
+            except BaseException as err:  # noqa: BLE001
+                box["error"] = err
+
+        thread = threading.Thread(target=_run, name="fake-executor")
+        thread.start()
+        thread.join(timeout=30)
+        assert not thread.is_alive(), "the register sequence deadlocked against itself"
+        if "error" in box:
+            raise box["error"]
+        return box["value"]
+
+
+@pytest.fixture
+def wired_shared(monkeypatch):
+    """(hass, coordinator, client, handlers) with a real SharedModbusConnection."""
+
+    def _build(seed=None, refuse=(), refuse_fc06=()):
+        fake = _FakeModbus(
+            seed=STALE_BANK if seed is None else seed,
+            refuse=refuse,
+            refuse_fc06=refuse_fc06,
+        )
+        monkeypatch.setattr(_gm, "ModbusTcpClient", lambda *a, **k: fake)
+        hub = _gm.SharedModbusConnection(host="10.0.0.1", port=502)
+        assert hub.ensure_connected(), "the hub refused to connect to the fake client"
+        client = _gm.GrowattModbus(
+            connection_type="tcp", host="10.0.0.1", port=502,
+            register_map=WIT_MAP, shared_conn=hub,
+        )
+        client.min_read_interval = 0
+        client._default_min_read_interval = 0
+        client._fake = fake
+        coordinator = _Coordinator(client)
+        hass = _ThreadedHass(coordinator)
+        monkeypatch.setattr(_diag, "dr", _FakeDrModule)
+        asyncio.run(_diag.async_setup_services(hass))
+        return hass, coordinator, client, hass.registered
+
+    return _build
+
+
+@pytest.mark.parametrize("name", sorted(OPTIMIZER_COMMANDS))
+def test_the_shared_connection_writes_the_same_registers(wired_shared, name):
+    """Same assertion as the direct-path case, on the branch production takes."""
+    params = OPTIMIZER_COMMANDS[name]
+    _, _, _, handlers = wired_shared()
+
+    _set_wit_mode(handlers, device_id=DEVICE_ID, **params)
+
+    observed = _observe(handlers)
+    expected = expected_registers(params["mode"], params)
+    assert differences_like_the_verifier(observed, expected) == [], (
+        f"{name}: observed {observed} against expected {expected}"
+    )
+
+
+def test_the_shared_sequence_is_one_batch_on_one_thread(wired_shared):
+    """The bus is taken once, before the first write, and released after the last.
+
+    On the shared branch the lock held is the hub's — the same one a poll takes for its
+    whole duration — so a leak here stalls polling for every entity on the connection,
+    and a split sequence would deadlock rather than interleave.
+    """
+    _, _, client, handlers = wired_shared()
+    hub = client._shared_conn
+    assert hub is not None, "the fixture did not build a shared connection"
+
+    depth = []
+    real_batch = client.write_batch
+
+    @contextmanager
+    def _spy(what="write sequence", timeout=None):
+        with real_batch(what, timeout=timeout):
+            depth.append(("enter", len(client._fake.calls)))
+            yield
+            depth.append(("exit", len(client._fake.calls)))
+
+    client.write_batch = _spy
+    _set_wit_mode(handlers, device_id=DEVICE_ID, mode="discharge_to_load",
+                  duration_minutes=20, power_percent=100,
+                  ac_charge_mode="disabled", discharge_cutoff_soc=10)
+
+    assert [d[0] for d in depth] == ["enter", "exit"]
+    assert depth[0][1] == 0 and depth[1][1] >= 8
+    # Released, not leaked: a poll must be able to take it straight afterwards.
+    assert hub._lock.acquire(timeout=0) is True
+    hub._lock.release()
+
+
+def test_the_fc06_refusal_on_30410_is_memoised_on_the_shared_path_too(wired_shared):
+    """30410 rejects FC 0x06 on the reference firmware (#353). The fallback must be
+    learned once, not re-probed every slot — the shared bus is the contended one."""
+    _, _, client, handlers = wired_shared(refuse_fc06=(30410,))
+
+    def _fc06_probes():
+        return [c for c in client._fake.calls if c[0] == "fc06" and c[1] == 30410]
+
+    charge = dict(mode="grid_charge", duration_minutes=20, power_percent=100,
+                  ac_charge_mode="pv_priority", charge_cutoff_soc=95)
+    _set_wit_mode(handlers, device_id=DEVICE_ID, **charge)
+    assert len(_fc06_probes()) == 1
+    assert 30410 in client._fc10_only_registers
+
+    for _ in range(3):
+        _set_wit_mode(handlers, device_id=DEVICE_ID, **charge)
+    assert len(_fc06_probes()) == 1, "the known-refused FC 0x06 probe was paid again"
+    assert _observe(handlers)[REG_AC_CHARGE_ENABLE] == 1
+
+
+def test_a_short_frame_is_a_failed_read_not_a_truncated_values_list(wired_shared):
+    """A misaligned gateway frame must read as UNVERIFIABLE, never as evidence.
+
+    `values` is consumed positionally: values[0] is 30407 and values[2] is the power
+    word. A three-register answer to a count-4 request would put the AC charge mode
+    where the power word belongs, and the mode decoded from it is one nobody
+    commanded. `_validate_registers` discards the frame, so the action reports
+    success=False and DirectControl records UNVERIFIABLE (#367).
+    """
+    _, _, client, handlers = wired_shared()
+
+    def _short(address=None, count=None, **kwargs):
+        return _Read([1, 20, 65436][:max(1, count - 1)])
+
+    client._fake.read_holding_registers = _short
+    result = _get_register_data(handlers, *REG_BLOCK_CONTROL)
+    assert result["success"] is False
+    assert result["values"] == []
+
+
+def test_a_read_the_bus_cannot_take_is_reported_rather_than_raised(wired_shared):
+    """DirectControl maps a raised call and success=False to the same UNVERIFIABLE, but
+    only because the action never lets a bus exception escape as a service error."""
+    _, _, client, handlers = wired_shared()
+
+    def _boom(**kwargs):
+        raise RuntimeError("bus wedged")
+
+    client.read_holding_registers = _boom
+    result = _get_register_data(handlers, *REG_BLOCK_CONTROL)
+    assert result["success"] is False
+    assert result["values"] == []
+    assert "bus wedged" in str(result.get("error"))
