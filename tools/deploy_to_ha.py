@@ -46,6 +46,7 @@ import shutil
 import sys
 import time
 import urllib.error
+import http.client
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -504,10 +505,11 @@ def do_restart(args, token):
         log("  restart request returned HTTP {0}".format(status))
         if status not in (200, 201):
             raise DeployError("Restart was refused: HTTP {0}: {1!r}".format(status, body[:200]))
-    except urllib.error.URLError as exc:
-        # HA regularly drops the connection while shutting down; that is a
-        # successful restart, not a failure.
-        log("  connection dropped while restarting ({0}) - expected, continuing".format(exc.reason))
+    except (urllib.error.URLError, http.client.HTTPException, ConnectionError, TimeoutError, OSError) as exc:
+        # HA regularly drops the connection while shutting down (seen live on
+        # 2026-09-02 as http.client.RemoteDisconnected, which is NOT a URLError);
+        # that is a successful restart, not a failure.
+        log("  connection dropped while restarting ({0!r}) - expected, continuing".format(exc))
 
     log("  waiting for the API to come back (timeout {0:.0f}s)...".format(RESTART_POLL_TIMEOUT))
     started = time.monotonic()
