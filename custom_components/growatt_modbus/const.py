@@ -337,6 +337,7 @@ WRITABLE_REGISTERS = {
 
     # WIT VPP SOC Cutoff Controls
     'vpp_charge_cutoff_soc': {
+        'label': 'VPP Charge Cutoff SOC',
         'register': 30404,
         'scale': 1,
         'valid_range': (10, 100),
@@ -344,6 +345,7 @@ WRITABLE_REGISTERS = {
         'desc': 'VPP charge cutoff SOC (stop charging at this SOC)'
     },
     'vpp_discharge_cutoff_soc': {
+        'label': 'VPP Discharge Cutoff SOC',
         'register': 30405,
         'scale': 1,
         'valid_range': (10, 100),
