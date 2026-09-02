@@ -71,6 +71,9 @@ EXCLUDED_DIR_NAMES = {"__pycache__"}
 EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
 
 RESTART_POLL_TIMEOUT = 300.0
+RUNNING_WAIT_TIMEOUT = 180.0   # /api/config state -> RUNNING
+ENTITY_CHECK_TIMEOUT = 120.0   # retry the entity check this long after RUNNING
+ENTITY_CHECK_INTERVAL = 15.0
 RESTART_POLL_INTERVAL = 5.0
 HACS_DOWNLOAD_TIMEOUT = 600.0
 HACS_STORAGE_RETRIES = 30
@@ -532,8 +535,38 @@ def do_restart(args, token):
                 RESTART_POLL_TIMEOUT)
         )
 
+    _wait_for_running(base, token)
     _report_integration_errors(base, ws_url, token)
-    return _check_entities(base, token)
+    # Entities are registered while HA is still starting; a 404 in the first
+    # minute after the API answers is timing, not a broken integration (seen
+    # live on 2026-09-02: API back after 26 s, entities present at ~45 s).
+    deadline = time.monotonic() + ENTITY_CHECK_TIMEOUT
+    while True:
+        if _check_entities(base, token):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        log("  entities not usable yet; retrying in {0:.0f}s".format(ENTITY_CHECK_INTERVAL))
+        time.sleep(ENTITY_CHECK_INTERVAL)
+
+
+def _wait_for_running(base, token):
+    """Block until /api/config reports state RUNNING (or the timeout passes)."""
+    deadline = time.monotonic() + RUNNING_WAIT_TIMEOUT
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            status, body = _request(base, "/api/config", token, timeout=10.0)
+            if status == 200:
+                last = json.loads(body).get("state")
+                if last == "RUNNING":
+                    log("  Home Assistant reports state RUNNING")
+                    return
+        except (urllib.error.URLError, http.client.HTTPException, OSError):
+            pass
+        time.sleep(RESTART_POLL_INTERVAL)
+    log("  WARNING: state is still {0!r} after {1:.0f}s; checking entities anyway".format(
+        last, RUNNING_WAIT_TIMEOUT))
 
 
 def _report_integration_errors(base, ws_url, token):
