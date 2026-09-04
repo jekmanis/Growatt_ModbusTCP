@@ -22,6 +22,7 @@ from .const import (
     CONF_BAUDRATE,
     CONF_INVERT_BATTERY_POWER,
     CONF_INVERTER_SERIES,
+    PROTOCOL_VARIANT_AUTO,
     CONF_DEVICE_STRUCTURE_VERSION,
     CURRENT_DEVICE_STRUCTURE_VERSION,
     get_sensor_type,
@@ -253,6 +254,19 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         # reports before it clears its own daily counters (~30–90 s after HA midnight).
         self._midnight_grace_expires: datetime | None = None
 
+        # What each daily counter read just before midnight, for the counters that had a
+        # non-zero total. A counter still reading exactly this has not been cleared by the
+        # inverter yet, whatever the clock says — one SPF took 16 minutes (#410). Entries
+        # are dropped as soon as the register moves, and the whole map is rebuilt at the
+        # next midnight.
+        self._pre_midnight_daily_totals: dict[str, float] = {}
+
+        # Attributes already warned about for a rejected spike. The condition can persist
+        # for every poll of a session — a register the model never populates, or a daily
+        # counter the inverter is slow to clear — and a guard working as designed should
+        # not file an error-log line a minute for hours (#412, same reasoning as #384).
+        self._spike_warned: set[str] = set()
+
         # Cloud override detection: tracks recently written register values
         # Format: {register_address: (expected_value, write_timestamp, control_name, mismatch_count)}
         # mismatch_count debounces the check — see _check_for_cloud_overrides (Issue #358).
@@ -319,6 +333,25 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         if self._profile_recheck_done:
             return
 
+        # Say nothing when the owner has chosen the protocol variant by hand.
+        #
+        # Nearly every DTC in the registry points at a _v201 profile, so this check finds
+        # two populations: people whose detection read failed and left them on a legacy
+        # map - the case it exists for - and people who deliberately moved to legacy
+        # because V2.01 misbehaved on their hardware. The Protocol variant selector was
+        # added in #385 precisely so the second group could escape a wrong detection.
+        #
+        # Without this guard the notice would find exactly those people and tell them to go
+        # back to the profile they had a bad time with, on every restart. A stated
+        # preference is not a fault to be corrected (#405).
+        variant = self.config_entry.options.get("protocol_variant", PROTOCOL_VARIANT_AUTO)
+        if variant != PROTOCOL_VARIANT_AUTO:
+            _LOGGER.debug(
+                "Profile re-check skipped: protocol variant was set to '%s' by hand", variant,
+            )
+            self._profile_recheck_done = True
+            return
+
         # NEVER read VPP registers on an off-grid profile.
         #
         # auto_detection.py carries the warning in capitals: reading 30000+ causes POWER
@@ -355,6 +388,40 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             _LOGGER.debug("Profile re-check: DTC %s agrees with the profile in use", dtc)
             return
 
+        # Say nothing when the two profiles would behave identically.
+        #
+        # A DTC can cover several model families. 5400 is 'MOD 3-10KTL3-XH/BP; MID
+        # 11-30KTL3-XH; MID 8-15KTL3-XHL/JP', and the registry has to resolve it to one
+        # profile - so every MID owner in that group was told to move to the MOD profile.
+        #
+        # There is nothing to move to. mid_11000_30000tl3_xh_v201 and
+        # mod_6000_15000tl3_xh_v201 declare the same register_map and the same 102
+        # sensors; they differ only in name, description and max_power_kw. Following the
+        # advice would have changed nothing except leaving the owner on a profile named
+        # for hardware they do not have - which then misleads whoever reads their next
+        # diagnostic report.
+        #
+        # Comparing behaviour rather than identity is the honest test: the notice exists
+        # to say "your inverter supports registers this profile does not map", and that
+        # claim is simply false when the maps and sensor sets match (#405, reported by
+        # @as-wallpen).
+        from .device_profiles import INVERTER_PROFILES
+
+        _cfg = INVERTER_PROFILES.get(configured)
+        _sug = INVERTER_PROFILES.get(suggested)
+        if (
+            _cfg and _sug
+            and _cfg.get('register_map') == _sug.get('register_map')
+            and set(_cfg.get('sensors') or ()) == set(_sug.get('sensors') or ())
+        ):
+            _LOGGER.debug(
+                "Profile re-check: DTC %s indicates '%s', but it maps the same registers "
+                "and the same sensors as '%s' - nothing to gain, staying quiet",
+                dtc, suggested, configured,
+            )
+            self._profile_recheck_done = True
+            return
+
         entry = DTC_REGISTRY.get(dtc)
         _LOGGER.warning(
             "Profile mismatch: this inverter reports DTC %s (%s), which indicates profile "
@@ -362,11 +429,26 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             "your inverter supports. Nothing has been changed (#405).",
             dtc, entry.model if entry else "unknown", suggested, configured,
         )
+        # State the difference rather than asserting a direction.
+        #
+        # The notice used to say the profile in use "maps fewer registers than the one your
+        # hardware reports". Nothing checked that. The equivalence guard above only rules
+        # out the two profiles being identical - where they differ, the suggested one may
+        # map fewer sensors, or simply a different set, and the claim would be wrong in a
+        # way the reader has no way to check (#405).
+        #
+        # Both profiles are already looked up for that guard, so the real counts cost
+        # nothing and say something the owner can verify against their own device page.
+        _n_cfg = len(set(_cfg.get('sensors') or ())) if _cfg else 0
+        _n_sug = len(set(_sug.get('sensors') or ())) if _sug else 0
+
         self._pending_profile_issue = {
             "dtc": str(dtc),
             "model": entry.model if entry else "unknown",
             "suggested": suggested,
             "configured": configured or "unknown",
+            "configured_count": str(_n_cfg) if _n_cfg else "an unknown number of",
+            "suggested_count": str(_n_sug) if _n_sug else "an unknown number of",
         }
 
     def _refresh_inverter_clock(self) -> None:
@@ -718,6 +800,20 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             'load_energy_today': getattr(self.data, 'load_energy_today', 0),
             'energy_to_user_today': getattr(self.data, 'energy_to_user_today', 0),
         }
+
+        # Snapshot every daily counter, not just those four, so _protect_energy_totals can
+        # tell "the inverter has not cleared this yet" from "this is today's reading". The
+        # four above feed unrelated startup heuristics and are left alone (#410).
+        from .const import DAILY_TOTAL_ATTRS
+        self._pre_midnight_daily_totals = {
+            attr: value
+            for attr in DAILY_TOTAL_ATTRS
+            if (value := (getattr(self.data, attr, 0) or 0)) > 0
+        }
+        _LOGGER.debug(
+            "[ENERGY_GUARD] Holding %d daily counters until they clear: %s",
+            len(self._pre_midnight_daily_totals), self._pre_midnight_daily_totals,
+        )
         
         # Update current date
         self._current_date = datetime.now().date()
@@ -727,6 +823,10 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
 
         # Clear daily total retention so new day starts fresh
         self._retained_daily_totals = {}
+
+        # A new day may hit the spike guard for new reasons, and one line per day is worth
+        # having. Without this the first session-warning is the only one ever logged (#412).
+        self._spike_warned = set()
 
         # Open a grace window so _protect_energy_totals() can suppress the stale
         # pre-reset values the inverter reports before it clears its own daily counters
@@ -906,6 +1006,27 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
 
         _updated = False
 
+        # Is the inverter actually returning data, or answering with zeros?
+        #
+        # This distinction is the whole basis of the retention below, and it used to be
+        # guessed from the wrong evidence. A *lifetime* total reading 0 is never real on a
+        # unit that has ever produced, so retention makes sense there. A *daily* counter
+        # reading 0 is not evidence of anything — it is what a day with no activity of that
+        # kind looks like. Retention was extended to daily counters by analogy (v0.6.6b2,
+        # "Daily totals: same logic"), and the analogy does not hold: on a quiet day the
+        # guard re-published yesterday's figure indefinitely (#410).
+        #
+        # Lifetime totals settle it, from the same snapshot and at no extra cost. A dormant
+        # inverter returns 0 for those too — that is the case retention exists for — so a
+        # non-zero one proves the device is answering with real values, and a zero daily
+        # counter alongside it is a measurement rather than a silence.
+        #
+        # Read before the lifetime loop below, which substitutes retained values into
+        # `data` and would otherwise make a dormant inverter look awake.
+        _device_reporting = any(
+            (getattr(data, attr, 0) or 0) > 0 for attr in LIFETIME_TOTAL_ATTRS
+        )
+
         # Lifetime totals: only block drops to exactly 0
         for attr in LIFETIME_TOTAL_ATTRS:
             value = getattr(data, attr, 0)
@@ -951,6 +1072,37 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 _spike = False
                 if retained is None:
                     # First reading after midnight clear (or inverter just came online).
+                    #
+                    # Suppress while the register still reads exactly what it read before
+                    # midnight. The old test was a 10-minute timer, on the assumption that
+                    # an inverter clears its own counters 30-90 s after midnight. One SPF
+                    # cleared at **16 minutes**, and in the six-minute gap yesterday's
+                    # totals were adopted as today's: discharge_energy_today took on 11.8
+                    # kWh, while energy_today escaped only because 28.9 happened to exceed
+                    # the spike threshold. Which counter survived was decided by an
+                    # unrelated constant (#410).
+                    #
+                    # A value test needs no per-device timing at all. Once the register
+                    # moves off its pre-midnight figure it is discarded from the watch list
+                    # for the day, so a counter that legitimately climbs back to yesterday's
+                    # total is never suppressed twice.
+                    _pre_midnight = self._pre_midnight_daily_totals.get(attr)
+                    if _pre_midnight is not None:
+                        if value == _pre_midnight:
+                            _LOGGER.debug(
+                                "[ENERGY_GUARD] %s still reads its pre-midnight %.3f kWh — "
+                                "the inverter has not cleared this counter yet, reporting 0",
+                                attr, value,
+                            )
+                            setattr(data, attr, 0)
+                            continue  # Do not update retention
+                        _LOGGER.debug(
+                            "[ENERGY_GUARD] %s moved off its pre-midnight %.3f kWh to "
+                            "%.3f kWh — new day confirmed for this counter",
+                            attr, _pre_midnight, value,
+                        )
+                        self._pre_midnight_daily_totals.pop(attr, None)
+
                     if self._midnight_grace_expires:
                         # Grace window is active: the inverter has not yet reset its own
                         # daily counters (typically happens 30–90 s after HA midnight).
@@ -972,7 +1124,17 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                     _spike = True
 
                 if _spike:
-                    _LOGGER.warning(
+                    # Warn once per attribute per session, then drop to debug. The
+                    # condition is not always transient: a register the model never
+                    # populates, or a daily counter this inverter clears late, repeats on
+                    # every poll — one reporter's error log carried a line every 62 s
+                    # indefinitely, which reads as a fault rather than a guard working
+                    # (#412).
+                    _log = (
+                        _LOGGER.warning if attr not in self._spike_warned else _LOGGER.debug
+                    )
+                    self._spike_warned.add(attr)
+                    _log(
                         "[ENERGY_GUARD] Daily total spike rejected for %s: %.3f kWh "
                         "(retained=%.3f kWh, delta=%.3f kWh, threshold=%.1f kWh) — "
                         "likely register glitch during startup or midnight reset",
@@ -981,9 +1143,26 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                         value - (retained if retained is not None else 0.0),
                         _SPIKE_THRESHOLD_KWH,
                     )
-                    # Leave retention unchanged — do not persist the garbage value.
-                    # The next legitimate reading (near 0 after the inverter settles)
-                    # will be accepted normally.
+
+                    # Withhold the value as well as declining to retain it.
+                    #
+                    # This branch used to do neither: it left `data` untouched, so the
+                    # rejected reading was published to the sensor and into long-term
+                    # statistics exactly as read. "Rejected" meant only that it was kept
+                    # out of _retained_daily_totals. That inverts the point of the guard,
+                    # which exists to stop a total_increasing sensor recording an
+                    # impossible jump — one reporter was publishing 135,777,726 kWh on
+                    # every poll while this warning fired (#412).
+                    #
+                    # Prefer the last real value; with none, report nothing at all. A gap
+                    # is honest about what happened, where a number the inverter never
+                    # meaningfully produced is a claim we cannot support (#384).
+                    if retained is not None and retained > 0:
+                        setattr(data, attr, retained)
+                    else:
+                        _unread = getattr(data, 'unread_fields', None)
+                        if _unread is not None:
+                            _unread.add(attr)
                 else:
                     if self._retained_daily_totals.get(attr) != value:
                         _LOGGER.debug(
@@ -995,11 +1174,26 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                         self._retained_daily_totals[attr] = value
                         _updated = True
             elif retained is not None and retained > 0:
-                _LOGGER.debug(
-                    "[ENERGY_GUARD] Retaining %s=%.3f kWh (hardware reported 0 — dormant or startup reset)",
-                    attr, retained,
-                )
-                setattr(data, attr, retained)
+                if _device_reporting:
+                    # A real zero from a working inverter: no activity of this kind today.
+                    # Substituting here is what kept a reporter's AC Discharge Energy Today
+                    # showing yesterday's 2.90 kWh for a whole day while the register read
+                    # 0 on every poll (#410).
+                    _LOGGER.debug(
+                        "[ENERGY_GUARD] %s: hardware reported 0 and the inverter is "
+                        "reporting (lifetime totals non-zero) — accepting the zero and "
+                        "dropping retention of %.3f kWh",
+                        attr, retained,
+                    )
+                    self._retained_daily_totals.pop(attr, None)
+                    _updated = True
+                else:
+                    _LOGGER.debug(
+                        "[ENERGY_GUARD] Retaining %s=%.3f kWh (hardware reported 0 and so "
+                        "did every lifetime total — dormant or startup reset)",
+                        attr, retained,
+                    )
+                    setattr(data, attr, retained)
             else:
                 # value=0, no retention — log only for the key grid import sensor to avoid noise
                 if attr == 'energy_to_user_today':
@@ -1253,6 +1447,8 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                             "model": info["model"],
                             "suggested": info["suggested"],
                             "configured": info["configured"],
+                            "configured_count": info["configured_count"],
+                            "suggested_count": info["suggested_count"],
                         },
                         learn_more_url=(
                             "https://github.com/0xAHA/Growatt_ModbusTCP/blob/main/"

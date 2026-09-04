@@ -2966,34 +2966,49 @@ class GrowattModbus:
             power_to_user_addr = self._find_register_by_name('power_to_user_low')
             power_to_load_addr = self._find_register_by_name('power_to_load_low')
 
-            # power_to_grid: prefer native 3044, fall back to VPP active_power (31101 maps_to power_to_grid_low)
-            # On some MID/MOD V2.01 firmware the 3000-range registers return 0 while VPP registers are correct.
-            power_to_grid_addr = self._find_register_by_name('power_to_grid_low')
-            if power_to_grid_addr:
-                ptg_val = self._get_register_value(power_to_grid_addr)
-                if ptg_val is None or ptg_val == 0.0:
-                    # Try VPP fallback (31101 maps_to='power_to_grid_low' in MID/MOD V2.01 profile)
-                    vpp_addr = self._find_register_by_name_with_fallback('power_to_grid_low')
-                    if vpp_addr and vpp_addr != power_to_grid_addr:
-                        vpp_val = self._get_register_value(vpp_addr)
-                        if vpp_val is not None and vpp_val != 0.0:
-                            ptg_val = vpp_val
-                            logger.debug(f"power_to_grid 3044=0, using VPP active power reg {vpp_addr}: {ptg_val}W")
-                data.power_to_grid = ptg_val if ptg_val is not None else 0.0
-
-            # power_to_user: prefer native 3042, fall back to VPP meter_power (31113 maps_to power_to_user_low)
-            # On some MID/MOD V2.01 firmware the 3000-range registers return 0 while VPP registers are correct.
-            if power_to_user_addr:
-                ptu_val = self._get_register_value(power_to_user_addr)
-                if ptu_val is None or ptu_val == 0.0:
-                    # Try VPP fallback (31113 maps_to='power_to_user_low' in MID/MOD V2.01 profile)
-                    vpp_addr = self._find_register_by_name_with_fallback('power_to_user_low')
-                    if vpp_addr and vpp_addr != power_to_user_addr:
-                        vpp_val = self._get_register_value(vpp_addr)
-                        if vpp_val is not None and vpp_val != 0.0:
-                            ptu_val = vpp_val
-                            logger.debug(f"power_to_user 3042=0, using VPP meter reg {vpp_addr}: {ptu_val}W")
-                data.power_to_user = ptu_val if ptu_val is not None else 0.0
+            # Grid flow: take the first address carrying a reading, wherever it lives.
+            #
+            # These used to defer to _find_register_by_name_with_fallback(), which picks a
+            # range using _detect_battery_register_range(). That is battery detection, and
+            # it has nothing to do with a grid meter — but on an inverter with **no
+            # battery** every battery test sensor reads zero, so the detector takes its
+            # "both ranges are zero" branch and returns 'fallback'. The VPP address is then
+            # filtered out, the fallback resolves to the same 3000-range address it started
+            # from, and the guard `vpp_addr != power_to_grid_addr` refuses to fire.
+            #
+            # Net effect: on a batteryless grid-tied inverter the metered value at
+            # 31112/31113 could never be reached, however good the meter. A reporter with a
+            # working DTSU666 — reading -211.2 W from those registers with his own script at
+            # the same moment — had his grid sensors falling through to an estimate, because
+            # 3043/3044 read 0 on that firmware and nothing was allowed to look further
+            # (#228).
+            #
+            # Note 31113 is meter_power, NOT 31101 active power: on a grid-tied MID,
+            # 31100/31101 is the inverter's own 3-phase output while 31112/31113 is metered
+            # grid exchange. v0.8.6 remapped it for that reason; re-read mid.py before
+            # changing it.
+            for _flow_attr, _flow_name in (
+                ('power_to_grid', 'power_to_grid_low'),
+                ('power_to_user', 'power_to_user_low'),
+            ):
+                _addresses = self._find_all_registers_by_name(_flow_name)
+                _value = None
+                for _addr in _addresses:
+                    _candidate = self._get_register_value(_addr)
+                    if _candidate is None:
+                        continue
+                    if _value is None:
+                        _value = _candidate  # Remember the first real read as the floor.
+                    if _candidate != 0.0:
+                        _value = _candidate
+                        if _addr != _addresses[0]:
+                            logger.debug(
+                                "%s: %s read 0, using reg %d instead: %sW",
+                                _flow_name, _addresses[0], _addr, _candidate,
+                            )
+                        break
+                if _addresses:
+                    setattr(data, _flow_attr, _value if _value is not None else 0.0)
             if power_to_load_addr:
                 self._set_from_register(data, 'power_to_load', power_to_load_addr)
             

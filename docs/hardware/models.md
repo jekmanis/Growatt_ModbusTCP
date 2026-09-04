@@ -111,18 +111,23 @@ The **MOD** column below represents the **MOD TL3-XH** (hybrid, with battery). T
 
 ## Smart Meter Requirement
 
-Several sensors only populate if a **Growatt smart meter** (GOSS-W or SPM-S CT clamp) is physically installed between the inverter and the grid connection. Without a meter the inverter has no way to measure AC import/export directly — the sensors appear in Home Assistant but always read zero.
+Several sensors only populate if a **Growatt smart meter** (GOSS-W or SPM-S CT clamp) is physically installed between the inverter and the grid connection. Without a meter the inverter has no way to measure AC import/export directly — the sensors appear in Home Assistant but report **unknown**.
+
+!!! info "Unknown, not zero (changed in v1.9.2)"
+    These sensors used to read 0 W, and on grid-tied models without a battery they could report something worse: the integration estimated grid flow from `solar - load`, and with no load register either that reduced to **solar power wearing a grid label**. One reporter importing 240 W was shown 74 W of *export*, which was exactly his PV output ([#228](https://github.com/0xAHA/Growatt_ModbusTCP/issues/228)).
+
+    Without a meter the grid flow is not measurable, so the integration now says so rather than publishing a figure it cannot support. **If these sensors have gone unknown after upgrading, that is this change** — and the numbers you were seeing before were not grid readings.
 
 ### Which sensors are affected
 
 | Sensor group | Without meter | With meter |
 | --- | --- | --- |
-| Grid Export / Import Power | Always 0 W | Live reading |
+| Grid Export / Import Power | **Unknown** | Live reading |
 | Power to Grid / Power to User (registers) | Always 0 W | Live reading |
 | Energy to Grid Today / Total | Always 0 kWh | Accumulating |
 | Load Energy Today / Total (register-based) | Always 0 kWh | Accumulating |
 
-> **`house_consumption` is never affected.** It is a calculated sensor (`solar_total_power + grid_import_power − grid_export_power`) and always reflects actual consumption regardless of meter presence — it just falls back to being solar-only when grid readings are zero.
+> **`house_consumption` falls back to solar-only** when there is no grid reading. It is a calculated sensor (`solar_total_power + grid_import_power − grid_export_power`), so without a meter it reports your generation rather than your consumption. That is a floor, not a measurement — anything you draw from the grid is invisible to it.
 
 ### Which models are affected
 
@@ -131,7 +136,7 @@ Several sensors only populate if a **Growatt smart meter** (GOSS-W or SPM-S CT c
 | **MOD 6000-15000TL3-X** (grid-tied, no battery) | **Yes** — 3000+ register range returns all zeros without meter |
 | **MOD 6000-15000TL3-XH** (hybrid) | Yes, for accurate grid registers; battery-side sensors unaffected |
 | **SPH-TL3, SPH, MIN TL-XH, WIT** (hybrid) | Yes, for meter-based grid registers; calculated `house_consumption` always works |
-| **MIC, MIN TL-X, MID** (grid-tied, no battery) | No — grid power is inferred from the inverter's own AC measurement |
+| **MIC, MIN TL-X, MID** (grid-tied, no battery) | **Yes**, for any grid figure at all. These have no battery and usually no load register, so there is nothing to infer grid flow from — the inverter measures only its own AC output. Corrected in v1.9.2; this row previously claimed grid power was inferred, which is what produced the wrong readings on [#228](https://github.com/0xAHA/Growatt_ModbusTCP/issues/228) |
 | **SPF** (off-grid) | N/A — grid connection is AC input only, no export |
 
 ### What hardware to get
@@ -175,13 +180,20 @@ Both calculated and register-based values are available. Register-based sensors 
 
 ## Invert Grid Power
 
-> ⚠️ **v0.9.1b1 note:** A bug in the setup wizard's auto-detection caused **Invert Grid Power** to be incorrectly enabled for most users during initial configuration. If you set up the integration before v0.9.1b1 and your grid export/import sensors appear swapped after upgrading, go to **Settings → Devices & Services → Growatt Modbus → Configure** and turn **Invert Grid Power off**. The vast majority of Growatt inverters do not need this option.
+All models support an **Invert Grid Power** option. It flips the sign of the signed sensors — `Grid Power` and the net grid energy sensors — together. `Grid Export Power` and `Grid Import Power` are always-positive and are never affected by it.
 
-All models support an **Invert Grid Power** option. When enabled, the sign of the `Grid Power` sensor is flipped. This is only needed in the rare case where your inverter's registers report the opposite sign to the integration convention (positive = export).
+**This is a presentation choice, not a fault.** Growatt reports grid flow from the inverter's point of view, so **positive means export**. Most Home Assistant dashboards and power-flow cards expect the opposite — **positive means import**, because the grid is being treated as a source feeding the house. Enabling this option converts between the two, so **it is normal and common to have it on**, and having it on does not mean anything is wrong with your inverter or your wiring.
 
-**When to enable:** Only if `Grid Power` shows a positive value while you are definitely importing from the grid (or negative while definitely exporting), and `Grid Export Power` / `Grid Import Power` still look correct. This indicates the inverter itself reports the opposite sign convention.
+**When to enable:** if `Grid Power` shows a *negative* value while you are importing from the grid and you would rather it read positive. Equivalently: if the sign is the opposite of what your dashboard expects. There is no single correct answer here — pick the convention you and your cards agree on, and keep it consistent.
 
-**When NOT to enable:** Do not enable this to fix a swapped `Grid Export Power` / `Grid Import Power` display — those sensors derive directly from the physical register values and are independent of this setting since v0.9.1b1.
+**How to check:** compare `Grid Power` against a moment when you know the direction. If you are drawing 500 W from the grid and `Grid Power` reads −500 W, enabling this makes it read +500 W.
+
+**What it does not fix:** a swapped `Grid Export Power` / `Grid Import Power` display. Those derive directly from the register values and are independent of this setting. If *they* look wrong, the cause is elsewhere — open an issue rather than reaching for this toggle.
+
+!!! note "Auto-detection measures your hardware, not your preference"
+    The setup wizard runs `detect_grid_orientation`, which checks whether your inverter's registers match the integration's internal convention while you are exporting. That is a question about polarity, and it is a different question from which way round you want the sensor displayed.
+
+    So a result of **OFF** means "your registers read the way we expect", never "you should leave this off". It also needs decent sun and real export to measure anything at all — outside those conditions it leaves the option off without having measured, and says so. You can re-run it any time with the `growatt_modbus.detect_grid_orientation` action, and you can override it whenever you like.
 
 **How to change:** Integration → **Configure** → toggle **Invert Grid Power**.
 

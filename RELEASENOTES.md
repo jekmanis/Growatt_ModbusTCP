@@ -80,41 +80,12 @@ identify-the-inverter-once.
 
 ---
 
-## Unreleased
+## Fork: merged upstream v1.9.6 (2026-09-04)
 
-Staged for the next release. **Not yet published** — v1.8.14 is the current stable.
+Upstream v1.9.0-v1.9.6 merged on top of the fork. The fork-only changes below were
+staged in the previous Unreleased section and are not part of any upstream release;
+everything else in v1.9.0-v1.9.6 is documented in the upstream sections further down.
 
-- **Your inverter now tells you if it is on the wrong profile.** Detection ran once during
-  setup and was never revisited, so a single timed-out read at that moment could leave an
-  inverter on a profile that maps fewer registers than it supports - with nothing to say so.
-  The device type code is now re-checked against a working connection, and a mismatch
-  raises a repair notice suggesting the better profile. **Nothing is changed automatically.**
-  Off-grid models are excluded from the check entirely, because reading those registers can
-  power-cycle an SPF. (#405, #228)
-- **Control names corrected.** Twenty writable controls were displaying mangled acronyms -
-  "Ac Charge Enable", "Charge Stopped Soc", "Vpp Export Limit Enable" - and two showed raw
-  register abbreviations: "Bat Low To Uti" is the battery-to-utility switchover voltage, now
-  named as such. The AC charge controls are also prefixed so they read as one group, since
-  they operate together. **Display names only** - entity IDs are unchanged, so automations,
-  dashboards and history are unaffected. Raised by @Doprintityourself. (#407)
-- **SPH-TL3: Battery Current now reads.** That profile mapped no register for it, so the
-  entity showed 0.00 A permanently while the BMS held a real value. Confirmed against a
-  5170 W discharge on a 219.9 V ARK pack. Reported by @Doprintityourself. (#403)
-- **WIT: battery power no longer reads ten times too high.** The scale is chosen at runtime
-  by comparing the power register against voltage x current, and on some units several
-  registers claim to be battery current while disagreeing wildly - one inverter offered
-  -0.1 A, 6.3 A and -4.3 A at the same instant. The largest was used, the wrong scale
-  matched it, and the choice stuck for the session, giving 40 kW readings on a 6.5 kW
-  battery. When the current registers disagree, no scale is now inferred and the
-  documented one is used. The scale is also no longer guessed while the battery is nearly
-  idle - the reporter upgraded with a full battery and the house on solar, which is exactly
-  when the comparison is least reliable. Reported by @sebastianries. (#406)
-- **SPF: the impossible-PV-zero message no longer repeats in the log.** The suppression
-  warns once per restart and logs further occurrences at debug. It stays a warning the first
-  time, because knowing your inverter reports 0 W PV while producing over a kilowatt is
-  worth one line - but the fault can recur on every poll, and it appears in Home Assistant's
-  error log, so repeating it says the integration is broken rather than the inverter.
-  Raised by @dinkalin-ux. (#384)
 - **`set_battery_mode`'s standby option works again.** The action's dropdown offered
   `preserve_soc`, which the registered schema rejected - so the only non-charge/discharge
   entry in the list could not be submitted. The option is back to `hold`, and
@@ -153,6 +124,194 @@ Staged for the next release. **Not yet published** — v1.8.14 is the current st
   is removed from the entity registry on the next setup. Protocol V1.39 has no AC-discharge
   counter, so the sensor never had a register behind it; use Battery Discharge Today. Export
   its long-term statistics first if that history matters to you.
+
+---
+
+## Unreleased
+
+Staged for the next release. **Not yet published** - v1.9.6 is the current stable.
+
+- **The wrong-profile notice now tells you the actual difference.** It used to assert that
+  the profile in use "maps fewer registers than the one your hardware reports", which
+  nothing verified - where two profiles differ, the suggested one may map fewer sensors, or
+  simply a different set. It now states both counts, so you can check them against your own
+  device page and decide. It also no longer presents a failed setup read as the certain
+  cause, since a device type code covering several models produces the same notice. (#405)
+
+---
+
+## v1.9.6
+
+Issues: #405
+
+- **The wrong-profile notice no longer fires when there is nothing to gain.** A device type
+  code can cover several model families - 5400 is *MOD 3-10KTL3-XH/BP; MID 11-30KTL3-XH;
+  MID 8-15KTL3-XHL/JP* - and the registry resolves it to one profile, so **MID owners in
+  that group were told to switch to the MOD profile**. Those two profiles map the same
+  registers and create the same 102 sensors; switching would change no reading and would
+  leave you on a profile named for hardware you do not have. The check now compares what
+  the profiles actually do, not their names, and stays silent when they match. If you
+  dismissed this notice, you were right to. Reported by @as-wallpen. (#405)
+
+---
+
+## v1.9.5
+
+Issues: #411
+
+- **A write made through the diagnostic services no longer reports itself as a
+  reversion.** When a control entity writes a register, the integration remembers the
+  value and warns if a later poll disagrees - that is how it catches a ShineWiFi dongle
+  or the Growatt cloud overriding your settings. The `write_register` and
+  `write_registers` actions changed the same registers without updating that record, so
+  an automation that set an entity and then called one of those actions on the same
+  register had its own second write reported as **"Write reversion detected"**. Both
+  actions now clear the record for the registers they write. Reported by @Vict20, who
+  spent a week tracing it. (#411)
+
+---
+
+## v1.9.4
+
+Issues: #331 #398
+
+- **A multi-register control can no longer be interrupted halfway on a direct connection.**
+  Controls that write several registers together (the WIT VPP mode select writes six to eight)
+  hold the Modbus bus for the whole sequence, so a poll cannot land in the middle of it. That
+  protection was skipped whenever the connection was not shared between config entries, on the
+  reasoning that such a client owns its socket outright - which stopped being true in v1.8.12,
+  when a whole poll started holding the per-client bus lock. On those setups a poll could still
+  interleave, and a write partway through the sequence could time out with the inverter left
+  half-configured. Shared connections are unaffected. (#331, #398)
+
+  Contributed by @jekmanis.
+
+---
+
+## v1.9.3
+
+Issues: #228
+
+- **Grid meter readings now reach the sensors on inverters without a battery.** If your
+  inverter has no battery, the integration could never use a grid value from the VPP
+  register range - the choice of which register to read was made by *battery* range
+  detection, and with no battery every test it scores reads zero, so it always picked the
+  older range. On hardware where the older registers return 0, the metered value at
+  31112/31113 was unreachable no matter how good your meter. A reporter with a working
+  DTSU666 was reading -211.2 W from those registers with his own script while the
+  integration showed him a fabricated figure. Grid flow now simply uses whichever mapped
+  register answers. Reported by @majliSK. (#228)
+
+- **Documentation: Invert Grid Power is a display convention, not a fault.** Three pages
+  said most users should have it off and described it as a rare hardware quirk. Growatt
+  reports grid flow positive-for-export; most Home Assistant dashboards expect
+  positive-for-import, so **having it enabled is normal and common**. The pages now say so,
+  explain how to choose, and make clear it never affects Grid Export Power or Grid Import
+  Power. No behaviour has changed and your existing setting is untouched.
+
+- The setup wizard no longer reports "using default (no inversion)" when it could not
+  measure anything. It says what it could not determine and how to re-run the check.
+
+---
+
+## v1.9.2
+
+Issues: #228 #410
+
+- **Grid power is no longer estimated from solar when there is nothing to estimate from.**
+  On a grid-tied inverter with no smart meter, the grid registers read 0 and there is no
+  battery or load reading to balance against - so the calculation reduced to solar power,
+  published under a grid label. A reporter importing 240 W was shown 74 W of export, which
+  was his PV output to the watt. **These sensors now read unknown instead**, because
+  without a meter the grid flow is not measurable. If Grid Power, Grid Export Power or
+  Grid Import Power go unavailable after upgrading, that is this change - and the figures
+  you saw before were not grid readings. See
+  [Smart Meter Requirement](https://0xaha.github.io/Growatt_ModbusTCP/hardware/models/#smart-meter-requirement).
+  Reported by @majliSK. (#228)
+- **A metered import is no longer discarded.** On MID V2.01 the meter is one signed
+  register and an import arrives as a negative value. Nothing handled the negative case, so
+  the meter reading was thrown away exactly when it said "importing", and replaced by the
+  estimate above. Affects anyone on that profile **with** a smart meter. (#228)
+- **A daily counter reading zero is now believed.** On a day with no activity of that kind
+  the register correctly reads 0, and the integration was treating that as a sleeping
+  inverter and re-publishing yesterday's figure - all day. One reporter's AC Discharge
+  Energy Today sat at 2.90 kWh through a day with no AC discharge at all. The protection
+  for genuinely dormant inverters is unchanged; it now applies only when the lifetime
+  totals are silent too, which is what actually distinguishes the two. Reported by
+  @horiace. (#410)
+- **The midnight rollover no longer depends on how fast your inverter clears its
+  counters.** The old behaviour allowed a fixed 10 minutes; one SPF took **16**, and in the
+  gap yesterday's totals were adopted as today's starting values. Whether a given counter
+  was affected came down to whether its total happened to exceed an unrelated threshold.
+  Each counter is now held until the register actually changes, however long that takes.
+  (#410)
+
+---
+
+## v1.9.1
+
+Issues: #412
+
+- **An impossible energy reading is no longer published.** The guard that detects a
+  daily counter jumping to a physically impossible value kept it out of the integration's
+  own memory but still passed it to Home Assistant, so it reached your sensor and your
+  long-term statistics - which is the counter reset it exists to prevent. One reporter's
+  Generator Discharge Today was reporting 135,777,726 kWh on every poll. Such readings are
+  now withheld: the last real value is shown where there is one, otherwise the sensor reads
+  unknown and history shows a gap. Found in a log attached by @horiace to #410. (#412)
+- **That guard no longer writes a warning every poll.** When the cause persists - a
+  register your model never populates, or a daily counter the inverter is slow to clear
+  after midnight - it warned on every scan, indefinitely. It now warns once per counter,
+  then logs at debug, and warns again the next day. (#412)
+
+---
+
+## v1.9.0
+
+Issues: #384 #402 #403 #405 #406 #407 #228
+
+- **Your inverter now tells you if it is on the wrong profile.** Detection ran once during
+  setup and was never revisited, so a single timed-out read at that moment could leave an
+  inverter on a profile that maps fewer registers than it supports - with nothing to say so.
+  The device type code is now re-checked against a working connection, and a mismatch
+  raises a repair notice suggesting the better profile. **Nothing is changed automatically.**
+  Off-grid models are excluded from the check entirely, because reading those registers can
+  power-cycle an SPF, and the notice stays silent if you have set the Protocol variant by
+  hand - a stated preference is not a fault to be corrected. (#405, #228)
+- **Control names corrected.** Twenty writable controls were displaying mangled acronyms -
+  "Ac Charge Enable", "Charge Stopped Soc", "Vpp Export Limit Enable" - and two showed raw
+  register abbreviations: "Bat Low To Uti" is the point at which an SPF switches over to
+  utility, and now reads **Battery to Utility Switchover**. It is not named for a unit
+  because it does not have a fixed one - that entity shows % on a lithium battery and V on
+  anything else. The AC charge controls are also prefixed so they read as one group, since
+  they operate together. **Display names only** - entity IDs are unchanged, so automations,
+  dashboards and history are unaffected. Raised by @Doprintityourself. (#407)
+- **Documentation: the SPH battery controls are three independent blocks**, and the entity
+  list gave no hint of it. AC Charge (1090-1092) governs grid charging only - an AC Charge
+  Stop SOC of 92 % will not stop solar charging at 92 % - while Battery First and Grid First
+  schedule when charging and discharging are allowed. None of them overrides another.
+  Measured and raised by @Doprintityourself. (#403)
+- **SPH-TL3: Battery Current now reads.** That profile mapped no register for it, so the
+  entity showed 0.00 A permanently while the BMS held a real value. Confirmed against a
+  5170 W discharge on a 219.9 V ARK high-voltage pack. **If you have an SPH-TL3 with a
+  low-voltage battery, please check the reading looks right** - the scale is confirmed on
+  one pack type only, and the same block is known to use different scales for different
+  batteries. Reported by @Doprintityourself. (#403)
+- **WIT: battery power no longer reads ten times too high.** The scale is chosen at runtime
+  by comparing the power register against voltage x current, and on some units several
+  registers claim to be battery current while disagreeing wildly - one inverter offered
+  -0.1 A, 6.3 A and -4.3 A at the same instant. The largest was used, the wrong scale
+  matched it, and the choice stuck for the session, giving 40 kW readings on a 6.5 kW
+  battery. When the current registers disagree, no scale is now inferred and the
+  documented one is used. The scale is also no longer guessed while the battery is nearly
+  idle - the reporter upgraded with a full battery and the house on solar, which is exactly
+  when the comparison is least reliable. Reported by @sebastianries. (#406)
+- **SPF: the impossible-PV-zero message no longer repeats in the log.** The suppression
+  warns once per restart and logs further occurrences at debug. It stays a warning the first
+  time, because knowing your inverter reports 0 W PV while producing over a kilowatt is
+  worth one line - but the fault can recur on every poll, and it appears in Home Assistant's
+  error log, so repeating it says the integration is broken rather than the inverter.
+  Raised by @dinkalin-ux. (#384)
 - **A setting re-entered after it failed to apply is no longer skipped.** The check that
   avoids rewriting a register that already holds the requested value compared against
   cached data, up to a poll interval old. So if something else changed the register — the
