@@ -31,7 +31,7 @@ Why the HACS step exists at all: HACS decides "update available" by comparing
 ``version_installed`` against ``last_version`` in ``.storage/hacs.repositories``.
 Writing the fork's files over the directory does not change that record, so HACS
 would keep offering the upgrade - and one accidental click would replace the
-fork with plain upstream.  Making HACS actually download v1.8.14 sets
+fork with plain upstream.  Making HACS actually download the pinned tag sets
 ``version_installed`` honestly; the fork (a superset of that tag) then goes on
 top.
 """
@@ -51,11 +51,11 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_HOST = "192.168.33.167"
+DEFAULT_HOST = "192.168.77.167"
 DEFAULT_PORT = 8123
-DEFAULT_SHARE_ROOT = r"\\192.168.33.167\config"
+DEFAULT_SHARE_ROOT = r"\\192.168.77.167\config"
 DEFAULT_HACS_REPO_ID = "1065036927"
-DEFAULT_HACS_VERSION = "v1.8.14"
+DEFAULT_HACS_VERSION = "v1.9.6"
 
 INTEGRATION_DIR_NAME = "growatt_modbus"
 BACKUP_DIR_NAME = "growatt_modbus_backups"
@@ -177,6 +177,28 @@ def find_cache_dirs(target):
     return sorted(p for p in target.rglob("*") if p.is_dir() and p.name in EXCLUDED_DIR_NAMES)
 
 
+def _mkdir_tolerant(path, attempts=5, delay=1.0):
+    """``mkdir(parents=True, exist_ok=True)`` that survives stale SMB metadata.
+
+    Right after HACS deletes and re-extracts the integration directory, the Windows SMB
+    client can keep serving the old directory entry for a moment: ``os.mkdir`` fails
+    with "already exists" while ``is_dir()`` still answers False, so ``exist_ok`` does
+    not swallow it. Re-checking after a short pause sees the real directory.
+    """
+    for attempt in range(attempts):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return
+        except FileExistsError:
+            if path.is_dir():
+                return
+            if attempt == attempts - 1:
+                raise
+            log("    mkdir {0}: exists-but-not-a-directory (stale SMB view?), retrying in {1}s"
+                .format(path, delay))
+            time.sleep(delay)
+
+
 def mirror(source, target, label):
     """Mirror ``source`` onto ``target``, then SHA256-verify every file.
 
@@ -217,10 +239,18 @@ def mirror(source, target, label):
     target.mkdir(parents=True, exist_ok=True)
     for rel in to_copy:
         dst = target / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
+        _mkdir_tolerant(dst.parent)
         shutil.copy2(src_files[rel], dst)
     for rel in to_delete:
-        (target / rel).unlink(missing_ok=True)
+        stale = target / rel
+        if stale.is_dir():
+            # Seen right after a HACS re-extract over SMB: the Windows client's directory
+            # cache reported the fresh ``profiles`` directory as a file, so it landed in
+            # the stale list. Deleting a directory here is never right - the copy loop
+            # above populates it, and the verification pass below reports anything left.
+            log("    skipping stale entry that is a directory: {0}".format(rel))
+            continue
+        stale.unlink(missing_ok=True)
     for cache in caches:
         shutil.rmtree(cache, ignore_errors=True)
 
