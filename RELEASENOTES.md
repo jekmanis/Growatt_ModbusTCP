@@ -4,6 +4,29 @@
 
 ---
 
+## Fork: merged upstream v2.0.6 (2026-11-01)
+
+Upstream v1.9.7-v2.0.6 merged on top of the fork; everything upstream shipped is in the
+sections below. Fork-specific effects of the merge:
+
+- **`set_wit_mode`, its schema and the Inverter Mode sensor are unchanged**, and none of
+  the seven entities the battery optimizer reads is renamed or removed.
+- **`set_battery_mode` gains upstream's `release` mode.** `preserve_soc` is still accepted
+  as an alias for `hold`.
+- **Service errors now show their message instead of "Unknown error"**, `set_wit_mode`'s
+  included. An automation that only checks whether the call failed is unaffected.
+- **New switch: Inverter Power** (upstream), disabled by default, next to the fork's Grid
+  Export and Battery Optimizer switches.
+- **WIT entity changes on upgrade**, both decided upstream:
+  `sensor.growatt_dry_contact_state` is removed (its register exists only on MIN TL-X),
+  and `sensor.growatt_battery_battery_state_of_health` becomes
+  `sensor.growatt_battery_battery_state_of_health_vpp`. Update dashboards that use either.
+- **Device identification stays off the poll path** and now also reads upstream's firmware
+  build string (holding 82-87), with the same one-time, short-timeout rules as the other
+  identification reads.
+
+---
+
 ## Fork: rebased on upstream v1.8.14 (2026-09-02)
 
 This is the [jekmanis](https://github.com/jekmanis) fork of
