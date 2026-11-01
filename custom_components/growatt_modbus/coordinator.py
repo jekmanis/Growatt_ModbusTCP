@@ -37,6 +37,7 @@ from .const import (
     DEVICE_TYPE_LOAD,
     DEVICE_TYPE_BATTERY,
     DEVICE_TYPE_BACKUPBOX,
+    device_identifier,
     SHARED_LOCK_TIMEOUT,
     DEFAULT_INTER_SLAVE_DELAY_MS,
     WIT_MODE_DISPLAY_NAMES,
@@ -2766,7 +2767,7 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
 
         Returns the fragment to splat into a DeviceInfo dict.
         """
-        identifier = (DOMAIN, f"{entry_id}_inverter")
+        identifier = device_identifier(entry_id, DEVICE_TYPE_INVERTER)
 
         from homeassistant.helpers import device_registry as dr
 
@@ -2813,7 +2814,7 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         # Main inverter device (parent)
         if device_type == DEVICE_TYPE_INVERTER:
             device_info = {
-                "identifiers": {(DOMAIN, f"{entry_id}_inverter")},
+                "identifiers": {device_identifier(entry_id, DEVICE_TYPE_INVERTER)},
                 "name": base_name,
                 "manufacturer": "Growatt",
                 "model": model,
@@ -2840,7 +2841,7 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
 
         if device_type == DEVICE_TYPE_SOLAR:
             return {
-                "identifiers": {(DOMAIN, f"{entry_id}_solar")},
+                "identifiers": {device_identifier(entry_id, DEVICE_TYPE_SOLAR)},
                 "name": f"{base_name} Solar",
                 "manufacturer": "Growatt",
                 "model": "Solar Production",
@@ -2849,7 +2850,7 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
 
         elif device_type == DEVICE_TYPE_GRID:
             return {
-                "identifiers": {(DOMAIN, f"{entry_id}_grid")},
+                "identifiers": {device_identifier(entry_id, DEVICE_TYPE_GRID)},
                 "name": f"{base_name} Grid",
                 "manufacturer": "Growatt",
                 "model": "Grid Connection",
@@ -2858,7 +2859,7 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
 
         elif device_type == DEVICE_TYPE_LOAD:
             return {
-                "identifiers": {(DOMAIN, f"{entry_id}_load")},
+                "identifiers": {device_identifier(entry_id, DEVICE_TYPE_LOAD)},
                 "name": f"{base_name} Load",
                 "manufacturer": "Growatt",
                 "model": "Load Management",
@@ -2867,7 +2868,7 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
 
         elif device_type == DEVICE_TYPE_BATTERY:
             return {
-                "identifiers": {(DOMAIN, f"{entry_id}_battery")},
+                "identifiers": {device_identifier(entry_id, DEVICE_TYPE_BATTERY)},
                 "name": f"{base_name} Battery",
                 "manufacturer": "Growatt",
                 "model": "Battery Storage",
@@ -2876,7 +2877,7 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
 
         elif device_type == DEVICE_TYPE_BACKUPBOX:
             return {
-                "identifiers": {(DOMAIN, f"{entry_id}_backup_box")},
+                "identifiers": {device_identifier(entry_id, DEVICE_TYPE_BACKUPBOX)},
                 "name": f"{base_name} Backup Box",
                 "manufacturer": "Growatt",
                 # V1.39 calls 3250-3342 the "Backup box"; VPP 30115 names it "SYN". It

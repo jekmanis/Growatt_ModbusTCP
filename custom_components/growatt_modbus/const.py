@@ -1175,6 +1175,29 @@ DEVICE_TYPE_LOAD = "load"
 DEVICE_TYPE_BATTERY = "battery"
 DEVICE_TYPE_BACKUPBOX = "backup_box"
 
+# Every device type coordinator.get_device_info() builds a device for. The device-removal
+# hook (device_removal.py) treats exactly these identifiers as live, so a device type added
+# to get_device_info but not here would become deletable from the UI while in use.
+# tests/test_device_removal.py holds the two together.
+ALL_DEVICE_TYPES = (
+    DEVICE_TYPE_INVERTER,
+    DEVICE_TYPE_SOLAR,
+    DEVICE_TYPE_GRID,
+    DEVICE_TYPE_LOAD,
+    DEVICE_TYPE_BATTERY,
+    DEVICE_TYPE_BACKUPBOX,
+)
+
+
+def device_identifier(entry_id: str, device_type: str) -> tuple:
+    """The device-registry identifier for one of an entry's devices.
+
+    The single source for the format: get_device_info() builds DeviceInfo from it, and the
+    device-removal hook derives the set of live identifiers from it. Before device
+    structure v2 the parent used the bare entry_id; that format is no longer created.
+    """
+    return (DOMAIN, f"{entry_id}_{device_type}")
+
 # Sensor to Device Mapping
 # Each sensor is assigned to a logical device for better organization
 SENSOR_DEVICE_MAP = {

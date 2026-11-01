@@ -22,6 +22,7 @@ from .const import (
     WRITABLE_REGISTERS,
     CONF_REGISTER_MAP,
     DEVICE_TYPE_INVERTER,
+    device_identifier,
     get_device_type_for_control,
     hold_tou_periods,
     is_read_only_register,
@@ -1163,7 +1164,7 @@ class GrowattWitModePresetSelect(GrowattEntity, SelectEntity):
         from homeassistant.helpers import device_registry as dr
         device_reg = dr.async_get(self.hass)
         entry_id = self._config_entry.entry_id
-        inverter_identifier = (DOMAIN, f"{entry_id}_inverter")
+        inverter_identifier = device_identifier(entry_id, DEVICE_TYPE_INVERTER)
 
         device_entry = device_reg.async_get_device(identifiers={inverter_identifier})
         if device_entry is None:

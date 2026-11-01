@@ -32,6 +32,9 @@ from .const import (
 )
 from .coordinator import GrowattConfigEntry, GrowattModbusCoordinator
 from .device_profiles import get_profile
+# Re-exported, not just imported: Home Assistant offers "Delete" on a device only when the
+# integration module defines this hook. It refuses anything still in use; see the module.
+from .device_removal import async_remove_config_entry_device  # noqa: F401
 from .diagnostic import async_setup_services
 from .growatt_modbus import SharedModbusConnection
 

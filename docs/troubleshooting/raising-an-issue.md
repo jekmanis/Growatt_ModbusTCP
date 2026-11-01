@@ -102,6 +102,12 @@ SOC-limit writes on ALBA13 and accepted them after Growatt updated it to ALBA18
 
 Attach a register scan (see above) and tell us the **exact model from the inverter's label**, not the marketing name. If you know your DTC code, say so — it's in the diagnostics file and in the scan.
 
+### A leftover Growatt device has no entities and can't be deleted
+
+Older versions registered the inverter under a different identifier, so an upgraded install can show an extra, empty Growatt device. Open it under **Settings → Devices & services → Devices**, then **⋮ → Delete**. No issue needed.
+
+The integration only allows deleting devices it no longer creates. The Inverter, Solar, Grid, Load, Battery and Backup Box devices, and any device with a working entity, are refused. If a deletion is rejected on a device you think is stale, the reason is logged at info level under `custom_components.growatt_modbus.device_removal`.
+
 ---
 
 ## Things that genuinely help

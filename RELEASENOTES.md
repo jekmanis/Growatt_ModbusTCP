@@ -24,6 +24,10 @@ sections below. Fork-specific effects of the merge:
 - **Device identification stays off the poll path** and now also reads upstream's firmware
   build string (holding 82-87), with the same one-time, short-timeout rules as the other
   identification reads.
+- **Leftover devices can now be deleted.** An empty Growatt device left over from the
+  pre-v2 device layout can be removed with **Delete** on its device page. Devices the
+  integration still creates, or that have working entities, are refused
+  ([how](docs/troubleshooting/raising-an-issue.md#a-leftover-growatt-device-has-no-entities-and-cant-be-deleted)).
 
 ---
 
