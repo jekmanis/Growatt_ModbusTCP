@@ -21,12 +21,16 @@
         "data": {
           "host": "IP Address",
           "port": "Port",
-          "slave_id": "Modbus Slave ID"
+          "slave_id": "Modbus Slave ID",
+          "add_anyway": "Add anyway, without a connection test",
+          "gateway_type": "Connection hardware"
         },
         "data_description": {
           "host": "IP address of your RS485-to-TCP converter",
           "port": "Modbus TCP port (usually 502)",
-          "slave_id": "Inverter Modbus address (usually 1)"
+          "slave_id": "Inverter Modbus address (usually 1)",
+          "add_anyway": "Adds the inverter even though it did not answer. Use this if it is offline for now, or if it is not supported yet and you need the register scanner to produce a scan.",
+          "gateway_type": "Sets starting values for the polling settings below. Pick a Growatt dongle if you use one - they need slower, smaller reads to stay connected."
         }
       },
       "serial": {
@@ -51,6 +55,13 @@
         },
         "data_description": {
           "has_offgrid": "Enable this ONLY if you have an SPF series off-grid inverter. Off-Grid inverters use a different protocol and will reset if VPP registers are accessed."
+        }
+      },
+      "manual": {
+        "title": "Select your inverter model",
+        "description": "Could not reach the inverter, so nothing has been detected. **Choose the profile yourself below.** Every entity will stay unavailable until the inverter answers - if it never does, nothing here will work, and the likeliest causes are a wrong address or port, an adapter that is not powered, or a device that does not speak Modbus TCP at all.",
+        "data": {
+          "inverter_series": "Inverter model"
         }
       }
     },
@@ -84,8 +95,11 @@
           "baudrate": "Baud Rate",
           "host": "Host / IP Address",
           "port": "TCP Port",
+          "slave_id": "Unit / Slave ID",
           "max_block_size": "Max Register Block Size",
-          "protocol_variant": "Protocol Variant"
+          "protocol_variant": "Protocol Variant",
+          "gateway_type": "Connection hardware",
+          "clock_drift_threshold_min": "Clock Drift Warning (minutes)"
         },
         "data_description": {
           "device_name": "Friendly name for the device (appears before all sensor names)",
@@ -101,7 +115,10 @@
           "manual_path": "Overrides the selection above. Use this if the adapter is not listed, or to paste a /dev/serial/by-id/ path.",
           "host": "IP address or hostname of the RS485-to-TCP gateway.",
           "max_block_size": "Registers requested per Modbus read. Auto lets the profile decide. Lower this if entities are unavailable or stuck at zero and the log shows short reads or \"Unable to decode request\" - some RS485 gateways truncate large responses.",
-          "protocol_variant": "Ten inverter families exist as two register maps - a V1.39 legacy one and a VPP V2.01 one. Auto uses whatever auto-detection concluded at setup and is right for almost everyone. Change it only if sensors that should work are reporting nothing: an inverter without VPP support on the V2.01 map cannot read the 30000/31000 range, and the reverse leaves the VPP sensors empty."
+          "protocol_variant": "Ten inverter families exist as two register maps - a V1.39 legacy one and a VPP V2.01 one. Auto uses whatever auto-detection concluded at setup and is right for almost everyone. Change it only if sensors that should work are reporting nothing: an inverter without VPP support on the V2.01 map cannot read the 30000/31000 range, and the reverse leaves the VPP sensors empty.",
+          "slave_id": "Modbus unit ID the inverter answers on. Usually 1. If every reading is unavailable and the log shows transport errors, this is worth checking with a standalone Modbus client - some inverters ignore the address configured in ShineTools and only answer on 1.",
+          "gateway_type": "Changing this re-applies that hardware's suggested scan interval, timeout, request delay and block size. Anything you edit in the same save is kept.",
+          "clock_drift_threshold_min": "Warn when the inverter's clock differs from Home Assistant by more than this. Set to 0 to turn the notice off - useful when a datalogger enforces a fixed UTC offset that a sync cannot hold."
         }
       }
     },
@@ -125,6 +142,10 @@
     "profile_mismatch": {
       "title": "Growatt: this inverter may be on the wrong profile",
       "description": "Your inverter reports device type code **{dtc}** ({model}), which indicates the **{suggested}** profile. The integration is currently using **{configured}**.\n\n**Nothing has been changed, and your setup is working.** The profile in use creates **{configured_count} sensors**; the one your device type code indicates creates **{suggested_count}**. Compare that against your device page before deciding - if you are not missing anything you care about, there is nothing here you need to do.\n\nMost often this follows a failed read during setup, where a single timed-out request left detection falling back to a best guess. It can also happen because one device type code covers several models, in which case the profile named here may be a sibling of yours rather than a better fit.\n\n**To change it:** Settings → Devices & services → Growatt Modbus → Configure, and select **{suggested}**. Your entity IDs are preserved, so automations, dashboards and history carry over.\n\nIf the current profile is deliberate, or the suggested one behaves worse, please say so on GitHub - the device type code mapping may be wrong for your model and that is worth knowing."
+    },
+    "unit_id_never_responded": {
+      "title": "Growatt: no response since setup - check the Modbus unit ID",
+      "description": "This integration has made **{attempts}** attempts to read from **{target}** at unit ID **{slave_id}** and has never had a single successful response since it was set up.\n\nAn entry that worked and then stopped usually means the inverter is asleep or unreachable. One that has *never* worked more often means a setting does not match the hardware, and the **unit ID (slave ID)** is the setting that gives no clue when it is wrong - every read simply times out, which looks identical to a dead connection.\n\n**Worth checking, in order:**\n\n1. **Which unit ID the inverter actually answers on.** Point a standalone Modbus client (QModMaster, modpoll) at the same address and try unit IDs 1 to 8. Most Growatt inverters answer on **1**.\n2. **Do not trust the address configured in ShineTools.** On at least one WIT (firmware 5050) the EMS COM address was set to 2 and the port went on answering only on 1.\n3. The host, port or serial device path, and that the gateway or adapter is powered and reachable.\n\n4. **Another integration or program holding the same serial adapter.** A USB RS485 adapter can only be opened by one program at a time. If a second Growatt integration is installed and working on that adapter, this one will never read anything - and the symptom is identical to a wrong unit ID. Disable or remove the other one, then reload this entry.\n\nThe unit ID can now be corrected in **Configure** without deleting the entry, so your entity IDs, automations, dashboards and statistics history are kept.\n\nThis notice clears itself as soon as any read succeeds."
     }
   },
   "entity": {
@@ -197,6 +218,18 @@
       },
       "ac_voltage_tr": {
         "name": "AC Voltage TR"
+      },
+      "battery1_charge_energy_today": {
+        "name": "Battery 1 Charge Today"
+      },
+      "battery1_charge_energy_total": {
+        "name": "Battery 1 Charge Total"
+      },
+      "battery1_discharge_energy_today": {
+        "name": "Battery 1 Discharge Today"
+      },
+      "battery1_discharge_energy_total": {
+        "name": "Battery 1 Discharge Total"
       },
       "battery2_charge_energy_today": {
         "name": "Battery 2 Charge Today"
@@ -316,7 +349,25 @@
         "name": "Battery SOC"
       },
       "battery_soh": {
-        "name": "Battery State of Health"
+        "name": "Battery State of Health (VPP)"
+      },
+      "battery_cluster_sum": {
+        "name": "Battery Clusters"
+      },
+      "battery_working_status": {
+        "name": "Battery Working Status"
+      },
+      "battery_module_number": {
+        "name": "Battery Modules per Cluster"
+      },
+      "battery_module_rated_voltage": {
+        "name": "Battery Module Rated Voltage"
+      },
+      "battery_module_rated_capacity": {
+        "name": "Battery Module Rated Capacity"
+      },
+      "battery2_full_charge_capacity": {
+        "name": "Battery 2 Full Charge Capacity"
       },
       "battery_temp": {
         "name": "Battery Temperature"
@@ -359,6 +410,12 @@
       },
       "bms_soh": {
         "name": "Battery State of Health"
+      },
+      "bms_gauge_rm": {
+        "name": "Battery Remaining Capacity"
+      },
+      "bms_gauge_fcc": {
+        "name": "Battery Full Charge Capacity"
       },
       "bms_status": {
         "name": "BMS Status"
@@ -665,11 +722,40 @@
       },
       "wit_mode_status": {
         "name": "Inverter Mode"
+      },
+      "ct_grid_import_l1": {
+        "name": "CT Grid Import L1"
+      },
+      "ct_grid_import_l2": {
+        "name": "CT Grid Import L2"
+      },
+      "ct_grid_export_l1": {
+        "name": "CT Grid Export L1"
+      },
+      "ct_grid_export_l2": {
+        "name": "CT Grid Export L2"
+      },
+      "inverter_to_load_l1": {
+        "name": "Inverter to Load L1"
+      },
+      "inverter_to_load_l2": {
+        "name": "Inverter to Load L2"
       }
     },
     "button": {
       "sync_inverter_clock": {
         "name": "Inverter Clock Sync"
+      },
+      "wake_apx_battery": {
+        "name": "Wake APX Battery"
+      }
+    },
+    "switch": {
+      "inverter_power": {
+        "name": "Inverter Power"
+      },
+      "ac_output": {
+        "name": "AC Output"
       }
     }
   }

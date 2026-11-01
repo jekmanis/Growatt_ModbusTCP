@@ -36,6 +36,18 @@ WARNING - ✗ DTC Detection - Unknown DTC code: 9999 (not in supported models)
 INFO - DTC and model name detection failed, trying register-based detection...
 ```
 
+!!! note "A DTC of 0 is not an unknown code"
+    "Unknown DTC code" names a value your inverter actually reported. A register that
+    answers **0** has given no answer at all, and says nothing about whether your model is
+    supported.
+
+    Until v2.0.4-b23 the profile re-check below passed a zero straight through, so owners of
+    fully supported inverters saw `✗ DTC Detection - Unknown DTC code: 0 (not in supported
+    models)` once after every restart, with no way to clear it
+    ([#449](https://github.com/0xAHA/Growatt_ModbusTCP/issues/449)). It is now logged at
+    debug. On an older version the message is harmless: nothing was changed by it, and your
+    profile was never altered.
+
 ### The failures above are silent, and they are permanent
 
 All three leave detection falling back to register probing or model-name matching. That
@@ -62,7 +74,7 @@ that means the DTC mapping is wrong for your model, which is worth knowing.
 
 DTC codes are read from holding register 30000 (VPP models) or register 43 (legacy models). Each code maps to a specific profile.
 
-Model names below follow Growatt VPP 2.03 protocol documentation, Table 3-1.
+Model names below follow Growatt VPP protocol documentation, Table 3-1, as of V2.05.
 
 ### Reading the Status column
 
@@ -94,6 +106,15 @@ These statuses live in `DTC_REGISTRY` in `auto_detection.py`, which is the singl
 | 3401 | SPF 3000-6000 ES PLUS (variant) | spf_3000_6000_es_plus | ⚠️ Unconfirmed |
 | 3402 | SPF 3000-6000 ES PLUS (variant) | spf_3000_6000_es_plus | ⚠️ Unconfirmed |
 | 3403 | SPF 3000-6000 ES PLUS (variant) | spf_3000_6000_es_plus | ⚠️ Unconfirmed |
+| 20105 | SPF 5000 ES | spf_3000_6000_es_plus | ✅ Confirmed (scan [#444](https://github.com/0xAHA/Growatt_ModbusTCP/issues/444)) |
+
+!!! note "20105 is not in the 034xx block"
+
+    The SPF 5000 ES reports its DTC at **holding register 43**, and the value is nowhere
+    near the 3400-3403 range the other off-grid models use. The off-grid detection reads
+    input 44 first, accepts only 3400-3403 there, and falls through to holding 43 - which
+    is how this one is found. If your off-grid scan reports an unknown DTC from holding 43,
+    that is worth reporting: the code itself is all that is needed to add the model.
 
 ### SPH / SPA Series — Single-Phase Hybrid
 
@@ -101,7 +122,7 @@ These statuses live in `DTC_REGISTRY` in `auto_detection.py`, which is the singl
 
 | DTC Code | Model Series | Profile | Status |
 |----------|-------------|---------|--------|
-| 3501 | SPH 3000-6000TL BL | sph_3000_6000_v201 | ⚠️ Unconfirmed |
+| 3501 | SPH 3000-6000TL BL | sph_3000_6000_v201 | ✅ Confirmed (SPH6000, #470) |
 | 3502 | SPH 3000-6000TL BL-UP | sph_3000_6000_v201 | ✅ Confirmed (#337) |
 | 3503 | SPH 3000-6000TL HU | sph_3000_6000_v201 | ⚠️ Unconfirmed |
 | 3504 | SPH 3000-6000TL HUB | sph_3000_6000_v201 | ✅ Confirmed (#286) |
@@ -111,7 +132,12 @@ These statuses live in `DTC_REGISTRY` in `auto_detection.py`, which is the singl
 | 3716 | SPA 3000-6000TL AUB | sph_3000_6000_v201 | ⚠️ Unconfirmed — SPH profile on SPA hardware |
 | 3725 | SPA 4-10KTL3 BH-UP | spa_tl3_4000_10000_v201 | ✅ Confirmed — register layout verified on hardware |
 | 3735 | SPA 3000TL BL-UP | sph_3000_6000_v201 | ⚠️ Unconfirmed — SPH profile on SPA hardware |
+| 21100 | SPH/SPM 8000-10000TL-HU (US) | sph_8000_10000_hu | ✅ Confirmed (SPH-10000-US UL2.21, PR #418) |
 | 21303 | SPH/SPM 8000-10000TL-HU | sph_8000_10000_hu | ✅ Confirmed (scan #303) |
+| 21304 | SPM 3000-6000TL-HU | sph_8000_10000_hu | ✅ Confirmed (SPM 6000TL-HU UL2.61, #463) |
+| 21305 | SPM 3000-6000TL-HU(BR) | sph_8000_10000_hu | ⚠️ Unconfirmed — regional variant of 21304 |
+| 21308 | SPM 3000-6000TL-HU(IT) | sph_8000_10000_hu | ⚠️ Unconfirmed — regional variant of 21304 |
+| 21309 | SPM 2500-6000TL-HU(EU) | sph_8000_10000_hu | ⚠️ Unconfirmed — regional variant of 21304 |
 
 ### SPE Series — Single-Phase Hybrid (SPF protocol, 8-12 kW)
 
@@ -126,6 +152,14 @@ These statuses live in `DTC_REGISTRY` in `auto_detection.py`, which is the singl
 | 5100 | MIN 2500-6000TL-XH/XH2/XHE/XA | tl_xh_3000_10000_v201 | ✅ Confirmed (#71) |
 | 5200 | MIC 600-3300TL-X/X2/X2(Pro); MIN 2500-6000TL-X/X2/X2(Pro)/X2(Pro.E) | min_3000_6000_tl_x_v201 | ⚠️ Unconfirmed — refined at runtime by per-MPPT energy check |
 | 5201 | MIN 7-10KTL-X/X2/X2(E) | min_7000_10000_tl_x_v201 | ✅ Confirmed (MIN 10000TL-X, DTC from legacy holding 43) |
+
+**5100 is shared, and the XH2 needs its own profile.** The second-generation TL-XH2 answers
+**only** the VPP ranges (30000+ / 31000+); every legacy range, including the 3000 block the
+default profile reads, is silent. Detection cannot tell the generations apart, so on an XH2
+choose **MIN TL-XH2 3000-10000** by hand. The profile check recognises it and MIN TL-XH
+3000-10000 as correct for 5100, and will not tell you to switch
+([#361](https://github.com/0xAHA/Growatt_ModbusTCP/issues/361),
+[#461](https://github.com/0xAHA/Growatt_ModbusTCP/issues/461)).
 
 ### MOD / MID / MAC Series — Three-Phase Hybrid / Grid-Tied
 
@@ -154,9 +188,11 @@ These statuses live in `DTC_REGISTRY` in `auto_detection.py`, which is the singl
 |----------|-------------|---------|--------|
 | 5601 | WIT 29.9-50K-XHU | wit_29900_50000tl3_xhu | ✅ Confirmed (scan #338) |
 | 5600 | WIS 100K-AM; WIT 50-100K-H/HE/HU/A/AE/AU (incl. -US); WIT 28-55K-H/HE/HU/A/AE/AU-US L2 | wit_29900_50000tl3_xhu | ⚠️ Unconfirmed — interim; VPP 31200+ not available on 100K-HU ([#349](https://github.com/0xAHA/Growatt_ModbusTCP/issues/349)) |
-| 5603 | WIT 4-15kW | wit_4000_15000tl3 | ✅ Confirmed (#335) |
-| 5800 | WIS 210K | mid_15000_25000tl3_x_v201 | ⚠️ Unconfirmed — uses MID profile |
-| 5801 | WIS 215K-AM | mid_15000_25000tl3_x_v201 | ⚠️ Unconfirmed — uses MID profile |
+| 5603 | WIT 4-15K-HU; WIT 17-25K-HU | wit_4000_15000tl3 | ✅ Confirmed (#335, #481) — 17-25K-HU not yet seen |
+| 5605 | WIT 4-25K-XHU | wit_4000_15000tl3 | ⚠️ Unconfirmed — grouped with 5603 in Table 3-1 |
+| 5604 | WIS 125K-AM | wit_29900_50000tl3_xhu | ⚠️ Unconfirmed — mapped like WIS 100K-AM (5600) |
+| 5800 | WIS 210K | mid_15000_25000tl3_x_v201 | ⚠️ Unconfirmed — uses MID profile; no longer in Table 3-1 |
+| 5801 | WIS 200-215K-AMA | mid_15000_25000tl3_x_v201 | ⚠️ Unconfirmed — uses MID profile |
 
 ## How to View Logs in Home Assistant
 

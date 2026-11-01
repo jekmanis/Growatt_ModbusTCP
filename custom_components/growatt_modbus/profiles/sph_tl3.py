@@ -4,7 +4,7 @@
 
 from .vpp_v201 import (
     VPP_V201_STATUS, VPP_V201_PV2_INPUT, VPP_V201_PV2_TOTAL,
-    VPP_V201_TEMPERATURE_1P, VPP_V201_BATTERY2, VPP_V201_HOLDING_1P,
+    VPP_V201_BATTERY2, VPP_V201_HOLDING_1P,
 )
 from .sph import STORAGE_AC_CHARGE_ENERGY
 
@@ -46,11 +46,57 @@ SPH_TL3_3000_10000 = {
         # AC Grid Frequency
         37: {'name': 'ac_frequency', 'scale': 0.01, 'unit': 'Hz'},
 
-        # Three-Phase AC Output - Phase R (with generic aliases for compatibility)
+        # Three-Phase AC Output, registers 38-49.
+        #
+        # CONFIRMED ODD on two SPH 10000 TL3 BH-UP units, and still mapped as the protocol
+        # describes them - the observation is settled, what to do about it is not.
+        #
+        # #442 measured this block against the rest of one poll; #447, a different owner on
+        # a different site, confirms the same three things in a register scan at a quite
+        # different operating point:
+        #
+        #   1. The voltage is line-to-line, not phase. #442: 398-416 V. #447: 396-397 V while
+        #      the portal's DTSU666 meter showed 230.1 / 229.3 / 229.5 V per phase. The ratio
+        #      is sqrt(3). Registers 50/51/52, which V1.39 assigns to line-to-line, read 0.0
+        #      on both, so their real source on this hardware is VPP 31106-31108 (below).
+        #      Settled directly on #447: 38/42/46 read 404.4 / 408.0 / 391.3 V against
+        #      31106/31107/31108 at 404.8 / 407.8 / 391.1 V, same instant.
+        #   2. Only 40/41 is populated. 44/45 and 48/49 read a flat zero on both inverters,
+        #      at idle and at 5.5 kW.
+        #   3. So the three per-phase power ENTITIES are not readings at all: with S and T
+        #      empty, the V x I fallback below synthesises all three - from a line-to-line
+        #      voltage, which is why they come out about sqrt(3) high.
+        #
+        # CORRECTED 2026-09-17. This block previously said the power registers were "the
+        # exact product of voltage and current, to the last digit" and therefore derived by
+        # the firmware. They are not: that agreement was OUR fallback, and @acsel91
+        # withdrew the observation once he had DEBUG on. The #447 figures quoted for it -
+        # 3128.4 / 3159.2 / 3178.4 W summing to 9466 W - are the fallback's output, not the
+        # inverter's. Anything reasoning from "the firmware computes these" is unfounded.
+        #
+        # NOT changed yet, deliberately. The fix is not a rename: dividing 38/42/46 by sqrt(3)
+        # would invent a phase voltage that is only exact on a perfectly balanced supply, and
+        # the power figures inherit the same error. Every SPH-TL3 owner sees these three
+        # entities, and a change to what they mean needs deciding once, properly, rather than
+        # folding into a release about something else. The line voltages, which had no source
+        # at all, are fixed now; this is the remaining half.
+        #
+        # See also #442 on the `signed` flag - the same registers, and the reason it was
+        # left alone there is this one.
+        # AC Power is the documented real output power, Pac (35/36, W). It used to read 40/41
+        # through an alias, which V1.39 documents as apparent power (VA) - and which on this
+        # firmware is the three-phase VA total, not phase R. Real power sits under it by a
+        # near-constant reactive part: ~1% at 3-7 kW, ~25% at 0.9 kW. 35/36 matched an
+        # independent wallbox meter to 0.4% across a 6.7 kW step (@acsel91), and a second
+        # SPH 10000 TL3 BH-UP read 35/36 = 5538.9 W against 40/41 = 5561.1 VA (#447).
+        35: {'name': 'ac_power_high', 'scale': 1, 'unit': '', 'pair': 36},
+        # Signed like the same pair on MOD/MID/WIT (#429): it goes negative when the inverter
+        # draws through its AC side.
+        36: {'name': 'ac_power_low', 'scale': 1, 'unit': '', 'pair': 35, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
         38: {'name': 'ac_voltage_r', 'scale': 0.1, 'unit': 'V', 'desc': 'Phase R voltage', 'alias': 'ac_voltage'},
         39: {'name': 'ac_current_r', 'scale': 0.1, 'unit': 'A', 'desc': 'Phase R current', 'alias': 'ac_current'},
-        40: {'name': 'ac_power_r_high', 'scale': 1, 'unit': '', 'pair': 41, 'alias': 'ac_power_high'},
-        41: {'name': 'ac_power_r_low', 'scale': 1, 'unit': '', 'pair': 40, 'combined_scale': 0.1, 'combined_unit': 'W', 'alias': 'ac_power_low'},
+        40: {'name': 'ac_power_r_high', 'scale': 1, 'unit': '', 'pair': 41},
+        41: {'name': 'ac_power_r_low', 'scale': 1, 'unit': '', 'pair': 40, 'combined_scale': 0.1, 'combined_unit': 'W'},
 
         # Three-Phase AC Output - Phase S
         42: {'name': 'ac_voltage_s', 'scale': 0.1, 'unit': 'V', 'desc': 'Phase S voltage'},
@@ -98,8 +144,8 @@ SPH_TL3_3000_10000 = {
         # device read 94 = 200 (20.0 °C) and 95 = 333 (33.3 °C) alongside 93 = 378
         # (37.8 °C), all three plausible and independent.
         #
-        # The VPP copies at 31130-31132 are mapped further down and read zero on that
-        # device, so the fallback was never going to populate these either.
+        # 31130-31132 were once mapped as VPP copies of these and read zero on that device;
+        # no protocol defines temperatures there, and they are no longer mapped.
         93: {'name': 'inverter_temp', 'scale': 0.1, 'unit': '°C', 'signed': True},
         94: {'name': 'ipm_temp', 'scale': 0.1, 'unit': '°C', 'signed': True,
              'desc': 'IPM (power module) temperature (confirmed #360 scan)'},
@@ -146,6 +192,53 @@ SPH_TL3_3000_10000 = {
         # _find_register_by_name() resolution order-dependent.
         1083: {'name': 'bms_status', 'scale': 1, 'unit': '', 'desc': 'Status from BMS'},
         1085: {'name': 'bms_error', 'scale': 1, 'unit': '', 'desc': 'Error information from BMS'},
+
+        # Gauge remaining / full-charge capacity. INPUT 1091-1092 - holding 1091/1092 in
+        # this same file are AC Charge Stop SOC and AC Charge Enable, which is the overlap
+        # this protocol is full of.
+        #
+        # 10 mAh per the ESS Protocol (0x001A/0x001B), so 0.01 Ah - and CONFIRMED against
+        # hardware, not just documented.
+        #
+        # The reporter runs 4x Growatt ARK 2.5H-A2 in series: 2.56 kWh at 51.2 V is 50.0 Ah
+        # per module, and series adds volts rather than amp-hours, so the pack is 50.0 Ah at
+        # 204.8 V = 10.24 kWh, matching his stated nameplate exactly.
+        #
+        # His raw 5250 at 0.01 Ah is 52.50 Ah, or 105% of the 50.0 Ah nameplate - what a
+        # gauge reports for a healthy pack against a conservatively rated module. The
+        # watt-hour reading this was checked against would have been 5.25 kWh, 51% of his
+        # pack, which is impossible at the 95% SOC the pair implies. Corroborated by his
+        # discharge measurement: 5170 W at 219.9 V is 23.5 A against a register reading of
+        # -25.10 A, and the module is rated 48 A (#403).
+        1091: {'name': 'bms_gauge_rm', 'scale': 0.01, 'unit': 'Ah',
+               'desc': 'BMS_GaugeRM - remaining capacity (ESS 0x001A, 10 mAh units)'},
+        1092: {'name': 'bms_gauge_fcc', 'scale': 0.01, 'unit': 'Ah',
+               'desc': 'BMS_GaugeFCC - full charge capacity (ESS 0x001B, 10 mAh units)'},
+
+        # Cell voltage extremes are NOT mapped here, and that is a measured decision.
+        #
+        # V1.39 documents input 1108/1109 as uwMaxCellVolt / uwMinCellVolt at 0.001 V, and
+        # they were mapped on that basis in v2.0.1-b2. The reporter who asked for them read
+        # raw 2272 and 1888 on an SPH-TL3 with 4x ARK 2.5H-A2 at 47% SOC - 2.272 V and
+        # 1.888 V per cell. A LiFePO4 cell at 47% sits near 3.25 V, and his own BMS app
+        # showed cells within 0.003 V of each other, so those two numbers are not this
+        # pack's cell voltages under any scale: no factor turns 2272 into 3250.
+        #
+        # 1094 (delta) reads 18260 on the same device, equally impossible for a figure the
+        # ESS protocol puts in cell-voltage units.
+        #
+        # The BMS block IS aligned on this hardware - 1088 was confirmed against a clamp
+        # meter at 0.01 A - so this is not an offset. These addresses simply do not carry
+        # what the document says on this battery.
+        #
+        # Removed rather than left in place: a mapped register that returns an implausible
+        # value publishes a wrong number, and a cell voltage of 1.9 V reads as a dying pack
+        # (#403).
+        #
+        # Note 1114/1115 DO look right on the same device - 23.8 C and 22.0 C at 0.1 C -
+        # so the block is not wholly unimplemented. They are not mapped yet either, for
+        # want of a second device.
+
         1095: {'name': 'bms_cycle_count', 'scale': 1, 'unit': '', 'desc': 'Cycle count from BMS'},
         1096: {'name': 'bms_soh', 'scale': 1, 'unit': '%', 'desc': 'SOH (State of Health) from BMS'},
         
@@ -154,10 +247,14 @@ SPH_TL3_3000_10000 = {
         # 1021: PactouserTotal  = AC power to user total (grid import, positive = importing)
         # 1029: Pactogrid total = AC power to grid total (grid export, positive = exporting)
         # 1037: PLocalLoad total = INV power to local load total
-        1015: {'name': 'power_to_user_high', 'scale': 1, 'unit': '', 'pair': 1016, 'desc': 'Power imported from grid HIGH (legacy register)'},
-        1016: {'name': 'power_to_user_low', 'scale': 1, 'unit': '', 'pair': 1015, 'combined_scale': 0.1, 'combined_unit': 'W'},
-        1021: {'name': 'power_to_user_total_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal = grid import)', 'maps_to': 'power_to_user'},
-        1022: {'name': 'power_to_user_total_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1015: {'name': 'power_to_user_r_high', 'scale': 1, 'unit': '', 'pair': 1016, 'desc': 'Power imported from grid HIGH (legacy register)'},
+        1016: {'name': 'power_to_user_r_low', 'scale': 1, 'unit': '', 'pair': 1015, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1017: {'name': 'power_to_user_s_high', 'scale': 1, 'unit': '', 'pair': 1018, 'desc': 'Grid import S phase HIGH (PactouserS)'},
+        1018: {'name': 'power_to_user_s_low', 'scale': 1, 'unit': '', 'pair': 1017, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1019: {'name': 'power_to_user_t_high', 'scale': 1, 'unit': '', 'pair': 1020, 'desc': 'Grid import T phase HIGH (PactouserT)'},
+        1020: {'name': 'power_to_user_t_low', 'scale': 1, 'unit': '', 'pair': 1019, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1021: {'name': 'power_to_user_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal = grid import)'},
+        1022: {'name': 'power_to_user_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
         1029: {'name': 'power_to_grid_high', 'scale': 1, 'unit': '', 'pair': 1030, 'desc': 'AC power to grid total H (Pactogrid total)'},
         1030: {'name': 'power_to_grid_low', 'scale': 1, 'unit': '', 'pair': 1029, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
         1037: {'name': 'power_to_load_high', 'scale': 1, 'unit': '', 'pair': 1038, 'desc': 'INV power to local load total H (PLocalLoad total)'},
@@ -203,8 +300,10 @@ SPH_TL3_3000_10000 = {
         1062: {'name': 'load_energy_total_high', 'scale': 1, 'unit': '', 'pair': 1063},
         1063: {'name': 'load_energy_total_low', 'scale': 1, 'unit': '', 'pair': 1062, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
-        # Dry Contact State (V1.39 input register — 0=Off, 1=On)
-        3119: {'name': 'dry_contact_state', 'scale': 1, 'unit': '', 'desc': 'Dry contact relay current state: 0=Off, 1=On'},
+        # NOT 3119 (Dry Contact State). It is in the 3000 input range, which SPH-TL3 does
+        # not implement: an SPH 8000TL3 BH-UP answers Illegal Function there on every poll
+        # (#467) and a DTC 3601 scan shows the whole 3000-3124 range silent, 3119 included
+        # (#210). Mapping it made every poll request 3000-3119 to fetch one register.
     },
     'holding_registers': {
         0: {'name': 'on_off', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': '0=Off, 1=On'},
@@ -293,56 +392,60 @@ SPH_TL3_3000_10000 = {
         # -----------------------------------------------------------------------
         # Battery First mode scheduling windows — slots 4–6 (registers 1017–1025)
         # These control WHEN the inverter applies Battery First priority.
-        # Register naming confirmed via SPH_3000-6000TL-HUB manual:
-        #   1021 = "Bat First Stop Time 5", 1022 = "BatFirst on/off Switch 5"
+        # Slots 4-6 (see sph.py) start at 1018, not the 1017 that Protocol V1.39 and the SPH-HUB manual
+        # print. Set in the app with marker times on an SPH3600 (firmware RAAa919486), each
+        # start/end landed one register later, and enabling Battery First 4 / Grid First 4
+        # changed only 1020 / 1029; 1017 stayed 0 (#484). The document's own table ends with
+        # a stray second 'Bat First Start Time 4' at 1035, the mark of a table numbered one
+        # off. Writing Battery First 5 and Grid First 6 from Home Assistant on b12 changed
+        # exactly their three registers each, read back in the app (#484).
         # Note: these are HOLDING registers; input registers 1021/1022/1029/1030
         # (power_to_user_total / power_to_grid) are in a separate address space.
         # -----------------------------------------------------------------------
-        1017: {'name': 'batt_first_time_period_4_start', 'scale': 1, 'unit': '', 'access': 'RW',
+        1018: {'name': 'batt_first_time_period_4_start', 'scale': 1, 'unit': '', 'access': 'RW',
                'desc': 'Battery First slot 4 start (hex-packed: hours*256+minutes, e.g. 06:00 = 1536)'},
-        1018: {'name': 'batt_first_time_period_4_end', 'scale': 1, 'unit': '', 'access': 'RW',
+        1019: {'name': 'batt_first_time_period_4_end', 'scale': 1, 'unit': '', 'access': 'RW',
                'desc': 'Battery First slot 4 end (hex-packed: hours*256+minutes)'},
-        1019: {'name': 'batt_first_time_period_4_enable', 'scale': 1, 'unit': '', 'access': 'RW',
+        1020: {'name': 'batt_first_time_period_4_enable', 'scale': 1, 'unit': '', 'access': 'RW',
                'values': {0: 'Disabled', 1: 'Enabled'},
                'desc': 'Enable Battery First slot 4'},
-        1020: {'name': 'batt_first_time_period_5_start', 'scale': 1, 'unit': '', 'access': 'RW',
+        1021: {'name': 'batt_first_time_period_5_start', 'scale': 1, 'unit': '', 'access': 'RW',
                'desc': 'Battery First slot 5 start (hex-packed: hours*256+minutes)'},
-        1021: {'name': 'batt_first_time_period_5_end', 'scale': 1, 'unit': '', 'access': 'RW',
+        1022: {'name': 'batt_first_time_period_5_end', 'scale': 1, 'unit': '', 'access': 'RW',
                'desc': 'Battery First slot 5 end (hex-packed: hours*256+minutes)'},
-        1022: {'name': 'batt_first_time_period_5_enable', 'scale': 1, 'unit': '', 'access': 'RW',
+        1023: {'name': 'batt_first_time_period_5_enable', 'scale': 1, 'unit': '', 'access': 'RW',
                'values': {0: 'Disabled', 1: 'Enabled'},
                'desc': 'Enable Battery First slot 5'},
-        1023: {'name': 'batt_first_time_period_6_start', 'scale': 1, 'unit': '', 'access': 'RW',
+        1024: {'name': 'batt_first_time_period_6_start', 'scale': 1, 'unit': '', 'access': 'RW',
                'desc': 'Battery First slot 6 start (hex-packed: hours*256+minutes)'},
-        1024: {'name': 'batt_first_time_period_6_end', 'scale': 1, 'unit': '', 'access': 'RW',
+        1025: {'name': 'batt_first_time_period_6_end', 'scale': 1, 'unit': '', 'access': 'RW',
                'desc': 'Battery First slot 6 end (hex-packed: hours*256+minutes)'},
-        1025: {'name': 'batt_first_time_period_6_enable', 'scale': 1, 'unit': '', 'access': 'RW',
+        1026: {'name': 'batt_first_time_period_6_enable', 'scale': 1, 'unit': '', 'access': 'RW',
                'values': {0: 'Disabled', 1: 'Enabled'},
                'desc': 'Enable Battery First slot 6'},
 
         # -----------------------------------------------------------------------
-        # Grid First mode scheduling windows — slots 4–6 (registers 1026–1034)
-        # 1029 = "Grid First Start Time 5", 1030 = "Grid First Stop Time 5" (confirmed via manual)
+        # Grid First mode scheduling windows — slots 4–6 (registers 1027–1035, #484)
         # -----------------------------------------------------------------------
-        1026: {'name': 'grid_first_time_period_4_start', 'scale': 1, 'unit': '', 'access': 'RW',
+        1027: {'name': 'grid_first_time_period_4_start', 'scale': 1, 'unit': '', 'access': 'RW',
                'desc': 'Grid First slot 4 start (hex-packed: hours*256+minutes)'},
-        1027: {'name': 'grid_first_time_period_4_end', 'scale': 1, 'unit': '', 'access': 'RW',
+        1028: {'name': 'grid_first_time_period_4_end', 'scale': 1, 'unit': '', 'access': 'RW',
                'desc': 'Grid First slot 4 end (hex-packed: hours*256+minutes)'},
-        1028: {'name': 'grid_first_time_period_4_enable', 'scale': 1, 'unit': '', 'access': 'RW',
+        1029: {'name': 'grid_first_time_period_4_enable', 'scale': 1, 'unit': '', 'access': 'RW',
                'values': {0: 'Disabled', 1: 'Enabled'},
                'desc': 'Enable Grid First slot 4'},
-        1029: {'name': 'grid_first_time_period_5_start', 'scale': 1, 'unit': '', 'access': 'RW',
+        1030: {'name': 'grid_first_time_period_5_start', 'scale': 1, 'unit': '', 'access': 'RW',
                'desc': 'Grid First slot 5 start (hex-packed: hours*256+minutes)'},
-        1030: {'name': 'grid_first_time_period_5_end', 'scale': 1, 'unit': '', 'access': 'RW',
+        1031: {'name': 'grid_first_time_period_5_end', 'scale': 1, 'unit': '', 'access': 'RW',
                'desc': 'Grid First slot 5 end (hex-packed: hours*256+minutes)'},
-        1031: {'name': 'grid_first_time_period_5_enable', 'scale': 1, 'unit': '', 'access': 'RW',
+        1032: {'name': 'grid_first_time_period_5_enable', 'scale': 1, 'unit': '', 'access': 'RW',
                'values': {0: 'Disabled', 1: 'Enabled'},
                'desc': 'Enable Grid First slot 5'},
-        1032: {'name': 'grid_first_time_period_6_start', 'scale': 1, 'unit': '', 'access': 'RW',
+        1033: {'name': 'grid_first_time_period_6_start', 'scale': 1, 'unit': '', 'access': 'RW',
                'desc': 'Grid First slot 6 start (hex-packed: hours*256+minutes)'},
-        1033: {'name': 'grid_first_time_period_6_end', 'scale': 1, 'unit': '', 'access': 'RW',
+        1034: {'name': 'grid_first_time_period_6_end', 'scale': 1, 'unit': '', 'access': 'RW',
                'desc': 'Grid First slot 6 end (hex-packed: hours*256+minutes)'},
-        1034: {'name': 'grid_first_time_period_6_enable', 'scale': 1, 'unit': '', 'access': 'RW',
+        1035: {'name': 'grid_first_time_period_6_enable', 'scale': 1, 'unit': '', 'access': 'RW',
                'values': {0: 'Disabled', 1: 'Enabled'},
                'desc': 'Enable Grid First slot 6'},
 
@@ -395,6 +498,15 @@ SPH_TL3_3000_10000_V201 = {
     'name': 'SPH-TL3 Series 3-10kW (V2.01)',
     'description': 'Three-phase hybrid inverter with battery storage (3-10kW) and VPP Protocol V2.01',
     'notes': 'Combines legacy (0-124, 1000-1124 range) with V2.01 (30000+ range). Overlapping values served at both addresses.',
+    # Reg 53/54 = system AC output incl. battery discharge; use the per-MPPT DC sum instead.
+    #
+    # Carried on the base variant since #307 and lost here, because a _V201 variant merges
+    # `input_registers` from its base but writes its own top-level keys - so a flag added to
+    # the base is silently dropped unless it is repeated. The per-MPPT registers themselves
+    # came through the merge, so everything the flag needs was present and only the flag was
+    # missing: solar energy today rose overnight in step with battery discharge, which is
+    # #307 reappearing on the profile that `protocol_variant: auto` selects by default (#441).
+    'use_mppt_energy_today': True,
     'input_registers': {
         # === Legacy REGISTERS (0-124, 1000-1124 ranges) ===
         **SPH_TL3_3000_10000['input_registers'],
@@ -411,11 +523,41 @@ SPH_TL3_3000_10000_V201 = {
         # SPH-TL3 is a 2-string profile at VPP level.
         **VPP_V201_PV2_TOTAL,
 
-        # Three-Phase AC Output
-        31100: {'name': 'ac_voltage_r_vpp', 'scale': 0.1, 'unit': 'V', 'maps_to': 'ac_voltage_r'},
-        31101: {'name': 'ac_voltage_s_vpp', 'scale': 0.1, 'unit': 'V', 'maps_to': 'ac_voltage_s'},
-        31102: {'name': 'ac_voltage_t_vpp', 'scale': 0.1, 'unit': 'V', 'maps_to': 'ac_voltage_t'},
-        31103: {'name': 'ac_frequency_vpp', 'scale': 0.01, 'unit': 'Hz', 'maps_to': 'ac_frequency'},
+        # Grid AC block, 31100-31111 - laid out per the VPP input table (#447).
+        #
+        # This used to map 31100/31101/31102 as phase R/S/T voltage and 31103 as frequency.
+        # The VPP table gives 31100-31101 as Active power (INT32), 31102-31103 as Reactive
+        # power (INT32), 31104 reserved, 31105 Grid frequency, and 31106-31108 as the three
+        # line voltages. An SPH 10000 TL3 BH-UP scan agrees with the table and not with the
+        # old map: 31100/31101 = 0/55417 (5541.7 W, the inverter's output at the time),
+        # 31105 = 5001 (50.01 Hz), 31106-31108 = 3964/3971/3966.
+        #
+        # The old entries were never used - name lookup walks this dict in order, and the
+        # legacy 37/38/42/46 merged in above match `ac_frequency` and `ac_voltage_r/s/t`
+        # first - so removing them changes no published value. They are corrected rather than
+        # left because the next reader, or the next profile copied from this one, would have
+        # taken a power register for a voltage.
+        #
+        # No phase-voltage register exists in this block. Frequency keeps a documented
+        # fallback at 31105 for the same reason the old one existed.
+        31105: {'name': 'ac_frequency_vpp', 'scale': 0.01, 'unit': 'Hz', 'maps_to': 'ac_frequency',
+                'desc': 'Grid frequency (VPP input table, 0.01 Hz)'},
+
+        # Line voltages, 31106-31108 - the only source for AC Voltage RS/ST/TR on SPH-TL3.
+        #
+        # Named line_voltage_* because that is what the read path looks up to fill
+        # ac_voltage_rs/st/tr, exactly as on MID. Before this, nothing on either SPH-TL3
+        # profile carried those names, so the three sensors published their 0.0 default for
+        # ever - reported on #447, where the portal's meter showed 230 V per phase while
+        # Home Assistant showed 0. The V1.39 addresses for the same quantity, input 50-52,
+        # are not a substitute: they read 0.0 on two SPH 10000 TL3 BH-UP units on live
+        # grids (#442 checked with an ESPHome modbus_controller, #447 in a register scan).
+        31106: {'name': 'line_voltage_rs', 'scale': 0.1, 'unit': 'V',
+                'desc': 'AB line voltage (VPP input table); 396.4 V on #447'},
+        31107: {'name': 'line_voltage_st', 'scale': 0.1, 'unit': 'V',
+                'desc': 'BC line voltage (VPP input table); 397.1 V on #447'},
+        31108: {'name': 'line_voltage_tr', 'scale': 0.1, 'unit': 'V',
+                'desc': 'CA line voltage (VPP input table); 396.6 V on #447'},
 
         # Grid/Meter Power (maps to power_to_grid at 1029/1030)
         31112: {'name': 'meter_power_high', 'scale': 1, 'unit': '', 'pair': 31113, 'maps_to': 'power_to_grid'},
@@ -437,10 +579,6 @@ SPH_TL3_3000_10000_V201 = {
         31124: {'name': 'energy_to_grid_total_vpp_high', 'scale': 1, 'unit': '', 'pair': 31125, 'desc': 'Total power to grid HIGH (VPP, 0.1 kWh)'},
         31125: {'name': 'energy_to_grid_total_vpp_low', 'scale': 1, 'unit': '', 'pair': 31124, 'combined_scale': 0.1, 'combined_unit': 'kWh', 'desc': 'Total power to grid LOW'},
 
-        # Temperatures — VPP_V201_TEMPERATURE_1P (31130–31132)
-        # Confirmed responding on SPH-TL3 in scans 251_1 and 251_2.
-        **VPP_V201_TEMPERATURE_1P,
-
         # Battery Cluster 1 State (31200-31223)
         # Per VPP Protocol V2.01: 31200-31201 is signed battery power (positive=charge, negative=discharge)
         31200: {'name': 'battery_power_high', 'scale': 1, 'unit': '', 'pair': 31201},
@@ -451,7 +589,10 @@ SPH_TL3_3000_10000_V201 = {
         31214: {'name': 'battery_voltage_vpp', 'scale': 0.1, 'unit': 'V', 'maps_to': 'battery_voltage', 'signed': True},
         31217: {'name': 'battery_soc_vpp', 'scale': 1, 'unit': '%', 'maps_to': 'battery_soc'},
         31218: {'name': 'battery_soh', 'scale': 1, 'unit': '%', 'desc': 'Battery state of health'},
-        31222: {'name': 'battery_temp_vpp', 'scale': 0.1, 'unit': '°C', 'maps_to': 'battery_temp', 'signed': True},
+        31222: {'name': 'battery_gauge_rm_low', 'scale': 1, 'unit': '',
+                'desc': 'Low word of the reserved UINT32 at 31221 (battery remaining capacity, Ah) - NOT temperature (#440)'},
+        31223: {'name': 'battery_temp_vpp', 'scale': 0.1, 'unit': '°C', 'maps_to': 'battery_temp', 'signed': True,
+                'desc': 'Battery environmental temperature (VPP spec: INT16, 0.1C, range -400..1250)'},
 
         # Battery Cluster 2 — VPP_V201_BATTERY2 (31300–31303, 31314–31322)
         **VPP_V201_BATTERY2,

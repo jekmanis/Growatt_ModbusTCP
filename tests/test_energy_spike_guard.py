@@ -77,7 +77,19 @@ def _load_guard(logger):
 
     from datetime import datetime
 
-    namespace = {"_LOGGER": logger, "datetime": datetime}
+    # Module-level constants the method closes over. Read from the source rather than
+    # copied here, so a change to a threshold moves these tests with it instead of leaving
+    # them asserting against a number the shipped code no longer uses.
+    constants = {}
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id.isupper():
+                    constants[target.id] = node.value.value
+                elif isinstance(target, ast.Name) and target.id.startswith("_"):
+                    constants[target.id] = node.value.value
+
+    namespace = {"_LOGGER": logger, "datetime": datetime, **constants}
     exec(compile(ast.parse(body), "<guard>", "exec"), namespace)
     return namespace["_protect_energy_totals"]
 
@@ -90,6 +102,9 @@ class _Coordinator:
         self._pre_midnight_daily_totals: dict[str, float] = dict(pre_midnight or {})
         self._register_map_key = "spf_3000_6000_es_plus"
         self._spike_warned: set[str] = set()
+        self._backward_step_warned: set[str] = set()
+        self._daily_first_candidates: dict[str, float] = {}
+        self._daily_zero_streak: dict[str, int] = {}
 
 
 class _Data:
@@ -208,3 +223,101 @@ def test_the_attributes_under_test_are_really_shipped():
     anything."""
     assert SPIKE_ATTR in CONST.DAILY_TOTAL_ATTRS
     assert "energy_today" in CONST.DAILY_TOTAL_ATTRS
+
+
+# --------------------------------------------------------------------------- #417
+
+
+def test_a_small_backward_step_is_held_rather_than_published():
+    """Home Assistant reads any decrease on a total_increasing sensor as a meter reset,
+    which distorts the energy dashboard permanently.
+
+    Confirmed at the register on an SPH: load_energy_today read raw 92 against a retained
+    9.3 kWh - one count down, 0.1 kWh - with load_energy_total stepping identically in the
+    same poll. Nothing wrong on the wire; the inverter recomputed a total and rounded down.
+    A tenth of a kWh briefly held is a far smaller lie than a phantom reset (#417).
+    """
+    logger = _Logger()
+    guard = _load_guard(logger)
+    data = _Data(load_energy_today=9.2)
+
+    guard(_Coordinator(retained_daily={"load_energy_today": 9.3}), data)
+
+    assert data.load_energy_today == 9.3, (
+        "the backwards step was published; Home Assistant will record a meter reset"
+    )
+
+
+def test_a_step_forward_is_untouched():
+    """Guard against over-correcting: normal accumulation must not be held back."""
+    logger = _Logger()
+    guard = _load_guard(logger)
+    data = _Data(load_energy_today=9.4)
+
+    guard(_Coordinator(retained_daily={"load_energy_today": 9.3}), data)
+
+    assert data.load_energy_today == 9.4
+
+
+def test_a_large_drop_is_still_allowed_through():
+    """A genuine reset is a real event and inventing continuity across it would be worse
+    than the problem being fixed. Only a hair is absorbed."""
+    logger = _Logger()
+    guard = _load_guard(logger)
+    data = _Data(load_energy_today=1.0)
+
+    guard(_Coordinator(retained_daily={"load_energy_today": 20.0}), data)
+
+    assert data.load_energy_today == 1.0
+
+
+def test_the_backward_step_is_logged_once_per_counter():
+    """It can happen on any poll. One line per counter per session is enough - the same
+    reasoning as the spike guard."""
+    logger = _Logger()
+    guard = _load_guard(logger)
+    coordinator = _Coordinator(retained_daily={"load_energy_today": 9.3})
+
+    for _ in range(5):
+        guard(coordinator, _Data(load_energy_today=9.2))
+
+    hits = [m for m in logger.debugs if "stepped back" in m]
+    assert len(hits) == 1, f"expected one line, got {len(hits)}"
+
+
+def test_a_lifetime_counter_stepping_back_is_held_too():
+    """The half of #417 that v1.10.0-b4 missed.
+
+    `load_energy_today` is a daily attribute and `load_energy_total` a lifetime one, and
+    the guard went into the daily loop alone. The reporter's original evidence had both
+    stepping together from one event three milliseconds apart, so the fix held one and let
+    the other go on tripping total_increasing by itself - which he caught on the very next
+    capture.
+
+    A lifetime counter has no legitimate reason to decrease at all, so this is if anything
+    the less ambiguous half.
+    """
+    logger = _Logger()
+    guard = _load_guard(logger)
+    coordinator = _Coordinator()
+    coordinator._retained_lifetime_totals = {"load_energy_total": 20312.5}
+    data = _Data(load_energy_total=20312.4)
+
+    guard(coordinator, data)
+
+    assert data.load_energy_total == 20312.5, (
+        "the lifetime counter's backwards step was published; Home Assistant records a "
+        "meter reset on the lifetime total while the daily one is correctly held"
+    )
+
+
+def test_a_lifetime_counter_still_accepts_normal_growth():
+    logger = _Logger()
+    guard = _load_guard(logger)
+    coordinator = _Coordinator()
+    coordinator._retained_lifetime_totals = {"load_energy_total": 20312.5}
+    data = _Data(load_energy_total=20313.9)
+
+    guard(coordinator, data)
+
+    assert data.load_energy_total == 20313.9

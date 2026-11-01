@@ -31,10 +31,13 @@ from .const import (
     CONF_INVERT_GRID_POWER,
     get_device_type_for_sensor,
     get_entity_category,
+    hybrid_grid_connection_status,
+    offgrid_grid_connection_status,
+    PROFILE_STATUS_MAP,
 )
 from .coordinator import GrowattModbusCoordinator
 from .entity import GrowattEntity
-from .device_profiles import get_sensors_for_profile
+from .device_profiles import get_profile, get_sensors_for_profile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -421,6 +424,60 @@ SENSOR_DEFINITIONS = {
         "attr": "power_to_user",
         "description": "Power flowing from the grid to the home (grid import to loads). This measures grid supply specifically, not total home consumption. Available on storage/hybrid models with grid-side metering.",
     },
+    "ct_grid_import_l1": {
+        "name": "CT Grid Import L1",
+        "icon": "mdi:transmission-tower-import",
+        "device_class": SensorDeviceClass.POWER,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfPower.WATT,
+        "attr": "ct_grid_import_l1",
+        "description": "SPH-HU split-phase CT forward/import power on line 1 (V1.39 PactouserR).",
+    },
+    "ct_grid_import_l2": {
+        "name": "CT Grid Import L2",
+        "icon": "mdi:transmission-tower-import",
+        "device_class": SensorDeviceClass.POWER,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfPower.WATT,
+        "attr": "ct_grid_import_l2",
+        "description": "SPH-HU split-phase CT forward/import power on line 2 (V1.39 PactouserS).",
+    },
+    "ct_grid_export_l1": {
+        "name": "CT Grid Export L1",
+        "icon": "mdi:transmission-tower-export",
+        "device_class": SensorDeviceClass.POWER,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfPower.WATT,
+        "attr": "ct_grid_export_l1",
+        "description": "SPH-HU split-phase CT reverse/export power on line 1 (V1.39 PactogridR).",
+    },
+    "ct_grid_export_l2": {
+        "name": "CT Grid Export L2",
+        "icon": "mdi:transmission-tower-export",
+        "device_class": SensorDeviceClass.POWER,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfPower.WATT,
+        "attr": "ct_grid_export_l2",
+        "description": "SPH-HU split-phase CT reverse/export power on line 2 (V1.39 PactogridS).",
+    },
+    "inverter_to_load_l1": {
+        "name": "Inverter to Load L1",
+        "icon": "mdi:home-lightning-bolt",
+        "device_class": SensorDeviceClass.POWER,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfPower.WATT,
+        "attr": "inverter_to_load_l1",
+        "description": "SPH-HU inverter power delivered to local loads on line 1 (V1.39 PLocalLoadR).",
+    },
+    "inverter_to_load_l2": {
+        "name": "Inverter to Load L2",
+        "icon": "mdi:home-lightning-bolt",
+        "device_class": SensorDeviceClass.POWER,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": UnitOfPower.WATT,
+        "attr": "inverter_to_load_l2",
+        "description": "SPH-HU inverter power delivered to local loads on line 2 (V1.39 PLocalLoadS).",
+    },
     
     # Consumption Sensors
     "self_consumption": {
@@ -648,7 +705,11 @@ SENSOR_DEFINITIONS = {
     },
     "battery_soc": {
         "name": "Battery SOC",
-        "icon": "mdi:battery",
+        # No explicit icon: an icon set here always wins over Home Assistant's own
+        # charge-level icon (mdi:battery, mdi:battery-60, mdi:battery-outline, ...), which
+        # device_class BATTERY otherwise computes from the state automatically - so the
+        # Energy Dashboard's battery tile stayed permanently full instead of reflecting SOC
+        # (#455, reported by @AzraelsDisk).
         "device_class": SensorDeviceClass.BATTERY,
         "state_class": SensorStateClass.MEASUREMENT,
         "unit": PERCENTAGE,
@@ -777,6 +838,31 @@ SENSOR_DEFINITIONS = {
         "condition": lambda data: hasattr(data, 'bms_soh'),
         "description": "Battery state of health as reported by the Battery Management System (BMS) directly. 100% = new battery, lower values indicate capacity degradation over time. Sourced from BMS communication registers.",
     },
+    # Gauge capacity pair. These are genuinely dynamic attributes - set by the BMS block
+    # via setattr rather than declared on GrowattData - so the hasattr condition here is
+    # one of the few that actually filters (CLAUDE.md rule 6).
+    #
+    # Reported in Ah, not kWh. The BMS gauges charge, and converting to energy would mean
+    # multiplying by a pack voltage that itself moves with state of charge - a derived
+    # number that looks authoritative and is not measured anywhere (#403).
+    "bms_gauge_rm": {
+        "name": "Battery Remaining Capacity",
+        "icon": "mdi:battery-50",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": "Ah",
+        "attr": "bms_gauge_rm",
+        "condition": lambda data: hasattr(data, 'bms_gauge_rm'),
+        "description": "Charge remaining in the battery as measured by the BMS fuel gauge, in amp-hours. Divided by Battery Full Charge Capacity this gives the true state of charge, which can differ from the reported SOC percentage.",
+    },
+    "bms_gauge_fcc": {
+        "name": "Battery Full Charge Capacity",
+        "icon": "mdi:battery-high",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": "Ah",
+        "attr": "bms_gauge_fcc",
+        "condition": lambda data: hasattr(data, 'bms_gauge_fcc'),
+        "description": "Usable capacity of the battery at full charge, as measured by the BMS fuel gauge, in amp-hours. This falls below the nameplate capacity as the pack ages, so comparing it against the original figure shows real degradation.",
+    },
     "bms_constant_volt": {
         "name": "BMS Constant Voltage",
         "icon": "mdi:flash",
@@ -833,13 +919,64 @@ SENSOR_DEFINITIONS = {
         "condition": lambda data: hasattr(data, 'bms_min_soc'),
     },
     "battery_soh": {
-        "name": "Battery State of Health",
+        # "(VPP)" because bms_soh carries the same quantity from the documented BMS block at
+        # register 1096, and two sensors with one display name produce a second entity with
+        # a _2 suffix wherever both are created - which is any profile combining
+        # BATTERY_SENSORS with BMS_SENSORS (#403).
+        #
+        # 1096 is the authoritative one: 31218 was the original guess for SOH and was
+        # corrected to 1096, but the wrong register was never unmapped. This one is kept
+        # because MOD and MID have no 1096 and it is their only SOH source.
+        "name": "Battery State of Health (VPP)",
         "icon": "mdi:battery-heart",
         "state_class": SensorStateClass.MEASUREMENT,
         "unit": PERCENTAGE,
         "attr": "battery_soh",
         "condition": lambda data: hasattr(data, 'battery_soh'),
         "description": "Battery state of health as reported by the inverter's own register (not the BMS). 100% = new battery, lower values indicate capacity degradation. May differ from BMS State of Health if both are present.",
+    },
+    # VPP 31001 (#460). Values from the protocol's own table; 1-3 seen on a MIN 4200TL-XH.
+    "battery_working_status": {
+        "name": "Battery Working Status",
+        "icon": "mdi:battery-sync",
+        "attr": "battery_working_status",
+        "value_map": {0: "Standby", 1: "Disconnected", 2: "Charging", 3: "Discharging",
+                      4: "Fault", 5: "Upgrade"},
+        "description": "What the inverter reports the battery is doing. Disconnected is also "
+                       "what an APX battery reports while asleep.",
+    },
+    # Battery pack description, VPP 31225-31228 (#460). Static ratings, so no state_class:
+    # they are not measurements to keep statistics for.
+    "battery_cluster_sum": {
+        "name": "Battery Clusters",
+        "icon": "mdi:battery-outline",
+        "attr": "battery_cluster_sum",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "description": "Number of battery clusters the inverter reports.",
+    },
+    "battery_module_number": {
+        "name": "Battery Modules per Cluster",
+        "icon": "mdi:battery-plus-outline",
+        "attr": "battery_module_number",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "description": "Number of battery modules in each cluster.",
+    },
+    "battery_module_rated_voltage": {
+        "name": "Battery Module Rated Voltage",
+        "icon": "mdi:battery-outline",
+        "device_class": SensorDeviceClass.VOLTAGE,
+        "unit": UnitOfElectricPotential.VOLT,
+        "attr": "battery_module_rated_voltage",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "description": "Rated voltage of one battery module.",
+    },
+    "battery_module_rated_capacity": {
+        "name": "Battery Module Rated Capacity",
+        "icon": "mdi:battery-outline",
+        "unit": "Ah",
+        "attr": "battery_module_rated_capacity",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "description": "Rated capacity of one battery module.",
     },
     "battery_voltage_bms": {
         "name": "Battery Voltage BMS",
@@ -859,7 +996,13 @@ SENSOR_DEFINITIONS = {
             "name": f"Battery {n} {label}",
             "icon": icon,
             **extra,
-            "attr": f"battery{n}_{field}",
+            # The driver's dynamic reader (growatt_modbus.py) sets every field under its
+            # own name except current, which it stores as batteryN_current_low - the 32-bit
+            # pair carries a combined value there, same as battery_current_low on cluster 1.
+            # Sensor KEY stays batteryN_current (matching BATTERY2/3/4_SENSORS), but attr
+            # must point at the name the driver actually sets, or this reads unavailable
+            # forever (#451).
+            "attr": f"battery{n}_{field}" + ("_low" if field == "current" else ""),
             "condition": (lambda nn: lambda data: hasattr(data, f"battery{nn}_voltage"))(n),
             "disabled_by_default": True,
         }
@@ -886,6 +1029,67 @@ SENSOR_DEFINITIONS = {
             ("discharge_energy_total", "Discharge Total", "mdi:battery-minus",
              {"device_class": SensorDeviceClass.ENERGY, "state_class": SensorStateClass.TOTAL_INCREASING, "unit": UnitOfEnergy.KILO_WATT_HOUR}),
         )
+    },
+
+    # ---- Battery 1's own energy counters (VPP 31202-31209), multi-pack systems only ----
+    # The main Battery Charge/Discharge counters cover all packs together (#451). These
+    # exist only when a second pack does: battery2_voltage is set dynamically, so the
+    # condition is a real gate rather than a dataclass default (CLAUDE.md rule 6). Written
+    # out rather than generated so validate_sensors.py and the integrity tests can see them.
+    "battery1_charge_energy_today": {
+        "name": "Battery 1 Charge Today",
+        "icon": "mdi:battery-plus",
+        "device_class": SensorDeviceClass.ENERGY,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "unit": UnitOfEnergy.KILO_WATT_HOUR,
+        "attr": "battery1_charge_energy_today",
+        "condition": lambda data: hasattr(data, "battery2_voltage"),
+        "disabled_by_default": True,
+    },
+    "battery1_charge_energy_total": {
+        "name": "Battery 1 Charge Total",
+        "icon": "mdi:battery-plus",
+        "device_class": SensorDeviceClass.ENERGY,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "unit": UnitOfEnergy.KILO_WATT_HOUR,
+        "attr": "battery1_charge_energy_total",
+        "condition": lambda data: hasattr(data, "battery2_voltage"),
+        "disabled_by_default": True,
+    },
+    "battery1_discharge_energy_today": {
+        "name": "Battery 1 Discharge Today",
+        "icon": "mdi:battery-minus",
+        "device_class": SensorDeviceClass.ENERGY,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "unit": UnitOfEnergy.KILO_WATT_HOUR,
+        "attr": "battery1_discharge_energy_today",
+        "condition": lambda data: hasattr(data, "battery2_voltage"),
+        "disabled_by_default": True,
+    },
+    "battery1_discharge_energy_total": {
+        "name": "Battery 1 Discharge Total",
+        "icon": "mdi:battery-minus",
+        "device_class": SensorDeviceClass.ENERGY,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "unit": UnitOfEnergy.KILO_WATT_HOUR,
+        "attr": "battery1_discharge_energy_total",
+        "condition": lambda data: hasattr(data, "battery2_voltage"),
+        "disabled_by_default": True,
+    },
+    # Battery 2's full-charge capacity (31319-31320, #482); battery 1's is bms_gauge_fcc.
+    # It drops by one module's rated capacity for each module asleep or offline, and slowly
+    # with age - so it is not turned into a module count, which an aged stack would read
+    # as modules missing. Set dynamically by the cluster reader, so the gate is real
+    # (CLAUDE.md rule 6).
+    "battery2_full_charge_capacity": {
+        "name": "Battery 2 Full Charge Capacity",
+        "icon": "mdi:battery-high",
+        "state_class": SensorStateClass.MEASUREMENT,
+        "unit": "Ah",
+        "attr": "battery2_full_charge_capacity",
+        "entity_category": EntityCategory.DIAGNOSTIC,
+        "condition": lambda data: hasattr(data, "battery2_full_charge_capacity"),
+        "disabled_by_default": True,
     },
 
     "ac_charge_energy_today": {
@@ -1059,7 +1263,8 @@ SENSOR_DEFINITIONS = {
     },
     "peak_shaving_reserve_soc": {
         "name": "Peak Shaving Reserve SOC",
-        "icon": "mdi:battery-lock",
+        # No explicit icon - same reasoning as battery_soc (#455): an icon here would
+        # override Home Assistant's own charge-level icon for device_class BATTERY.
         "device_class": SensorDeviceClass.BATTERY,
         "state_class": SensorStateClass.MEASUREMENT,
         "unit": PERCENTAGE,
@@ -1296,7 +1501,7 @@ SENSOR_DEFINITIONS = {
         "condition": lambda data: getattr(data, 'wit_mode_status', "") != "",
     },
 
-    # Backup Box Sensors (Growatt ARK transfer switch, TL-X/TL-XH only, regs 3281-3342)
+    # Backup Box Sensors (Growatt SYN backup box, TL-X/TL-XH only, regs 3281-3342)
     "box_connect_flag": {
         "name": "Backup Box Status",
         "icon": "mdi:transfer-right",
@@ -1457,9 +1662,10 @@ async def async_setup_entry(
         entities.append(GrowattWitModeStatusSensor(coordinator, config_entry))
 
     # Not register-driven, so it is not in SENSOR_DEFINITIONS: it reads the RTC directly
-    # rather than coming out of a GrowattData field. Off-grid profiles encode the year
-    # differently and are excluded, same as the sync button (#393).
-    if coordinator.modbus_client.is_clock_supported:
+    # rather than coming out of a GrowattData field. Offered on every profile since an
+    # off-grid device confirmed the layout reads the same as V1.39 (#444) - unlike the
+    # sync button, which still needs the write encoding confirmed.
+    if coordinator.modbus_client.is_clock_readable:
         entities.append(GrowattInverterClockSensor(coordinator, config_entry))
 
     _LOGGER.info("Created %d sensors for %s", len(entities), inverter_series)
@@ -1631,16 +1837,47 @@ def _signed_grid_power(data) -> float | None:
 
     Returning None makes the entity unknown, which is the honest answer: without a meter
     we do not know the grid flow.
+
+    **A meter that read zero has told us something** (third defect, found on a WIT). Where
+    a meter IS fitted, 0/0 is its reading for a balanced site - the commonest state of a
+    self-consuming installation, and exactly what a battery covering the house produces.
+    Both directional tests still failed, so the estimate ran anyway: with the battery
+    discharging 605 W and `power_to_load` reading 0.0 despite being mapped,
+    `(0 + 605) - (0 + 0)` published 605 W of export that did not exist - byte-identical to
+    the battery discharge, which is what gave it away. The direction follows the battery
+    sign, so the same site fabricated an *import* instead before its polarity option was
+    corrected. Either way it lands in the export check of a discharge experiment, where a
+    phantom sale is the one reading that must never be invented.
+
+    That case is separated from the meterless one by ORDER, not by a new test: the
+    degenerate-balance guard below runs first and still answers for a profile with no
+    battery and no meter (#228). Only past it - where charge or discharge is non-zero, so
+    a battery profile with mapped registers is talking to us - is a 0/0 meter believed,
+    and only on a profile that declares the meter its single source of truth.
+
+    **And only while the inverter says something is measuring.** A WIT with no meter and no
+    external CT - the manual's "Zero export to GRID", where output is restricted to the LOAD
+    port and no meter is required - reads the same 0/0 and means the opposite by it. The
+    inverter answers that question itself: MeterLink (V1.39 holding 180) reports 0 = Missed
+    or 1 = Received for the grid-side source, whichever kind it is. So a zero is believed
+    only against a link that is Received; a Missed link makes the sensor unknown, and a link
+    we never established leaves the profile rule to answer.
     """
+    unread = getattr(data, "unread_fields", None) or set()
+    meter_only = bool(getattr(data, "grid_flow_from_meter_only", False))
+
     export = getattr(data, "power_to_grid", 0) or 0
     import_power = getattr(data, "power_to_user", 0) or 0
+    # A field that could not be READ is not a reading of zero (#384).
+    export_known = "power_to_grid" not in unread
+    import_known = "power_to_user" not in unread
 
     # A directional register carrying a real reading always wins.
-    if export > 0:
+    if export_known and export > 0:
         return float(export)
-    if import_power > 0:
+    if import_known and import_power > 0:
         return float(-import_power)
-    if export < 0:
+    if export_known and export < 0:
         # Signed meter reading indicating import. See above.
         return float(export)
 
@@ -1649,13 +1886,139 @@ def _signed_grid_power(data) -> float | None:
     charge = getattr(data, "charge_power", 0) or 0
     discharge = getattr(data, "discharge_power", 0) or 0
 
-    if load == 0 and charge == 0 and discharge == 0:
+    # A withheld battery is not an idle one (#434). The guard below reads "no load and no
+    # battery flow" as "nothing to balance against", and answers 0.0 at night. But the read
+    # path zeros charge and discharge when it withholds them - on a failed block read
+    # (#384), or when voltage x current disputes the battery power scale - so at night a
+    # battery discharging 540 W arrived here as 0/0 and came out as an idle site with no
+    # grid flow. Only a battery that was actually read may vouch for that.
+    battery_unread = "charge_power" in unread or "discharge_power" in unread
+    if load == 0 and charge == 0 and discharge == 0 and not battery_unread:
         # Nothing to balance solar against. With no generation either, the site really is
         # idle and zero is a fair answer; with generation, the expression degenerates to
         # `solar` and would be published as grid flow.
         return 0.0 if solar == 0 else None
 
+    if meter_only:
+        # Both meter registers were read and both say zero, on a profile that declares them
+        # the only usable source. The site is balanced; that is a measurement, not a gap to
+        # fill in. Gated on the profile rather than applied everywhere, because on a hybrid
+        # WITHOUT a meter the same 0/0 means the opposite - nothing is reporting - and there
+        # the estimate is the better answer (#228).
+        if export_known and import_known:
+            if getattr(data, "meter_link", None) == 0:
+                # The inverter says the grid-side measurement is not being received
+                # (MeterLink, V1.39 holding 180: 0 = Missed). Zero is then the absence of a
+                # source rather than a balanced site - the manual's "Zero export to GRID"
+                # arrangement needs no meter at all - and the estimate is no better here,
+                # because `power_to_load` reads 0 on this profile. Unknown is the only
+                # honest answer, and it is a measured one rather than a guess about how
+                # these sites are usually wired. A link we never established (None) keeps
+                # the profile rule below.
+                return None
+            return 0.0
+        # The meter is the only source here and it did not answer. Unknown, and in
+        # particular not something the estimate may stand in for: `power_to_load` is mapped
+        # on these profiles and still reads 0.0 while the house draws hundreds of watts.
+        return None
+
+    # The estimate, and only with every term of it actually read. Fixing "unread became
+    # zero" at the meter and leaving it here would reproduce the same fabrication one line
+    # lower, where it looks just as authoritative. An input the profile never mapped is not
+    # unread - the degenerate-balance guard above is what answers for those.
+    if any(name in unread for name in
+           ("pv_total_power", "power_to_load", "charge_power", "discharge_power")):
+        return None
+
     return float((solar + discharge) - (load + charge))
+
+
+def _signed_battery_power(data) -> float | None:
+    """Battery power as one signed number, positive = charging. None when it is not knowable.
+
+    Battery Power is a calculated sensor: it is rebuilt from `charge_power` and
+    `discharge_power` rather than read from a field of its own. Calculated sensors return
+    before the generic "was this read?" check in native_value, so this one never looked -
+    and when the read path withheld both halves it saw 0 and 0 and published 0 W (#434).
+
+    The read path withholds them for two reasons, and both leave the fields at 0.0 with the
+    fact recorded in `unread_fields`: the battery block was not read this poll (#384), or
+    this poll's voltage x current contradicted the scale about to be applied to the power
+    register. A WIT reporter's history showed the second exactly - `0` at two polls where
+    the battery was discharging 10.3 A and 10.4 A - which is worse than a tenth of the
+    truth, because zero is what an idle battery really reads.
+
+    Extracted from the entity so tests can run it; see _signed_grid_power for why.
+    """
+    unread = getattr(data, "unread_fields", None) or set()
+    if any(name in unread for name in ("battery_power", "charge_power", "discharge_power")):
+        return None
+
+    charge = getattr(data, "charge_power", 0) or 0
+    discharge = getattr(data, "discharge_power", 0) or 0
+    if charge > 0:
+        return round(float(charge), 1)
+    if discharge > 0:
+        return round(-float(discharge), 1)
+    return 0.0
+
+
+def _house_consumption(data, ac_side: bool = False) -> float | None:
+    """House load in watts, from the load register or the energy balance. None if unknowable.
+
+    Prefers `power_to_load` when it was read and is non-zero. Otherwise balances
+    solar + battery discharge + grid import against battery charge + grid export -
+    self_consumption_power (reg 1037/1038 on HU) is NOT used, because it reports solar
+    self-consumed rather than total house load and omits battery discharge and grid import.
+
+    The balance used to run on whatever the fields held, withheld or not. With the battery
+    withheld (#434) both battery terms are 0, `has_battery` goes false, and the house was
+    reported as solar minus export - leaving out a battery that was carrying the load. Every
+    term of the balance must have been read, the same rule _signed_grid_power applies to
+    its own estimate. An input the profile never mapped is not unread, and keeps its default.
+    """
+    unread = getattr(data, "unread_fields", None) or set()
+
+    # SPH-TL3: the load register is a DC-side balance and overstates the house by the
+    # conversion loss (~10%), so balance the AC side instead - what the inverter delivers,
+    # plus what the grid supplies, minus what goes back (#447). Only while the battery is
+    # not charging from the grid: then power flows INTO the inverter's AC side, which this
+    # has not been measured through, so that case keeps the previous behaviour below.
+    if ac_side and not any(
+        name in unread for name in (
+            "ac_power", "power_to_grid", "power_to_user", "charge_power", "pv_total_power",
+        )
+    ):
+        charge = getattr(data, "charge_power", 0) or 0
+        solar = getattr(data, "pv_total_power", 0) or 0
+        if charge <= solar:
+            ac_output = getattr(data, "ac_power", 0) or 0
+            import_power = getattr(data, "power_to_user", 0) or 0
+            export = getattr(data, "power_to_grid", 0) or 0
+            return round(max(0, ac_output + import_power - export), 1)
+
+    load = getattr(data, "power_to_load", 0) or 0
+    if load != 0 and "power_to_load" not in unread:
+        return round(max(0, load), 1)
+
+    if any(name in unread for name in (
+        "pv_total_power", "power_to_grid", "power_to_user", "charge_power", "discharge_power",
+    )):
+        return None
+
+    solar = getattr(data, "pv_total_power", 0) or 0
+    export = getattr(data, "power_to_grid", 0) or 0
+    import_power = getattr(data, "power_to_user", 0) or 0
+    charge = getattr(data, "charge_power", 0) or 0
+    discharge = getattr(data, "discharge_power", 0) or 0
+
+    has_battery = charge > 0 or discharge > 0
+    has_grid = export > 0 or import_power > 0
+    if has_battery or has_grid:
+        balance = solar + discharge - charge + import_power - export
+    else:
+        balance = max(0, solar - export)
+    return round(max(0, balance), 1)
 
 
 class GrowattModbusSensor(GrowattEntity, SensorEntity):
@@ -1679,6 +2042,13 @@ class GrowattModbusSensor(GrowattEntity, SensorEntity):
 
         self._sensor_key = sensor_key
         self._sensor_def = sensor_def
+
+        # Per device profile, not register map: SPA-TL3 shares SPH-TL3's map (#447).
+        self._house_from_ac_side = False
+        if sensor_key == "house_consumption":
+            series = config_entry.data.get(CONF_INVERTER_SERIES, "")
+            self._house_from_ac_side = bool(
+                get_profile(series).get("house_load_from_ac_output")) if series else False
 
         # Name comes from strings.json / translations/*.json under entity.sensor.<key>.name
         # rather than from sensor_def['name'], so the 22 shipped languages can translate it.
@@ -1817,43 +2187,20 @@ class GrowattModbusSensor(GrowattEntity, SensorEntity):
                 return self.coordinator.get_sensor_value(self._sensor_key, raw_value)
                 
             elif self._sensor_key == "house_consumption":
-                # House consumption
-                load = getattr(data, "power_to_load", 0)
-
-                if load == 0:
-                    # Energy balance: solar + battery_discharge - battery_charge + grid_import - grid_export
-                    # self_consumption_power (reg 1037/1038 on HU) is NOT used — it reports
-                    # solar self-consumed, not total house load (omits battery discharge + grid import).
-                    solar = getattr(data, "pv_total_power", 0)
-                    export = getattr(data, "power_to_grid", 0)
-                    import_power = getattr(data, "power_to_user", 0)
-                    charge = getattr(data, "charge_power", 0)
-                    discharge = getattr(data, "discharge_power", 0)
-                    has_battery = (charge > 0 or discharge > 0)
-                    has_grid = (export > 0 or import_power > 0)
-                    if has_battery or has_grid:
-                        load = solar + discharge - charge + import_power - export
-                    else:
-                        load = max(0, solar - export)
-
-                raw_value = round(max(0, load), 1)
+                # See _house_consumption: every term of the balance must have been read.
+                raw_value = _house_consumption(data, ac_side=self._house_from_ac_side)
+                if raw_value is None:
+                    return None
                 return self.coordinator.get_sensor_value(self._sensor_key, raw_value)
-            
+
             elif self._sensor_key == "battery_power":
-                # Battery power: positive = charging, negative = discharging
-                charge_power = getattr(data, "charge_power", 0)
-                discharge_power = getattr(data, "discharge_power", 0)
-                
-                if charge_power > 0:
-                    raw_value = round(charge_power, 1)  # Positive for charging
-                elif discharge_power > 0:
-                    raw_value = round(-discharge_power, 1)  # Negative for discharging
-                else:
-                    raw_value = 0
-                
+                # See _signed_battery_power: a withheld battery is unknown, not 0 W (#434).
+                raw_value = _signed_battery_power(data)
+                if raw_value is None:
+                    return None
                 return self.coordinator.get_sensor_value(self._sensor_key, raw_value)
-            
-            
+
+
             elif self._sensor_key == "grid_energy_today":
                 # Net grid energy = export − import. Positive = net export for the day.
                 export_energy = getattr(data, "energy_to_grid_today", 0)
@@ -1979,12 +2326,25 @@ class GrowattModbusSensor(GrowattEntity, SensorEntity):
                 # from "register not in this profile" — both yield equipment_status=0 otherwise.
                 if data.equipment_status_valid:
                     # V2.01 equipment_status (reg 31000): 5/6=On-grid, 7/8=Off-grid/EPS
-                    status = data.equipment_status
-                    if status in (5, 6):
-                        return "On-grid"
-                    if status in (7, 8):
-                        return "Off-grid"
-                    return "Unknown"
+                    return hybrid_grid_connection_status(data.equipment_status)
+                elif PROFILE_STATUS_MAP.get(
+                    getattr(self.coordinator.modbus_client, "register_map_name", "") or "",
+                    "grid_tied",
+                ) == "hybrid":
+                    # Hybrid profiles report the same working-state table in their own
+                    # status register (#474) - not the grid-tied 0/1 reading below.
+                    return hybrid_grid_connection_status(data.status)
+                elif inverter_series.startswith(("spf_", "spe_")):
+                    # Off-grid reads the SAME register 0 with a completely different code
+                    # set, so the grid-tied interpretation below is wrong here (#443). The
+                    # decision lives in const.py beside SPF_STATUS_CODES, where it can be
+                    # tested against that table without a Home Assistant entity.
+                    return offgrid_grid_connection_status(
+                        data.status,
+                        getattr(data, "grid_voltage", 0.0) or 0.0,
+                        "grid_voltage" in getattr(data, "unread_fields", ()),
+                    )
+
                 else:
                     # Legacy inverter_status (reg 0): 0=Waiting, 1=Normal, 3=Fault
                     # For all grid-tied/hybrid profiles 0 (idle) and 1 (normal) both
@@ -2034,7 +2394,10 @@ class GrowattModbusSensor(GrowattEntity, SensorEntity):
         
         # Special handling for status sensor
         if self._sensor_key == "status":
-            from .const import STATUS_CODES, HYBRID_STATUS_CODES, SPF_STATUS_CODES, PROFILE_STATUS_MAP
+            # PROFILE_STATUS_MAP comes from the module-level import. Importing it here as
+            # well made it local to the whole of native_value, and the grid connection
+            # branch above, which runs first, raised UnboundLocalError on every poll (#479).
+            from .const import STATUS_CODES, HYBRID_STATUS_CODES, SPF_STATUS_CODES
 
             if not self.coordinator.is_online:
                 return "Offline"

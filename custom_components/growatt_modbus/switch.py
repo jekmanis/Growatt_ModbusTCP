@@ -1,22 +1,40 @@
-"""Switch platform for Growatt Modbus Integration."""
+"""Switch platform for Growatt Modbus Integration.
+
+Upstream: one switch, remote on/off (the AC output, on off-grid models). Disabled by
+default on every profile, so nobody turns an inverter off by accident - see
+power_control.py for why each protocol family needs its own encoding.
+
+Fork: two WIT switches on top - Grid Export (30201) and the Battery Optimizer kill switch
+(30411 clear + input_boolean).
+"""
 import logging
 from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity import EntityCategory
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
     CONF_REGISTER_MAP,
     REGISTER_MAPS,
     DEVICE_TYPE_GRID,
     DEVICE_TYPE_INVERTER,
+    PROFILE_STATUS_MAP,
     WIT_REGISTER_MAPS,
 )
 from .coordinator import GrowattModbusCoordinator
 from .entity import GrowattEntity
+from .power_control import (
+    PowerControl,
+    PowerControlError,
+    decode,
+    resolve_power_control,
+    running_from_status,
+    set_power,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,11 +61,17 @@ async def async_setup_entry(
     # only the shared-connection registry, so indexing it by entry_id is always a bug.
     coordinator = config_entry.runtime_data
 
+    entities: list[SwitchEntity] = []
+
+    # Upstream: remote on/off, when the profile has an on/off register.
+    control = resolve_power_control(coordinator.modbus_client.register_map)
+    if control is not None:
+        entities.append(GrowattPowerSwitch(coordinator, config_entry, control))
+
     register_map_name = config_entry.data.get(CONF_REGISTER_MAP)
     register_map = REGISTER_MAPS.get(register_map_name, {})
     holding_registers = register_map.get('holding_registers', {})
 
-    entities: list[SwitchEntity] = []
     # The same tuple select.py, number.py and time.py gate on. Comparing against the
     # first map alone meant that on WIT_29900_50000TL3_XHU - which carries 30201 and
     # 30411 exactly like the 4000-15000 map - the mode sensor, the Mode Preset select and
@@ -57,18 +81,101 @@ async def async_setup_entry(
     is_wit = str(register_map_name).upper() in WIT_REGISTER_MAPS
 
     if is_wit:
+        wit_count = 0
         # Grid Export switch (register 30201)
         if VPP_EXPORT_LIMIT_POWER_RATE in holding_registers:
             entities.append(GrowattWitExportSwitch(coordinator, config_entry))
+            wit_count += 1
 
         # Battery Optimizer switch (controls input_boolean + TOU clear)
         if VPP_TOU_NUM_PERIODS in holding_registers:
             entities.append(GrowattWitOptimizerSwitch(coordinator, config_entry))
+            wit_count += 1
+
+        if wit_count:
+            entry_name = config_entry.data.get("name", config_entry.title)
+            _LOGGER.info("Created %d WIT switch entities for %s", wit_count, entry_name)
 
     if entities:
-        entry_name = config_entry.data.get("name", config_entry.title)
-        _LOGGER.info("Created %d WIT switch entities for %s", len(entities), entry_name)
         async_add_entities(entities)
+
+
+class GrowattPowerSwitch(GrowattEntity, SwitchEntity):
+    """Remote on/off.
+
+    Where the profile marks the register as reading back (confirmed on a real unit), the
+    state is read from the inverter each poll and the switch is an ordinary toggle.
+    Elsewhere it shows the last command sent: V1.39 documents register 0 as write-only and
+    VPP 30101 as not stored, so an unconfirmed read cannot be trusted to reflect the
+    inverter, and `assumed_state` makes Home Assistant offer both actions instead.
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_entity_registry_enabled_default = False
+    _attr_assumed_state = True
+    _attr_icon = "mdi:power"
+
+    def __init__(self, coordinator, config_entry: ConfigEntry, control: PowerControl) -> None:
+        """Initialise the on/off switch."""
+        super().__init__(
+            coordinator,
+            config_entry,
+            unique_key="inverter_power",
+            device_type=DEVICE_TYPE_INVERTER,
+        )
+        self._control = control
+        self._attr_translation_key = "ac_output" if control.is_ac_output else "inverter_power"
+        self._attr_is_on = None
+        if control.readback:
+            self._attr_assumed_state = False
+
+    async def async_added_to_hass(self) -> None:
+        """Ask the coordinator to start reading the register, where it reads back.
+
+        Disabled entities are never added, so leaving the switch off costs no reads.
+        """
+        await super().async_added_to_hass()
+        if self._control.readback:
+            self.coordinator.enable_onoff_polling(self._control.register)
+
+    @property
+    def is_on(self) -> bool | None:
+        if self._control.readback:
+            return decode(self._control, self.coordinator.onoff_raw)
+        client = self.coordinator.modbus_client
+        data = self.coordinator.data
+        if running_from_status(
+            self._control,
+            PROFILE_STATUS_MAP.get(getattr(client, "register_map_name", "") or "", "grid_tied"),
+            bool(self.coordinator.last_update_success and self.coordinator.is_online),
+            getattr(data, "status", None) if data is not None else None,
+        ):
+            return True
+        return self._attr_is_on
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self._async_set(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._async_set(False)
+
+    async def _async_set(self, on: bool) -> None:
+        try:
+            value = await self.hass.async_add_executor_job(
+                set_power, self.coordinator.modbus_client, self._control, on,
+            )
+        except PowerControlError as err:
+            raise HomeAssistantError(f"Could not switch the inverter {'on' if on else 'off'}: {err}") from err
+
+        _LOGGER.info(
+            "Inverter %s: wrote %d (0x%04X) to holding register %d (%s)",
+            "on" if on else "off", value, value, self._control.register, self._control.encoding,
+        )
+        if self._control.readback:
+            await self.coordinator.async_request_refresh()
+            return
+        self._attr_is_on = on
+        self.async_write_ha_state()
 
 
 class GrowattWitExportSwitch(GrowattEntity, SwitchEntity):

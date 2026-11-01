@@ -1,10 +1,10 @@
 # Actions Reference
 
 The integration registers nine actions (Home Assistant used to call these "services"). They
-appear in **Developer Tools → Actions**, search for `growatt_modbus`, and every one of them
+appear in **Settings → Tools → Actions**, search for `growatt_modbus`, and every one of them
 can be used in an automation or script.
 
-Most take a `device_id`. The easiest way to get one is to build the call in Developer Tools
+Most take a `device_id`. The easiest way to get one is to build the call in Settings → Tools → Actions
 with the UI picker, then switch to YAML mode with the toggle at the top right — Home
 Assistant fills in the ID for you.
 
@@ -17,7 +17,7 @@ Assistant fills in the ID for you.
 | [`write_registers`](#write-several-registers-at-once) | Write consecutive registers atomically |
 | [`export_register_dump`](#scan-every-register) | Full register scan to CSV |
 | [`detect_grid_orientation`](#detect-grid-ct-orientation) | Work out the grid CT sign convention |
-| [`set_battery_mode`](#set-battery-mode-vpp) | VPP charge/discharge/hold (WIT, MOD) |
+| [`set_battery_mode`](#set-battery-mode-vpp) | VPP charge/discharge/hold (WIT, MOD, MIN TL-XH2), and release back to the inverter's own mode |
 | [`sync_tou_schedule`](#write-a-time-of-use-schedule) | Push a full TOU schedule to the inverter |
 
 ---
@@ -157,15 +157,25 @@ Two consequences for how the action behaves:
 
 The action reads the clock back afterwards and logs a warning if it does not match.
 
-!!! warning "Not available on SPF/SPE"
+!!! note "Off-grid (SPF/SPE) uses a different year encoding, not the button"
 
-    The off-grid protocol uses the same addresses but stores the year as an offset from 2000
-    and gives register 51 to Chip Select rather than the weekday. Writing the standard layout
-    would set the year wrongly and overwrite an unrelated register, so the action refuses
-    rather than guessing.
+    The **Inverter Clock** sensor works on off-grid models the same as everywhere else. An
+    SPF 5000 ES read against a known-good clock returned `45: 2026, 46: 9, 47: 14, 48: 8,
+    49: 20, 50: 29` - the full four-digit year and the same field order as every other
+    family, so drift is visible there like anywhere else.
 
-    If you have an off-grid model and can post a register scan covering holding 45-51, that
-    is all that is needed to add support.
+    **Setting it now works too, and takes the opposite form.** Every other confirmed family
+    writes the year as two digits and reads it back as four - write 26, read 2026. An
+    SPF 3000-6000 ES PLUS, tested directly with a friend watching the front panel, does the
+    reverse: writing `26` is accepted, briefly displayed, and then quietly reverted on its
+    own; writing `2027` is accepted, displayed, and held. This action already writes
+    whichever form your profile needs, so there is nothing to configure -
+    [#443](https://github.com/0xAHA/Growatt_ModbusTCP/issues/443) has the full test if
+    you want the detail.
+
+    Confirmed on an SPF 3000-6000 ES PLUS. SPE shares the same off-grid clock block with no
+    reason so far to expect it differs, but has not been tested directly - if yours behaves
+    otherwise, #443 is the place to say so.
 
 ---
 
@@ -223,7 +233,7 @@ data:
 
 Writes a CSV covering every range the integration knows about, with the reason each read
 failed as well as the values that succeeded. This is what to attach when raising an issue —
-see [Diagnostic Service](../troubleshooting/diagnostic-service.md).
+see [Diagnostic Actions](../troubleshooting/diagnostic-service.md).
 
 ```yaml
 action: growatt_modbus.export_register_dump
@@ -249,21 +259,46 @@ data:
 
 ## Set battery mode (VPP)
 
-WIT and MOD models with VPP support. See the [WIT Inverter Guide](wit-guide.md).
+WIT and MOD models with VPP support, and MIN TL-XH2, where `charge` and `release` are
+confirmed and `discharge` and `hold` are not yet tested
+([#461](https://github.com/0xAHA/Growatt_ModbusTCP/issues/461)). See the
+[WIT Inverter Guide](wit-guide.md).
 
 ```yaml
 action: growatt_modbus.set_battery_mode
 data:
   device_id: 1a2b3c4d5e6f7890abcdef1234567890
-  mode: charge        # charge | discharge | hold
+  mode: charge        # charge | discharge | hold | release
   power_percent: 50
 ```
+
+**Use `release` when you are done.** Charge, discharge and hold all switch on VPP control
+authority (register 30100) and leave it on. Authority with no active command does not
+return the inverter to normal: on a MIN TL-XH it held the inverter in VPP standby with
+Load First selected, so the battery barely discharged and the grid carried the house.
+`release` clears the remote-power and schedule registers and then the authority, handing
+control back to the inverter's own mode
+([#460](https://github.com/0xAHA/Growatt_ModbusTCP/pull/460)). It needs only register
+30100, so unlike the other modes it also works on MIN TL-XH.
 
 ## Write a time-of-use schedule
 
 Pushes a whole schedule so the inverter follows it even if Home Assistant is offline. Up to
 20 periods, and **they must not overlap or touch** — end at `XX:59`, start the next at
 `XX:00`. See [Battery & Scheduling](battery-scheduling.md).
+
+!!! warning "This writes the VPP schedule only — it does not clear one set in the app"
+    The action writes the VPP time-of-use block (registers 30411 and 30412 upward) on WIT
+    inverters. A schedule created in **ShinePhone → Advanced Setting → TimeElectricity
+    Price** lives somewhere this action does not reach, and **an all-day period written here
+    will not override it**.
+
+    A WIT owner spent an evening on this: a forgotten *Battery First 11:51-15:30, 100%*
+    period was charging his battery from the grid at 14-16 kW, and neither Modbus writes nor
+    two calls to this action stopped it. Deleting the period inside ShinePhone stopped it
+    within one poll ([#448](https://github.com/0xAHA/Growatt_ModbusTCP/issues/448)).
+
+    **If a schedule appears to be ignoring you, check the app first.**
 
 ```yaml
 action: growatt_modbus.sync_tou_schedule

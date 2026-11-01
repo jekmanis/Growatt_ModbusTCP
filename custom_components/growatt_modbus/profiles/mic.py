@@ -72,7 +72,8 @@ MIC_600_3300TL_X = {
         144: {'name': 'test_treat_time', 'scale': 1, 'unit': 'ms'},
     },
     'holding_registers': {
-        0: {'name': 'on_off', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': 'Low byte: on/off (1/0), High byte: auto start (1/0)'},
+        0: {'name': 'on_off', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': 'Low byte: on/off (1/0), High byte: auto start (1/0)',
+            'onoff_encoding': 'legacy_autostart'},
         2: {'name': 'pf_cmd_memory', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': 'Power factor memory state (0/1)'},
         3: {'name': 'active_power_rate', 'scale': 1, 'unit': '%', 'access': 'RW', 'desc': 'Max output active power percent (0-100)'},
         4: {'name': 'reactive_power_rate', 'scale': 1, 'unit': '%', 'access': 'RW', 'desc': 'Max output reactive power percent (0-100)'},
@@ -124,15 +125,13 @@ MIC_600_3300TL_X_V201 = {
         31103: {'name': 'ac_power_low_vpp', 'scale': 1, 'unit': '', 'pair': 31102, 'combined_scale': 0.1, 'combined_unit': 'VA'},
         31106: {'name': 'ac_frequency_vpp', 'scale': 0.01, 'unit': 'Hz', 'maps_to': 'ac_frequency'},
 
-        # Energy Data
-        31120: {'name': 'energy_today_high_vpp', 'scale': 1, 'unit': '', 'pair': 31121, 'maps_to': 'energy_today'},
-        31121: {'name': 'energy_today_low_vpp', 'scale': 1, 'unit': '', 'pair': 31120, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        31122: {'name': 'energy_total_high_vpp', 'scale': 1, 'unit': '', 'pair': 31123, 'maps_to': 'energy_total'},
-        31123: {'name': 'energy_total_low_vpp', 'scale': 1, 'unit': '', 'pair': 31122, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-
-        # Temperatures
-        31130: {'name': 'inverter_temp_vpp', 'scale': 0.1, 'unit': '°C', 'maps_to': 'inverter_temp', 'signed': True},
-        31131: {'name': 'ipm_temp_vpp', 'scale': 0.1, 'unit': '°C', 'maps_to': 'ipm_temp', 'signed': True},
+        # Grid-side energy counters (V2.01-V2.05: 31120 total to user, 31122 to grid today).
+        # Previously labelled energy today/total, with temperatures at 31130-31131; see
+        # vpp_v201.py.
+        31120: {'name': 'energy_to_user_total_vpp_high', 'scale': 1, 'unit': '', 'pair': 31121},
+        31121: {'name': 'energy_to_user_total_vpp_low', 'scale': 1, 'unit': '', 'pair': 31120, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        31122: {'name': 'energy_to_grid_today_vpp_high', 'scale': 1, 'unit': '', 'pair': 31123},
+        31123: {'name': 'energy_to_grid_today_vpp_low', 'scale': 1, 'unit': '', 'pair': 31122, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
     },
     'holding_registers': {
         # === V3.05 REGISTERS ===
@@ -189,7 +188,7 @@ MIC_2500_6000TL_X_MIN_RANGE = {
 
         # AC Output Power (32-bit)
         35: {'name': 'output_power_high', 'scale': 1, 'unit': '', 'pair': 36},
-        36: {'name': 'output_power_low', 'scale': 1, 'unit': '', 'pair': 35, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        36: {'name': 'output_power_low', 'scale': 1, 'unit': '', 'pair': 35, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
 
         # AC Grid
         37: {'name': 'ac_frequency', 'scale': 0.01, 'unit': 'Hz'},
@@ -305,6 +304,11 @@ MIC_2500_6000TL_X_MIN_RANGE = {
     'holding_registers': {
         0: {'name': 'on_off', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': '0=Off, 1=On'},
         3: {'name': 'active_power_rate', 'scale': 1, 'unit': '%', 'access': 'RW', 'desc': 'Max output power %'},
+        # PV startup (connect) voltage. Confirmed on a MIC 2000TL-X (DTC 5200, FW "PV 200"):
+        # reg 17 reads 500 (=50.0 V) at factory default and accepts FC06 writes. Raising it
+        # delays grid-connect until the string can sustain voltage, which stops dawn/dusk
+        # on/off hunting on a single high-voltage panel. Keep below panel Voc.
+        17: {'name': 'pv_start_voltage', 'scale': 0.1, 'unit': 'V', 'access': 'RW', 'desc': 'PV startup voltage (x0.1V)'},
         30: {'name': 'modbus_address', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': 'Modbus address 1-254'},
 
         # Safety/compliance diagnostic registers (read-only, Issue #282)

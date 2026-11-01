@@ -204,13 +204,17 @@ def test_nothing_happens_before_a_real_poll() -> None:
 
 
 def test_the_threshold_matches_the_clients_own_give_up_point() -> None:
-    """At `_OPTIONAL_HOLDING_FAIL_THRESHOLD` consecutive failures growatt_modbus stops
-    asking for the block. Removing entities earlier means removing them while the client
-    still considers the register worth retrying."""
+    """At `_VPP_HOLDING_FAIL_THRESHOLD` (fork alias `_OPTIONAL_HOLDING_FAIL_THRESHOLD`)
+    consecutive failures growatt_modbus stops asking for the block. Removing entities
+    earlier means removing them while the client still considers the register worth
+    retrying."""
     client_src = (COMPONENT / "growatt_modbus.py").read_text(encoding="utf-8")
     client_value = int(
-        re.search(r"^_OPTIONAL_HOLDING_FAIL_THRESHOLD = (\d+)$", client_src, re.M).group(1)
+        re.search(r"^_VPP_HOLDING_FAIL_THRESHOLD = (\d+)$", client_src, re.M).group(1)
     )
+    assert re.search(
+        r"^_OPTIONAL_HOLDING_FAIL_THRESHOLD = _VPP_HOLDING_FAIL_THRESHOLD$", client_src, re.M
+    ), "the fork alias must stay an alias, not a second literal"
     assert THRESHOLD == client_value >= 2
 
 

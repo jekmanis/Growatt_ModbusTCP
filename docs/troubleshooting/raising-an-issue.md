@@ -37,7 +37,7 @@ Please paste log lines as text in a code block rather than a screenshot. Screens
     Screenshots remain the right choice for genuinely visual things: a settings page, the shape of a graph, a dialog that is behaving oddly, or a page from a manufacturer document. It is specifically **text inside an image** that costs time.
 
 !!! tip "Is there anything under Settings → Repairs?"
-    The integration raises repair notices for problems it can detect itself, such as an inverter reverting your settings or a gateway returning malformed responses. If one is showing, say so — it usually names the cause outright.
+    The integration raises repair notices for problems it can detect itself, such as an inverter reverting your settings, a gateway returning malformed responses, or an entry that has never had a single successful read since setup. If one is showing, say so — it usually names the cause outright.
 
     One of them answers the most common question here before you ask it. **"This inverter may be on the wrong profile"** appears when your inverter's device type code points at a different profile from the one in use — which is what usually lies behind *my model should have sensor X and does not*. Detection runs once at setup, and one timed-out read at that moment can leave you on a profile that maps fewer registers than your hardware supports. Nothing is changed automatically; the notice names the profile to switch to. If you have set the **Protocol variant** option by hand, the check stays silent and does not second-guess you.
 
@@ -64,7 +64,7 @@ Run the [Universal Register Scanner](diagnostic-service.md) and attach the CSV.
 
     The scanner opens its own connection. If the integration is still polling, the two compete for the same adapter and most reads fail — producing a scan that looks like a broken inverter on a system that is working perfectly.
 
-    **In the scan service, select your inverter under "Config entry" rather than typing the host and port.** That is how the scan inherits the slave ID, Modbus delay and block size you already have working. Entering the connection by hand starts from defaults instead, which a sensitive adapter may not tolerate — the same empty-looking scan, from a different cause. Selecting the device works while it is disabled (v1.5.2 and later; on earlier versions it did not, which is why this note now exists).
+    **In the scan action, select your inverter under "Config entry" rather than typing the host and port.** That is how the scan inherits the slave ID, Modbus delay and block size you already have working. Entering the connection by hand starts from defaults instead, which a sensitive adapter may not tolerate — the same empty-looking scan, from a different cause. Selecting the device works while it is disabled (v1.5.2 and later; on earlier versions it did not, which is why this note now exists).
 
 ### The connection drops, or entities go unavailable
 
@@ -72,11 +72,31 @@ Nearly always the RS485 adapter rather than the inverter or the integration. Rea
 
 Worth including: your adapter model, and whether the problem survives a restart of Home Assistant.
 
+!!! warning "If it has *never* worked, check the Modbus unit ID before anything else"
+    A connection that worked and then stopped, and one that has never once responded, look identical in the log — both give `transport error during block read`. But they rarely have the same cause, and a wrong **unit ID (slave ID)** produces exactly the second pattern with nothing to hint at it: every read is addressed to a device that is not listening, so every read times out.
+
+    This was reported as a connection that could not recover, and cost two days before a standalone Modbus client found it — unit ID 2 gave seven timeouts out of seven, unit ID 1 answered immediately.
+
+    **Check it with a standalone client** (QModMaster, modpoll) pointed at the same host and port, trying unit IDs 1 to 8. Most Growatt inverters answer on **1**.
+
+    **Do not trust the address configured in ShineTools.** On the WIT HU15 the EMS COM address is fixed at 1 on firmware 3030 and 5050 alike: set to 2 or 3, ShineTools reads it back as 1 and the port answers only on 1. See [two or more inverters on one adapter](rs485-gateways.md#two-or-more-inverters-on-one-adapter) if you were planning to share a bus.
+
+    From v1.10.0-b7 the integration raises a repair notice when an entry has never had a successful read since setup, and the **Unit / Slave ID** can be corrected under **Configure** without deleting the entry — so your entity IDs, automations and statistics history survive the fix.
+
 ### A control won't stick, or reverts after a few seconds
 
 Usually the Growatt cloud overwriting your change. If a **ShineWiFi or ShineLink dongle** is connected, the cloud can restore its own settings within seconds of a local write. The integration detects this and raises a repair notice.
 
-Say which control, what you set it to, and what it reverted to.
+**Check the app's own schedule before anything else.** A time-of-use period set in **ShinePhone → Advanced Setting → TimeElectricity Price** overrides Modbus controls while it is active, and it is invisible from this integration — nothing in the diagnostics shows it. One WIT owner's forgotten *Battery First 11:51-15:30* period charged his battery from the grid at 14-16 kW while every control he set reverted, and `sync_tou_schedule` did not clear it either; deleting the period in the app fixed it within one poll ([#448](https://github.com/0xAHA/Growatt_ModbusTCP/issues/448)). If the inverter is doing something no Home Assistant entity accounts for, that is the first place to look.
+
+Say which control, what you set it to, and what it reverted to — and your **firmware
+build**. From v2.0.5-b13 it appears in brackets after the firmware version on the inverter's
+device page (for example `AL1.0 (ALBA18010122)`); the Growatt portal's *Version* shows its
+first ten characters. Behaviour can differ between builds of the same model. On MIN TL-XH,
+the VPP registers are missing entirely on an older build
+([#458](https://github.com/0xAHA/Growatt_ModbusTCP/issues/458)). One inverter dropped
+SOC-limit writes on ALBA13 and accepted them after Growatt updated it to ALBA18
+([#400](https://github.com/0xAHA/Growatt_ModbusTCP/issues/400)).
 
 ### Your inverter model isn't supported, or auto-detection picks the wrong profile
 

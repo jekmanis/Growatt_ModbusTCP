@@ -454,8 +454,15 @@ class DtcEntry(NamedTuple):
     evidence: str
     """Where the confirmation came from, or what is missing without it."""
 
+    alternatives: tuple[str, ...] = ()
+    """Other profiles that are correct for some hardware sharing this DTC.
 
-# Official DTC codes from Growatt VPP 2.03 Protocol documentation Table 3-1.
+    Detection has to pick one, but an owner who selected one of these by hand is not on
+    the wrong profile, and the profile re-check must not tell them they are. Each needs a
+    real device on this DTC running it, the same bar as CONFIRMED."""
+
+
+# Official DTC codes from Growatt VPP Protocol Table 3-1, current to V2.05 (2026-05-29, #481).
 # Note: some legacy models expose the DTC register without supporting full V2.01.
 DTC_REGISTRY: dict[int, DtcEntry] = {
     # -- Legacy protocol models — DTC at holding register 43, no VPP support --
@@ -471,7 +478,8 @@ DTC_REGISTRY: dict[int, DtcEntry] = {
     # -- SPH series --
     3501: DtcEntry(
         'SPH 3000-6000TL BL', 'sph_3000_6000_v201',
-        ASSUMED, 'no device report; sibling 3502 is confirmed and shares this map',
+        CONFIRMED, 'SPH6000, issue #470 - PV total, grid export total, load energy and '
+                   'SOC matched the Growatt portal',
     ),
     3502: DtcEntry(
         'SPH 3000-6000TL BL-UP', 'sph_3000_6000_v201',
@@ -489,9 +497,38 @@ DTC_REGISTRY: dict[int, DtcEntry] = {
         'SPH-TL3 4-10kW', 'sph_tl3_3000_10000_v201',
         CONFIRMED, 'SPH 10000TL3 BH-UP, issue #210 — sensors confirmed working',
     ),
+    21100: DtcEntry(
+        'SPH/SPM 8000-10000TL-HU (US)', 'sph_8000_10000_hu',
+        CONFIRMED, 'SPH-10000-US UL2.21 register scan, PR #418 - reported as Unknown before this',
+    ),
     21303: DtcEntry(
         'SPH/SPM 8000-10000TL-HU', 'sph_8000_10000_hu',
         CONFIRMED, 'register scan #303, firmware UL2.21',
+    ),
+    # Confirmed before any protocol listed it: neighbour of 21100/21303, same UL firmware
+    # line, and the profile's PV, grid, battery and SOC readings matched ShinePhone within
+    # a few percent on the reporter's unit. Before this it was "unknown" and range
+    # detection fell through to MIN TL-XH. V2.05 Table 3-1 now lists it with three
+    # regional variants (below).
+    21304: DtcEntry(
+        'SPM 3000-6000TL-HU', 'sph_8000_10000_hu',
+        CONFIRMED, 'SPM 6000TL-HU, firmware UL2.61, compared against ShinePhone, issue #463',
+    ),
+    # Regional variants of 21304, listed beside it in V2.05 Table 3-1 and given the same
+    # treatment there (31132 "independent intelligent load" is defined for 21304-21305 and
+    # 21308-21309 together). Without an entry they fall through to range detection, which
+    # sent 21304 to MIN TL-XH before it was mapped.
+    21305: DtcEntry(
+        'SPM 3000-6000TL-HU(BR)', 'sph_8000_10000_hu',
+        ASSUMED, 'no device report; regional variant of 21304, which is confirmed on this profile',
+    ),
+    21308: DtcEntry(
+        'SPM 3000-6000TL-HU(IT)', 'sph_8000_10000_hu',
+        ASSUMED, 'no device report; regional variant of 21304, which is confirmed on this profile',
+    ),
+    21309: DtcEntry(
+        'SPM 2500-6000TL-HU(EU)', 'sph_8000_10000_hu',
+        ASSUMED, 'no device report; regional variant of 21304, which is confirmed on this profile',
     ),
 
     # -- SPA series — AC-coupled storage, NO solar DC inputs --
@@ -553,6 +590,14 @@ DTC_REGISTRY: dict[int, DtcEntry] = {
         'SPF 3000-6000 ES PLUS variant', 'spf_3000_6000_es_plus',
         ASSUMED, 'no device report on this DTC',
     ),
+    # Not in the 034xx block, and read from holding 43 rather than input 44 — the
+    # off-grid DTC read falls through to holding when input 44 is not one of the four
+    # 034xx codes, which is what happened here. Nothing else needs to change for this
+    # code to be picked up; it only has to be in this registry.
+    20105: DtcEntry(
+        'SPF 5000 ES', 'spf_3000_6000_es_plus',
+        CONFIRMED, 'SPF 5000 ES, firmware 067.02/068.02, register scan and diagnostics on issue #444 — profile confirmed by the same reporter mapping 24 ShinePhone settings against it',
+    ),
 
     # -- SPE series — single-phase hybrid (SPF protocol variant, 8-12kW) --
     64541: DtcEntry(
@@ -564,6 +609,11 @@ DTC_REGISTRY: dict[int, DtcEntry] = {
     5100: DtcEntry(
         'MIN 2500-6000TL-XH/XH2/XHE/XA', 'tl_xh_3000_10000_v201',
         CONFIRMED, 'MIN 6000 TL-XH + APX battery + backup box, issue #71',
+        # Two generations share 5100 and detection cannot tell them apart. XH2 serves only
+        # the VPP ranges - the 3000 block the default profile reads is silent - confirmed on
+        # two units by register scan (#361, #461). The MIN TL-XH profile is in use on a
+        # MIN 4200TL-XH on this DTC (#400, #460).
+        alternatives=('min_tl_xh2_3000_10000_v201', 'min_tl_xh_3000_10000_v201'),
     ),
 
     # -- MIC/MIN-X series --
@@ -657,8 +707,16 @@ DTC_REGISTRY: dict[int, DtcEntry] = {
 
     # -- WIT/WIS series — register 988 can distinguish: 0=WIT, 1=WIS --
     5603: DtcEntry(
-        'WIT 4-15kW Hybrid', 'wit_4000_15000tl3',
-        CONFIRMED, 'hardware, issue #335 (residential three-phase hybrid, Protocol V2.03)',
+        'WIT 4-15K-HU; WIT 17-25K-HU', 'wit_4000_15000tl3',
+        CONFIRMED, 'WIT 15KTL3, issue #335 (Protocol V2.03); WIT 4-15K-HU on V2.04, issue #481. '
+                   'The 17-25K-HU shares the code from V2.05 and is unseen',
+    ),
+    # V2.05 Table 3-1 groups it with 5603 under "Residential backup ES inverter", not with
+    # the commercial 29.9-50K-XHU (5601) despite the shared suffix, and its 4-25K range is
+    # the 5603 range. Range detection is the alternative, and it has no WIT branch.
+    5605: DtcEntry(
+        'WIT 4-25K-XHU', 'wit_4000_15000tl3',
+        ASSUMED, 'no device report; grouped with 5603 in V2.05 Table 3-1',
     ),
     5600: DtcEntry(
         'WIS 100K-AM; WIT 50-100K-H/HE/HU/A/AE/AU (incl. -US); '
@@ -670,13 +728,22 @@ DTC_REGISTRY: dict[int, DtcEntry] = {
         'WIT 29.9-50K-XHU', 'wit_29900_50000tl3_xhu',
         CONFIRMED, 'WIT 30K register scan, issue #338 (4 MPPT, 3 battery channels)',
     ),
+    # Listed up to V2.03, absent from V2.05 Table 3-1. Kept: an installed unit still
+    # reports it.
     5800: DtcEntry(
         'WIS 210K', 'mid_15000_25000tl3_x_v201',
-        ASSUMED, 'no device report; WIS mapped to a MID profile',
+        ASSUMED, 'no device report; WIS mapped to a MID profile; not in V2.05 Table 3-1',
     ),
     5801: DtcEntry(
-        'WIS 215K-AM', 'mid_15000_25000tl3_x_v201',
+        'WIS 200-215K-AMA', 'mid_15000_25000tl3_x_v201',
         ASSUMED, 'no device report; WIS mapped to a MID profile',
+    ),
+    # New in V2.05. Mapped like WIS 100K-AM (5600), the other WIS "-AM" model and the same
+    # commercial ES group, rather than like 5800/5801: the MID profile is a grid-tied PV
+    # map with no battery, and a WIS is a storage inverter.
+    5604: DtcEntry(
+        'WIS 125K-AM', 'wit_29900_50000tl3_xhu',
+        ASSUMED, 'no device report; mapped like WIS 100K-AM (5600)',
     ),
 }
 
@@ -721,6 +788,23 @@ def detect_profile_from_dtc(dtc_code: int) -> Optional[str]:
     Returns:
         Profile key or None if no match
     """
+    # A register that answers 0 has told us nothing, and nothing is not a model.
+    #
+    # Both detection callers test `if dtc_code:` before calling, so an empty value only
+    # reaches here from the once-per-session profile re-check, which passes the raw
+    # register straight through. The result was "Unknown DTC code: 0 (not in supported
+    # models)" at WARNING on every restart and reload - telling the owner of a perfectly
+    # supported inverter that their model is unsupported, over a register that simply came
+    # back empty. They could not clear it and reasonably read it as a fault (#449).
+    #
+    # Reading 0 is "Read OK" with no value (rule 3), never evidence about the hardware.
+    # Detection logs its own accurate line when this happens, so nothing is lost here.
+    if not dtc_code:
+        _LOGGER.debug(
+            "No device type code reported (register returned %s) - nothing to match", dtc_code
+        )
+        return None
+
     entry = DTC_REGISTRY.get(dtc_code)
     if entry:
         if entry.provenance == CONFIRMED:
@@ -736,7 +820,7 @@ def detect_profile_from_dtc(dtc_code: int) -> Optional[str]:
             _LOGGER.warning(
                 "Matched DTC %s (%s) to profile '%s', but this mapping is UNCONFIRMED: %s. "
                 "Sensors may be missing or present-but-meaningless. A register scan "
-                "(Developer Tools -> Actions -> Growatt Modbus: Universal Register Scanner) "
+                "(Settings -> Tools -> Actions -> Growatt Modbus: Universal Register Scanner) "
                 "attached to a GitHub issue is what turns this into a confirmed mapping.",
                 dtc_code, entry.model, entry.profile, entry.evidence,
             )

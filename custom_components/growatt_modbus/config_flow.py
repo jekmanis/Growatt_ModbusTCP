@@ -12,6 +12,11 @@ from homeassistant import config_entries
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+)
 
 from .const import (
     CONF_INVERTER_SERIES,
@@ -21,11 +26,16 @@ from .const import (
     CONF_DEVICE_PATH,
     CONF_BAUDRATE,
     CONF_INVERT_BATTERY_POWER,
+    CONF_ADD_ANYWAY,
     PROTOCOL_VARIANT_AUTO,
     PROTOCOL_VARIANT_LEGACY,
     PROTOCOL_VARIANT_V201,
     BLOCK_SIZE_OPTIONS,
     resolve_block_size,
+    CONF_GATEWAY_TYPE,
+    GATEWAY_PROFILES,
+    GATEWAY_TYPE_STANDARD,
+    gateway_tuning,
     DEFAULT_PORT,
     DEFAULT_SLAVE_ID,
     DEFAULT_BAUDRATE,
@@ -56,6 +66,45 @@ SERIAL_BY_ID_DIR = "/dev/serial/by-id"
 SERIAL_BY_PATH_DIR = "/dev/serial/by-path"
 
 MANUAL_PATH_SENTINEL = "manual"
+
+
+def _number_box(minimum: int, maximum: int, step: int = 1):
+    """A whole number the user types, with the range still enforced.
+
+    Home Assistant renders `vol.All(vol.Coerce(int), vol.Range(min=..., max=...))` as a
+    **slider when the range is narrow**, and as a plain box when it is wide. That is why
+    only two fields here need this: the unit ID (1-247) and the connection timeout (1-60)
+    came out as sliders, while the scan intervals, the request delay and the TCP port were
+    already boxes and are deliberately left on their original declarations.
+
+    A slider is the wrong control for either of them - both are values the owner knows and
+    types once, and dragging to 96 out of 247 is fiddly on a mouse and worse on a phone.
+
+    `vol.Coerce(int)` after the selector is not optional. NumberSelector hands back a
+    **float**, and the unit ID is interpolated into the entry's unique_id at setup
+    (`f"{host}:{port}_{slave_id}"`): a 1.0 produces "192.168.1.50:502_1.0" where an existing
+    entry reads "…_1", so the entry stops matching itself. It also reaches pymodbus as the
+    device id on every poll. A timeout stored as `10.0` where every previous version wrote
+    `10` is harmless but pointless, and the same helper handles both.
+    """
+    return vol.All(
+        NumberSelector(
+            NumberSelectorConfig(min=minimum, max=maximum, step=step,
+                                 mode=NumberSelectorMode.BOX)
+        ),
+        vol.Coerce(int),
+    )
+
+
+def _unit_id_field():
+    """The Modbus unit ID: a typed box over the documented 1-247 address range.
+
+    The setup steps used to declare this as a bare `int`, which renders as a box but
+    validates nothing - so 0 or 300 were accepted at setup and then refused by the options
+    form, leaving an entry in a state it could not be edited out of. The options form had
+    the opposite problem and was a slider. All three now share this.
+    """
+    return _number_box(1, 247)
 
 
 def _serial_port_options(current_path: str | None = None) -> dict[str, str]:
@@ -138,6 +187,16 @@ def _detect_grid_orientation(client: GrowattModbus) -> tuple[bool, str]:
         if not data:
             return False, "⚠️ Could not read the inverter - leaving Invert Grid Power OFF for now. This is a default, not a measurement: check the Grid Power sign once you are exporting, and run `growatt_modbus.detect_grid_orientation` if it looks wrong."
 
+        # A poll where nothing answered still returns an object, with every field at its 0.0
+        # default and the fields it tried to read recorded as unread. Without this the next
+        # check reports "solar production too low (0W)" to somebody whose inverter never
+        # replied at all - which sends them looking at the weather (#432).
+        if getattr(data, "unread_fields", None) and not any(
+            getattr(data, field, 0) for field in
+            ("pv_total_power", "pv1_power", "pv2_power", "ac_power", "energy_today")
+        ):
+            return False, "⚠️ The inverter did not answer any reads - leaving Invert Grid Power OFF for now. This is a default, not a measurement, and it is not a reading of zero production. Check the connection settings and any repair notices, then run `growatt_modbus.detect_grid_orientation` once sensors are showing live values."
+
         pv_power = getattr(data, "pv_total_power", 0)
         consumption = getattr(data, "house_consumption", 0) or getattr(data, "power_to_load", 0)
 
@@ -187,6 +246,9 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
     def __init__(self):
         """Initialize the config flow."""
         self._discovered_data = {}
+        # Set when the user chose "add anyway" past a failed connection test, so the
+        # profile step can say plainly what to expect (#389).
+        self._unreachable_at_setup = False
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -232,6 +294,35 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
         errors = {}
 
         if user_input is not None:
+            # "Add anyway" - skip the reachability test entirely.
+            #
+            # Until this existed, a failed connection test was a dead end: the form
+            # re-rendered with the address cleared and there was no route past it. That
+            # blocked two things at once. Someone whose inverter is simply offline could not
+            # finish setup at all; and because Home Assistant does not load a
+            # config-entry-only integration until an entry exists, the register scanner was
+            # unreachable too - so an owner of an unsupported model could not produce the
+            # scan that would get their model supported (#389).
+            #
+            # Straight to manual profile selection. That is also the safest route: it reads
+            # nothing, so it cannot trip the SPF power-reset behaviour that async_step_
+            # offgrid_check exists to avoid.
+            if user_input.get(CONF_ADD_ANYWAY):
+                _LOGGER.warning(
+                    "Adding %s:%s without a successful connection test, at the user's "
+                    "request. Entities will be unavailable until the inverter answers.",
+                    user_input.get(CONF_HOST), user_input.get(CONF_PORT),
+                )
+                self._discovered_data.update({
+                    CONF_HOST: user_input[CONF_HOST],
+                    CONF_PORT: user_input[CONF_PORT],
+                    CONF_SLAVE_ID: user_input[CONF_SLAVE_ID],
+                    CONF_GATEWAY_TYPE: user_input.get(CONF_GATEWAY_TYPE,
+                                                      GATEWAY_TYPE_STANDARD),
+                })
+                self._unreachable_at_setup = True
+                return await self.async_step_manual()
+
             try:
                 # Test basic connection first
                 _LOGGER.info(f"Testing TCP connection to {user_input[CONF_HOST]}:{user_input[CONF_PORT]}")
@@ -260,6 +351,8 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
                         CONF_HOST: user_input[CONF_HOST],
                         CONF_PORT: user_input[CONF_PORT],
                         CONF_SLAVE_ID: user_input[CONF_SLAVE_ID],
+                        CONF_GATEWAY_TYPE: user_input.get(CONF_GATEWAY_TYPE,
+                                                          GATEWAY_TYPE_STANDARD),
                     })
 
                     # CRITICAL: Check if user has OffGrid inverter BEFORE autodetection
@@ -270,16 +363,32 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
                 _LOGGER.exception("Unexpected error during TCP setup")
                 errors["base"] = "unknown"
 
-        # Build the TCP form schema
-        schema = vol.Schema({
-            vol.Required(CONF_HOST): str,
-            vol.Required(CONF_PORT, default=DEFAULT_PORT): int,
-            vol.Required(CONF_SLAVE_ID, default=DEFAULT_SLAVE_ID): int,
-        })
+        # Keep what they typed. Clearing the address on failure meant re-entering it for
+        # every attempt, which is how a wrong port turns into an evening (#389).
+        prior = user_input or {}
+        fields = {
+            vol.Required(CONF_HOST, default=prior.get(CONF_HOST, vol.UNDEFINED)): str,
+            vol.Required(CONF_PORT, default=prior.get(CONF_PORT, DEFAULT_PORT)): int,
+            vol.Required(CONF_SLAVE_ID,
+                         default=prior.get(CONF_SLAVE_ID, DEFAULT_SLAVE_ID)): _unit_id_field(),
+            # What the inverter is reached through. It only seeds the polling timings
+            # below - it does not change how anything is read, and every value it sets
+            # stays editable in Configure afterwards (#433).
+            vol.Required(
+                CONF_GATEWAY_TYPE,
+                default=prior.get(CONF_GATEWAY_TYPE, GATEWAY_TYPE_STANDARD),
+            ): vol.In(list(GATEWAY_PROFILES)),
+        }
+
+        # Only offered once a connection has actually failed. Showing it up front would
+        # invite skipping a check that catches real mistakes - a typo, the wrong port, an
+        # adapter that is not powered.
+        if errors:
+            fields[vol.Optional(CONF_ADD_ANYWAY, default=False)] = bool
 
         return self.async_show_form(
             step_id="tcp",
-            data_schema=schema,
+            data_schema=vol.Schema(fields),
             errors=errors,
             description_placeholders={
                 "info": "Enter TCP connection details for your RS485-to-TCP adapter (EW11, USR-W630, etc.)"
@@ -402,7 +511,7 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
                 38400: "38400",
                 115200: "115200",
             }),
-            vol.Required(CONF_SLAVE_ID, default=DEFAULT_SLAVE_ID): int,
+            vol.Required(CONF_SLAVE_ID, default=DEFAULT_SLAVE_ID): _unit_id_field(),
         })
 
         return self.async_show_form(
@@ -602,13 +711,18 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
                 except Exception as e:
                     _LOGGER.debug(f"Grid orientation detection error: {e}")
 
-                # Set default options
+                # Set default options.
+                #
+                # scan_interval, timeout, modbus_delay and max_block_size come from the
+                # gateway answered for at setup, so a Growatt WiFi dongle starts on timings
+                # that suit it rather than on ones tuned for a dedicated RS485 gateway
+                # (#433). All four remain editable in Configure.
                 default_options = {
-                    "scan_interval": 60,  # 60 seconds default polling
                     "offline_scan_interval": 300,  # 5 minutes when offline
-                    "timeout": 10,  # 10 seconds connection timeout
                     "invert_grid_power": invert_grid_power,  # Auto-detected or default
-                    "modbus_delay": 250,  # 250ms inter-request delay
+                    CONF_GATEWAY_TYPE: self._discovered_data.get(
+                        CONF_GATEWAY_TYPE, GATEWAY_TYPE_STANDARD),
+                    **gateway_tuning(self._discovered_data.get(CONF_GATEWAY_TYPE)),
                 }
 
                 # Create notification about grid orientation detection
@@ -785,12 +899,18 @@ class GrowattModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN): # type:
                     except Exception as e:
                         _LOGGER.debug(f"Grid orientation detection error: {e}")
 
-                    # Set default options
+                    # Set default options.
+                    #
+                    # Same gateway-derived timings as the auto-detected path above. This one
+                    # also had no modbus_delay at all, so a manually selected profile fell
+                    # back to whatever the read path defaulted to rather than to the 250 ms
+                    # its sibling wrote (#433).
                     default_options = {
-                        "scan_interval": 60,  # 60 seconds default polling
                         "offline_scan_interval": 300,  # 5 minutes when offline
-                        "timeout": 10,  # 10 seconds connection timeout
                         "invert_grid_power": invert_grid_power,  # Auto-detected or default
+                        CONF_GATEWAY_TYPE: self._discovered_data.get(
+                            CONF_GATEWAY_TYPE, GATEWAY_TYPE_STANDARD),
+                        **gateway_tuning(self._discovered_data.get(CONF_GATEWAY_TYPE)),
                     }
 
                     # Create notification about grid orientation detection
@@ -914,7 +1034,37 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
             # read from options by the shared-connection path but has no UI field, so it
             # reverted to its default every time any option was saved (#367).
             new_options = {**self.config_entry.options, **user_input}
-            
+
+            # Changing the gateway answer re-seeds the timings it governs (#433).
+            #
+            # Only the fields still sitting at their stored value are re-seeded. Anything
+            # the user edited in the same submission is theirs and is left alone - which is
+            # the difference between "here are timings for that hardware" and "your tuning
+            # has been overwritten". Someone who has spent an evening finding a block size
+            # that works must not lose it by answering a question about their adapter.
+            # An entry created before this field existed has nothing stored, and the form
+            # shows the standard choice for it. Treating that absence as "standard" is what
+            # makes the first save after upgrading a no-op: without it, every existing user
+            # with their own tuning would have it replaced by the defaults the moment they
+            # opened Configure and pressed Save, having changed nothing.
+            _previous_gateway = self.config_entry.options.get(
+                CONF_GATEWAY_TYPE, GATEWAY_TYPE_STANDARD)
+            _selected_gateway = user_input.get(CONF_GATEWAY_TYPE)
+            if _selected_gateway and _selected_gateway != _previous_gateway:
+                _kept = []
+                for _field, _value in gateway_tuning(_selected_gateway).items():
+                    _stored = self.config_entry.options.get(_field)
+                    _submitted = user_input.get(_field, _stored)
+                    if _submitted != _stored:
+                        _kept.append(f"{_field}={_submitted}")
+                        continue
+                    new_options[_field] = _value
+                _LOGGER.info(
+                    "Gateway type set to %r: applied its timings%s",
+                    _selected_gateway,
+                    f", keeping your own {', '.join(_kept)}" if _kept else "",
+                )
+
             # If profile changed, update config data too
             new_data = dict(self.config_entry.data)
             changed = False
@@ -982,6 +1132,25 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
             # here could collide with another entry, and the failure would be a broken entry
             # rather than a rejected form.
             connection_type = self.config_entry.data.get(CONF_CONNECTION_TYPE, "tcp")
+
+            # Unit / slave ID, for both connection types (#414).
+            #
+            # A WIT whose EMS COM address was set to 2 in ShineTools kept answering only on
+            # the native default of 1, so every block read timed out and surfaced as
+            # "transport error during block read" - which reads exactly like a connection
+            # that will not recover. The reporter spent two days on it, and the only fix
+            # available was deleting the entry and re-adding it, because this field could
+            # not be edited afterwards.
+            #
+            # Same reasoning as the host/path fields above: the unique_id is left alone,
+            # so entity IDs, automations and statistics survive the correction.
+            if CONF_SLAVE_ID in user_input and user_input[CONF_SLAVE_ID] != new_data.get(CONF_SLAVE_ID):
+                _LOGGER.info(
+                    "Unit/slave ID changed: %s -> %s",
+                    new_data.get(CONF_SLAVE_ID), user_input[CONF_SLAVE_ID],
+                )
+                new_data[CONF_SLAVE_ID] = user_input[CONF_SLAVE_ID]
+                changed = True
 
             if connection_type == "serial":
                 selected_path = user_input.get(CONF_DEVICE_PATH)
@@ -1069,6 +1238,7 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
         current_series = self.config_entry.data.get(CONF_INVERTER_SERIES, "min_7000_10000_tl_x")
         current_scan_interval = self.config_entry.options.get("scan_interval", 60)  # Default 60 seconds
         current_offline_scan_interval = self.config_entry.options.get("offline_scan_interval", 300)
+        current_clock_drift = self.config_entry.options.get("clock_drift_threshold_min", 5)
         current_timeout = self.config_entry.options.get("timeout", 10)
         current_invert_grid = self.config_entry.options.get("invert_grid_power", False)
         current_invert_battery = self.config_entry.options.get("invert_battery_power", False)
@@ -1082,6 +1252,11 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
             (label for label, size in BLOCK_SIZE_OPTIONS.items() if size == _resolved_block_size),
             "Auto (recommended)",
         )
+        # Entries created before this field existed have no stored value. Defaulting them
+        # to the standard gateway keeps their timings exactly as they are: the re-seed only
+        # runs when the answer CHANGES, and for them it starts out unchanged.
+        current_gateway_type = self.config_entry.options.get(
+            CONF_GATEWAY_TYPE, GATEWAY_TYPE_STANDARD)
 
         # Get user-friendly profiles
         available_profiles = get_available_profiles(legacy_only=False, friendly_names=True)
@@ -1134,6 +1309,12 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
                 PROTOCOL_VARIANT_LEGACY: "Legacy V1.39",
                 PROTOCOL_VARIANT_V201: "VPP V2.01",
             }),
+            # Placed immediately above the four settings it seeds, so the relationship is
+            # visible on the form rather than only in the docs (#433).
+            vol.Required(
+                CONF_GATEWAY_TYPE,
+                default=current_gateway_type
+            ): vol.In(list(GATEWAY_PROFILES)),
             vol.Required(
                 "scan_interval",
                 default=current_scan_interval
@@ -1145,7 +1326,15 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
             vol.Required(
                 "timeout",
                 default=current_timeout
-            ): vol.All(vol.Coerce(int), vol.Range(min=1, max=60)),
+            ): _number_box(1, 60),
+            # 0 turns the clock-drift notice off. Some plants cannot clear it at all:
+            # the Growatt portal offers fixed UTC offsets with no daylight-saving zones,
+            # and the datalogger pushes that to the inverter, so an owner whose zone
+            # observes DST is structurally an hour out for half the year (#439).
+            vol.Required(
+                "clock_drift_threshold_min",
+                default=current_clock_drift
+            ): _number_box(0, 240),
             vol.Required(
                 "invert_grid_power",
                 default=current_invert_grid
@@ -1187,6 +1376,15 @@ class GrowattModbusOptionsFlow(config_entries.OptionsFlow):
         # Shown per connection type: a serial entry has no use for a host field, and offering
         # both invites someone to fill in the wrong one.
         current_connection_type = self.config_entry.data.get(CONF_CONNECTION_TYPE, "tcp")
+
+        # Offered for both connection types - a wrong unit ID fails identically over TCP
+        # and serial, and is invisible from the symptoms (#414).
+        options_schema = options_schema.extend({
+            vol.Required(
+                CONF_SLAVE_ID,
+                default=self.config_entry.data.get(CONF_SLAVE_ID, DEFAULT_SLAVE_ID),
+            ): _unit_id_field(),
+        })
 
         if current_connection_type == "serial":
             current_device_path = self.config_entry.data.get(CONF_DEVICE_PATH, "")

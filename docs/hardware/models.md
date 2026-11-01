@@ -13,7 +13,7 @@ When you add the integration, it attempts to identify your inverter automaticall
 - VPP-capable inverters (DTC present) are identified with high confidence
 - Legacy inverters (no DTC) use model name probing — works for MIN, MIC, SPH families
 - If auto-detection picks the wrong profile, delete and re-add the integration with manual selection
-- The Universal Register Scanner (Developer Tools → Actions) shows the detection reasoning in its output
+- The Universal Register Scanner (Settings → Tools → Actions) shows the detection reasoning in its output
 
 ---
 
@@ -32,11 +32,12 @@ When you add the integration, it attempts to identify your inverter automaticall
 | Model | Range | PV Strings | VPP Support | Auto-detect | Tested | Notes |
 |-------|-------|-----------|-------------|-------------|--------|-------|
 | **MIN TL-XH 3000-10000** | 3–10 kW | 2–3 | VPP | DTC 5100 | ✅ | 3–6kW: 2 strings; 7–10kW: 3 strings |
+| **MIN TL-XH2 3000-10000** | 3–10 kW | 2–3 | VPP only | Manual (shares DTC 5100) | ✅ | Answers only the VPP ranges; select this profile by hand ([#461](https://github.com/0xAHA/Growatt_ModbusTCP/issues/461)) |
 | **SPA 3000-6000TL BL** | 3–6 kW | None | Legacy only | Auto | ✅ | AC-coupled storage only — no PV DC inputs |
 | **SPE 8000-12000 ES** | 8–12 kW | 2 | VPP-like | Model name | ✅ | Peak shaving, parallel operation |
-| **SPH 3000-6000** | 3–6 kW | 2 | VPP + Legacy | Model name | ✅ | |
+| **SPH 3000-6000** | 3–6 kW | 2 | VPP + Legacy | Model name | ✅ | Grid First export collapsing at dusk while status reads PV On-Grid was a firmware fault on RA1.0 (RAAA191904); Growatt's update to RAAa919486 fixed it. The update also adds the VPP registers (DTC 3501) ([#476](https://github.com/0xAHA/Growatt_ModbusTCP/issues/476)) |
 | **SPH 7000-10000** | 7–10 kW | 2 | VPP + Legacy | Model name | ✅ | |
-| **SPH/SPM 8000-10000 HU** | 8–10 kW | 3 | VPP + Legacy | DTC | ⚠️ | BMS monitoring (SOH, cell voltages) |
+| **SPH/SPM 8000-10000 HU** | 8–10 kW | 3 | VPP + Legacy | DTC | ⚠️ | BMS monitoring (SOH, cell voltages). Also used for the SPM 3000-6000TL-HU (DTC 21304, confirmed) and its regional variants 21305, 21308, 21309 (unconfirmed) |
 
 ### Single-Phase Off-Grid
 
@@ -53,7 +54,8 @@ When you add the integration, it attempts to identify your inverter automaticall
 | **MOD 6000-15000TL3-XH** | 6–15 kW | 3 | Yes | VPP + Legacy | DTC 5400 | ✅ | Battery monitoring only (control pending) |
 | **SPA-TL3 4000-10000** | 4–10 kW | None | Yes | VPP + Legacy | DTC 3725 | ✅ | AC-coupled storage only — no PV DC inputs. Shares the SPH-TL3 register map |
 | **SPH-TL3 3000-10000** | 3–10 kW | 2 | Yes | VPP + Legacy | DTC | ✅ | Tested: SPH 8000TL3 BH-UP |
-| **WIT 4000-15000TL3** | 4–15 kW | 2 | Yes | VPP v2.03 | DTC 5603 | ✅ | Advanced VPP control — DTC 5603 hardware-confirmed (Issue #335) |
+| **TL3-S 3000-15000** | 3–15 kW | 2 | No | Legacy only | DTC 2049 | ✅ | Grid-tied. Tested on firmware DH1.0 (#299) and dhaa01 (#432) - dhaa01 refuses reads over 50 registers, which the profile now allows for |
+| **WIT 4000-15000TL3** | 4–15 kW | 2 | Yes | VPP v2.03 | DTC 5603 | ✅ | Advanced VPP control — DTC 5603 hardware-confirmed (Issue #335). Also selected for the WIT 17-25K-HU (5603) and WIT 4-25K-XHU (5605), both unconfirmed |
 
 **Legend:** ✅ Tested with real hardware · ⚠️ Profile from documentation, community validation welcome
 
@@ -199,6 +201,37 @@ All models support an **Invert Grid Power** option. It flips the sign of the sig
 
 ---
 
+## Where Grid Power comes from
+
+`Grid Power` (and with it `Grid Export Power` and `Grid Import Power`) prefers your
+inverter's directional meter registers. When those are not available, it falls back to an
+energy balance — `(solar + battery discharge) − (house load + battery charge)` — which is
+an estimate, and is used only where there is genuinely something to balance.
+
+**On WIT models the meter is the only source and the estimate never runs.** Their
+directional registers are real, while `power_to_load` on the same profile reads 0 W with
+the house drawing hundreds of watts, so a balance built on it would be fiction. Two
+consequences:
+
+- **A meter reading of zero is believed.** A battery covering the house exactly is a
+  balanced site, not a missing measurement — the commonest evening state of a
+  self-consuming installation. Before v2.0.1-b1 the estimate ran here and published the
+  battery discharge as grid flow: several hundred watts of export that never happened,
+  which then made the Energy Dashboard compute house consumption as zero.
+- **A meter that cannot be read makes the sensor unknown**, leaving a gap in history,
+  rather than reporting a plausible number.
+- **A WIT with no grid-side measurement at all also reads unknown.** Grid measurement can
+  come from a Growatt meter or from external CTs, and the inverter reports whether either
+  is being received (`MeterLink`, holding register 180). Where it reports nothing is
+  connected — the manual's *Zero export to GRID* arrangement restricts output to the LOAD
+  port and needs no meter — `Grid Power` is unknown rather than zero, because on that site
+  a reading of zero is the absence of a source rather than a balanced house.
+
+Other families keep the estimate: on a hybrid with no meter fitted, the same all-zero
+reading means nothing is reporting, and the balance is the better answer there.
+
+---
+
 ## Manual Model Selection Guide
 
 If auto-detection fails (or you want to override), choose based on:
@@ -255,11 +288,12 @@ If auto-detection fails (or you want to override), choose based on:
 
 ### Inverter Connector Pinout
 
-| Connector | RS485+ (A) | RS485− (B) |
-| --- | --- | --- |
-| 16-pin DRM/COM | Pin 3 | Pin 4 |
-| 4-pin COM | Pin 1 | Pin 2 |
-| RJ45 (485-3) | Pin 5 | Pin 1 |
+| Connector | RS485+ (A) | RS485− (B) | Notes |
+| --- | --- | --- | --- |
+| 16-pin DRM/COM | Pin 3 | Pin 4 | Confirmed on a MID 30KTL3-XH, top row counted from the left ([#459](https://github.com/0xAHA/Growatt_ModbusTCP/issues/459)) |
+| 4-pin COM | Pin 1 | Pin 2 | |
+| RJ45 (485-3) | Pin 5 | Pin 1 | |
+| RJ45 (older SPH 3000-6000) | Pin 5 | Pin 4 | GND on pin 2. Confirmed on an SPH6000, DTC 3501 ([#470](https://github.com/0xAHA/Growatt_ModbusTCP/issues/470)) |
 
 > If values look garbled or the connection is unstable, try swapping the A and B wires — adapter labelling is not always consistent with the inverter's convention.
 

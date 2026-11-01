@@ -37,7 +37,7 @@ MOD_6000_15000TL3_XH = {
         # Aliased to ac_power so the generic ac_power sensor reflects the correct total.
         # Do NOT alias ac_power_r (reg 40/41) — that is Phase R only, not total.
         35: {'name': 'output_power_high', 'scale': 1, 'unit': '', 'pair': 36, 'alias': 'ac_power_high'},
-        36: {'name': 'output_power_low', 'scale': 1, 'unit': '', 'pair': 35, 'combined_scale': 0.1, 'combined_unit': 'W', 'alias': 'ac_power_low'},
+        36: {'name': 'output_power_low', 'scale': 1, 'unit': '', 'pair': 35, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True, 'alias': 'ac_power_low'},
 
         # === AC OUTPUT - THREE PHASE ===
         # Grid Frequency (shared across all phases)
@@ -158,11 +158,38 @@ MOD_6000_15000TL3_XH = {
         
         # Battery Diagnostics
         3086: {'name': 'battery_derating_mode', 'scale': 1, 'unit': ''},
-        3087: {'name': 'pv_iso', 'scale': 1, 'unit': 'kΩ', 'desc': 'PV insulation resistance'},
-        3088: {'name': 'dci_r', 'scale': 0.1, 'unit': 'mA', 'desc': 'DC injection current (R-phase)'},
-        3089: {'name': 'dci_s', 'scale': 0.1, 'unit': 'mA', 'desc': 'DC injection current (S-phase)'},
-        3090: {'name': 'dci_t', 'scale': 0.1, 'unit': 'mA', 'desc': 'DC injection current (T-phase)'},
-        3091: {'name': 'gfci', 'scale': 1, 'unit': 'mA', 'desc': 'Residual/leakage current (GFCI)'},
+        # Safety measurements: PV insulation resistance, DC injection and leakage current.
+        # INPUT 200-205 (FC04). Holding 201/202/203 at the same addresses are PID working
+        # mode, PID on/off and PID voltage - WRITE registers for a completely different
+        # subsystem.
+        #
+        # These were read from input 3087-3091 until #404, and that mapping was NOT a
+        # guess: V1.39 documents input 3087-3091 as ISO/DCI_R/DCI_S/DCI_T/GFCI with the
+        # same scales. Whether a device honours it depends on the firmware.
+        #
+        # Four scans show that block echoing SERIAL-NUMBER text instead: 22616 is 0x5858,
+        # ASCII "XX", three different quantities reading the same value, and the same values
+        # coming back from the holding space, where V1.39 documents 3087-3092 as Serial
+        # Number 1-6. So an insulation resistance of 2261.6 kOhm was being published from
+        # serial-number characters.
+        #
+        # But a MOD 10KTL3-XH on DTC 5400 / DN1.0 / V2.02 returns LIVE measurements from
+        # 3087-3091 - the same values as 200-205, DCI drifting together across paired reads.
+        # An earlier version of this note claimed no device honoured the block; that was four
+        # devices, not the family, and it was wrong.
+        #
+        # 200-205 is mapped because it works on both kinds of firmware. Note the two blocks
+        # are NOT one offset by a constant: GFCI is the fifth word of the old block (3091)
+        # and the sixth of the new (205), with 204 constant at 0 in between (#404).
+        #
+        # 200-205 move between scans the way a measurement does, and the mapping is
+        # confirmed from outside this project: Growatt's own app shows `Gfci(mA)` and
+        # `Iso(KOhm)` beside the values our scan reads from 205 and 200 (#404).
+        200: {'name': 'pv_iso', 'scale': 1, 'unit': 'kΩ', 'desc': 'PVISO - PV insulation resistance'},
+        201: {'name': 'dci_r', 'scale': 0.1, 'unit': 'mA', 'desc': 'R_DCI - DC injection, R phase'},
+        202: {'name': 'dci_s', 'scale': 0.1, 'unit': 'mA', 'desc': 'S_DCI - DC injection, S phase'},
+        203: {'name': 'dci_t', 'scale': 0.1, 'unit': 'mA', 'desc': 'T_DCI - DC injection, T phase'},
+        205: {'name': 'gfci', 'scale': 1, 'unit': 'mA', 'desc': 'GFCI - residual/leakage current'},
 
         # Battery - Discharge/Charge Energy (3000 range - PRIMARY for MOD XH)
         # Note: Order is discharge first, then charge (different from VPP which is charge first)
@@ -230,7 +257,7 @@ MOD_6000_15000TL3_XH = {
         3180: {'name': 'charge_power_high', 'scale': 1, 'unit': '', 'pair': 3181, 'desc': 'Battery charge power HIGH (unsigned)'},
         3181: {'name': 'charge_power_low', 'scale': 1, 'unit': '', 'pair': 3180, 'combined_scale': 0.1, 'combined_unit': 'W', 'desc': 'Battery charge power (unsigned, positive=charging)'},
 
-        # === BACKUP BOX (Growatt ARK transfer switch, RS485 at regs 3281-3342) ===
+        # === BACKUP BOX (Growatt SYN backup box, RS485 at regs 3281-3342) ===
         # Confirmed active on MOD 10KTL3-XH-BP via ledermueller scan (Issue #336):
         # reg 3282=1 (On-Grid), 3286=33°C, 3287=2340 (234.0V), 3297/3298=10898 (1089.8W), 3320=1 (connected)
         # Same register layout as TL-XH profile.
@@ -315,7 +342,11 @@ MOD_6000_15000TL3_XH = {
 
         # Battery Capacity
         31219: {'name': 'battery_fcc_high', 'scale': 1, 'unit': '', 'pair': 31220},
-        31220: {'name': 'battery_fcc_low', 'scale': 1, 'unit': '', 'pair': 31219, 'combined_scale': 1, 'combined_unit': 'Ah'},
+        # 0.1 Ah (VPP V2.05). A MID 25KTL3-XH cluster of four 104.0 Ah modules (31228 = 1040)
+        # read 4160, and 3120 / 2080 / 1040 as modules went to sleep (#482).
+        # Named bms_gauge_fcc so the existing Battery Full Charge Capacity sensor (SPH-HU
+        # 1092) reads it here too, through the same BMS reader.
+        31220: {'name': 'bms_gauge_fcc', 'scale': 1, 'unit': '', 'pair': 31219, 'combined_scale': 0.1, 'combined_unit': 'Ah'},
 
         # Battery Temperature (VPP range)
         31223: {'name': 'battery_temp_vpp', 'scale': 0.1, 'unit': '°C', 'signed': True, 'desc': 'Battery temp (VPP range, may not respond on XH variants)'},
@@ -332,14 +363,23 @@ MOD_6000_15000TL3_XH = {
         31301: {'name': 'battery2_power', 'scale': 1, 'unit': '', 'pair': 31300, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
 
         # Battery 2 Energy
+        #
+        # The LOW register carries no _low suffix, matching battery2_power above and the
+        # shared VPP_V201_BATTERY2 block in vpp_v201.py that SPH/TL-XH/SPH-TL3/WIT-XHU all
+        # use. This file hand-copies the block rather than importing it, and the copy had
+        # drifted: these four carried an extra _low that nothing else in the codebase does.
+        # The driver's dynamic battery-cluster reader (growatt_modbus.py) searches for the
+        # unsuffixed name, so on this profile the four energy fields were never found at
+        # all - not corrupted, not withheld, simply never looked up - while every other
+        # cluster-2 field on the very same successful poll read correctly (#451).
         31302: {'name': 'battery2_charge_energy_today_high', 'scale': 1, 'unit': '', 'pair': 31303},
-        31303: {'name': 'battery2_charge_energy_today_low', 'scale': 1, 'unit': '', 'pair': 31302, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        31303: {'name': 'battery2_charge_energy_today', 'scale': 1, 'unit': '', 'pair': 31302, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
         31304: {'name': 'battery2_charge_energy_total_high', 'scale': 1, 'unit': '', 'pair': 31305},
-        31305: {'name': 'battery2_charge_energy_total_low', 'scale': 1, 'unit': '', 'pair': 31304, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        31305: {'name': 'battery2_charge_energy_total', 'scale': 1, 'unit': '', 'pair': 31304, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
         31306: {'name': 'battery2_discharge_energy_today_high', 'scale': 1, 'unit': '', 'pair': 31307},
-        31307: {'name': 'battery2_discharge_energy_today_low', 'scale': 1, 'unit': '', 'pair': 31306, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        31307: {'name': 'battery2_discharge_energy_today', 'scale': 1, 'unit': '', 'pair': 31306, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
         31308: {'name': 'battery2_discharge_energy_total_high', 'scale': 1, 'unit': '', 'pair': 31309},
-        31309: {'name': 'battery2_discharge_energy_total_low', 'scale': 1, 'unit': '', 'pair': 31308, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
+        31309: {'name': 'battery2_discharge_energy_total', 'scale': 1, 'unit': '', 'pair': 31308, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
         # Battery 2 State
         31314: {'name': 'battery2_voltage', 'scale': 0.1, 'unit': 'V', 'signed': True,
@@ -348,6 +388,10 @@ MOD_6000_15000TL3_XH = {
         31316: {'name': 'battery2_current_low', 'scale': 1, 'unit': '', 'pair': 31315, 'combined_scale': 0.1, 'combined_unit': 'A', 'signed': True},
         31317: {'name': 'battery2_soc', 'scale': 1, 'unit': '%'},
         31318: {'name': 'battery2_soh', 'scale': 1, 'unit': '%'},
+        # Full-charge capacity, 0.1 Ah - the same layout as 31219-31220 (#482).
+        31319: {'name': 'battery2_fcc_high', 'scale': 1, 'unit': '', 'pair': 31320},
+        31320: {'name': 'battery2_full_charge_capacity', 'scale': 1, 'unit': '', 'pair': 31319,
+                'combined_scale': 0.1, 'combined_unit': 'Ah'},
         31323: {'name': 'battery2_temp', 'scale': 0.1, 'unit': '°C', 'signed': True},
 
         # Battery clusters 3 and 4 (VPP V2.03 spec, gate: batteryN_voltage > 0)
@@ -358,16 +402,29 @@ MOD_6000_15000TL3_XH = {
         # Per VPP 2.01 protocol spec (same layout as MID — confirmed on MID via #245 scan):
 
         # Active power (INT32 signed, 0.1W) — spec item 45
-        # Positive = export to grid, Negative = import from grid.
-        # Register 3043/3044 (power_to_grid_high/low) returns 0 on some firmware when the VPP
-        # range is active; 31100/31101 carries the authoritative signed active power value.
-        # maps_to power_to_grid_low so coordinator sees grid export (positive=export).
+        #
+        # This is the inverter's own AC output. It is NOT net grid exchange, and it must not
+        # be mapped to power_to_grid_low.
+        #
+        # It used to be, on the reasoning that "hybrid firmware subtracts battery and load,
+        # so Active Power IS the correct source for grid export". Two devices disproved that:
+        #
+        #   MOD 10KTL3-HU  PV 2557.2, charging 1796, load 780.2 -> grid ~0
+        #                  31101 read 702.7 and was published as 702.7 W of export
+        #   MOD TL3-XH     PV 1635.9, discharging 2004, load 3647.8 -> grid ~0
+        #                  31101 read 3574 and was published as 3574 W of export
+        #
+        # In both cases 31101 tracks PV minus battery minus losses - the AC output - while
+        # the house was self-consuming and nothing was flowing to the grid (#415).
+        #
+        # The MID grid-tied map corrected the same mistake in v0.8.6 and documented why;
+        # this map kept the old mapping. Grid flow on this family comes from 3041-3044, and
+        # from 31112/31113 where a meter feeds them.
         31100: {'name': 'ac_active_power_high', 'scale': 1, 'unit': '', 'pair': 31101,
-                'desc': 'Active power HIGH (INT32 signed, positive=export)'},
+                'desc': 'Active power HIGH (INT32 signed) — inverter AC output, not grid'},
         31101: {'name': 'ac_active_power_low', 'scale': 1, 'unit': '', 'pair': 31100,
                 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True,
-                'maps_to': 'power_to_grid_low',
-                'desc': 'Active power LOW — maps_to power_to_grid (positive=export per VPP 2.01 item 45)'},
+                'desc': 'Active power LOW (VPP 2.03 item 45) — inverter AC output, NOT grid export (#415)'},
 
         # Meter power (INT32 signed, 0.1W) — spec item 55
         # NOTE: sign convention OPPOSITE to active power — positive = IMPORT from grid.
@@ -417,7 +474,7 @@ MOD_6000_15000TL3_XH = {
 
         # Status
         31000: {'name': 'equipment_status', 'scale': 1, 'unit': '', 'desc': 'Equipment running status'},
-        31001: {'name': 'battery_working_status', 'scale': 1, 'unit': '', 'desc': '0=Idle, 1=Charge, 2=Discharge, 3=Fault, 4=Standby, 5=Shutdown'},
+        31001: {'name': 'battery_working_status', 'scale': 1, 'unit': '', 'desc': '0=Standby, 1=Disconnected, 2=Charging, 3=Discharging, 4=Fault, 5=Upgrade (VPP V2.01)'},
     },
     'holding_registers': {
         # Basic control
@@ -639,7 +696,7 @@ MOD_6000_15000TL3_XH = {
                        'cloud read-back (#372); not in any public protocol document'},
 
         # ====================================================================
-        # VPP remote power control (30100, 30407-30410, 30474) — READ ONLY
+        # VPP remote power control (30100, 30407-30410, 30474)
         # ====================================================================
         #
         # Mapped read-only on purpose. @KevlarD-67 demonstrated on hardware (#373) that
@@ -674,21 +731,92 @@ MOD_6000_15000TL3_XH = {
         # No new read code is needed: growatt_modbus.py already probes anchors 30100 and
         # 30407 behind `if <addr> in holding_map`, so adding them here activates the
         # existing path, including the 300 s failure retry from #370.
-        30100: {'name': 'control_authority', 'scale': 1, 'unit': '', 'access': 'RO',
-                'desc': 'VPP master enable. Read-only here — remote power control does nothing '
-                        'without it, and commanding power is not yet guarded (#373)'},
-        30407: {'name': 'remote_power_control_enable', 'scale': 1, 'unit': '', 'access': 'RO',
-                'desc': 'Remote power control enable. Does nothing unless 30100 is also set (#373)'},
-        30408: {'name': 'remote_power_control_charging_time', 'scale': 1, 'unit': 'min', 'access': 'RO',
+        # Writable on DTC 5400, and every one of them disabled by default.
+        #
+        # These were RO because commanding VPP power was unguarded. The measurement that
+        # changed it is on #373: a *standing* 30100 = 1 does not merely compete with the
+        # RTU scheduler, it removes it from circuit. Per V2.03 section 3.3.3, with authority
+        # held and an empty scheduler block the inverter enters the VPP model and 3047,
+        # 3049 and the Battery First slot all stop applying together.
+        #
+        #     30100 = 1   84 min   bought 0.04 kWh   against a plan of 3.53 kWh
+        #     30100 = 0   51 min   bought 4.33 kWh   SoC 37 -> 65 %
+        #
+        # Silently: no error, no entity going unavailable, nothing in a log. The reporter
+        # took 84 minutes to notice while watching at 1 Hz. Anyone not watching loses a
+        # night of cheap-rate charging with no way to find out why - which is why these
+        # arrive disabled, and why 30100 carries the warning in its own name.
+        30100: {'name': 'control_authority', 'scale': 1, 'unit': '',
+                'values': {0: 'Disabled', 1: 'Enabled'},
+                'desc': 'VPP master enable. WARNING: enabling this takes the TOU schedule out '
+                        'of circuit - 3047, 3049 and the Battery First slots all stop applying '
+                        'while it is set (#373)'},
+        # NOT a master on/off for the block, despite the name. It selects which branch
+        # drives the inverter: the direct setpoint (30409) or the roster/TOU schedule
+        # (30412-30471).
+        #
+        # Measured by counter deltas over 13:00-15:00 on 04-09, with Growatt's own scheduler
+        # driving and 30407 standing at 0 the whole afternoon: battery charge +12.30 kWh,
+        # grid import +13.37 kWh, discharge 0.00. Twelve kilowatt-hours went into the battery
+        # through the roster branch while this register read "Disabled" (#349).
+        #
+        # So do not test 30407 to answer "is external power control active". 30100 is the
+        # authority bit; this one only picks the branch.
+        #
+        # The value labels below were the wrong way round in v1.10.0-b7 through v1.10.0:
+        # they read 0 as the direct branch, while the measurement three paragraphs up has
+        # the ROSTER driving with 30407 at 0. Corrected to match the evidence rather than
+        # the register's name. Selecting "Roster/TOU schedule" previously wrote the value
+        # that selects the direct branch.
+        #
+        # 1 as the direct branch is corroborated by the WIT control path, which sets 30407=1
+        # and then drives 30409 - the direct setpoint - and is reported working.
+        30407: {'name': 'remote_power_control_enable', 'scale': 1, 'unit': '',
+                'values': {0: 'Roster/TOU schedule', 1: 'Direct setpoint (30409)'},
+                'desc': 'Selects the direct-setpoint branch vs the roster branch - not a master '
+                        'enable. The roster branch drives the inverter with this at 0 (#349)'},
+        30408: {'name': 'remote_power_control_charging_time', 'scale': 1, 'unit': 'min',
+                'valid_range': (0, 1440),
                 'desc': 'Remote control duration. Expires without clearing 30407/30409/30100 (#373)'},
-        30409: {'name': 'remote_charge_and_discharge_power', 'scale': 1, 'unit': '%', 'access': 'RO',
-                'signed': True,
+        30409: {'name': 'remote_charge_and_discharge_power', 'scale': 1, 'unit': '%',
+                'signed': True, 'valid_range': (-100, 100),
                 'desc': 'Commanded power, -100 to +100%. A TARGET, not a limit: it will import from '
                         'the grid to reach it even with allow_grid_charge off (#373)'},
-        30410: {'name': 'vpp_ac_charge_enable', 'scale': 1, 'unit': '', 'access': 'RO',
-                'desc': 'VPP AC charge enable'},
+        # Something other than this integration appears to write this register, so do not
+        # trust a cached "last written" value against it.
+        #
+        # Stated at the strength the evidence actually supports. The reporter first placed
+        # the 1 -> 0 transition one second before his own control loop started, and then
+        # withdrew that: his register sweep samples every ~300 s, so the timestamp was a
+        # detection time inside a 316 s window that his loop start also falls within. The
+        # timing never excluded his own stack.
+        #
+        # What survives is the absence of a write path: two grep hits across his control
+        # loop, watchdog and strategy module - a read list and a register-class table - the
+        # register on his writer's deny list, and a write counter booking at the FC6 frame
+        # that has recorded no write to 30410 on any day. That is weaker than a timed
+        # observation and it is what there is (#373).
+        #
+        # 30100 went 1 -> 0 in the same sweep frame, so it may do this too. Unexplained,
+        # and deliberately not guessed at here.
+        # Three values, not two. VPP 2.03 (protocol-vpp.md row 30410) gives 0 = not enabled,
+        # 1 = AC charge with PV priority, 2 = AC charge with AC priority - which is what
+        # WRITABLE_REGISTERS offers and what wit.py already decoded. This profile listed only
+        # Disabled/Enabled, so the control could write a 2 that the sensor rendered as
+        # unknown (#373).
+        30410: {'name': 'vpp_ac_charge_enable', 'scale': 1, 'unit': '',
+                'values': {0: 'Disabled', 1: 'PV priority', 2: 'AC priority'},
+                'desc': 'VPP AC charge enable (0=off, 1=PV charging first, 2=AC charging '
+                        'first). The inverter changes this on its own - do not trust a '
+                        'cached value (#373)'},
 
-        # Mirrors the last commanded setpoint. Retains it after remote control is disabled —
+        # Mirrors the ACTIVE control value, not the commanded setpoint. The reporter first
+        # described it as mirroring 30409 and then corrected himself with a five-day count:
+        # 30474 moved 9-15 times a day across 30-08 to 03-09 while 30409 never moved once,
+        # his own layers disarmed throughout. A register that changes while its supposed
+        # source is static is not mirroring that source (#400).
+        #
+        # Retains the value after remote control is disabled —
         # confirmed ten hours on, still reading -33 (raw 65503) with 30100/30407/30409 all
         # zero, which also confirms the two's complement decode. A direct write is accepted
         # and ignored: the echo returns the written value, the read-back keeps the old one.
@@ -699,6 +827,16 @@ MOD_6000_15000TL3_XH = {
         30474: {'name': 'vpp_last_setpoint', 'scale': 1, 'unit': '%', 'access': 'RO',
                 'signed': True,
                 'desc': 'Mirror of the last commanded VPP power setpoint. Write-ignored (#373)'},
+
+        # Listed as `Reserve` in the V2.01 register table (row 87, RW, count 20), but the
+        # V2.03 section 3.3.3 flow gives it a job: in the self-consumption branch it is what
+        # "Default mode is Load first, can change by 30476" refers to. Reads 0 on a MOD-XH.
+        # Mapped read-only so the value is visible without offering a control for behaviour
+        # nobody here has measured - a register documented as nothing in one version and as
+        # the default-mode selector in another is worth seeing (#373).
+        30476: {'name': 'vpp_default_mode', 'scale': 1, 'unit': '', 'access': 'RO',
+                'desc': 'Default operating mode in the VPP self-consumption branch. `Reserve` in '
+                        'the V2.01 table, load-bearing in the V2.03 3.3.3 diagram (#373)'},
 
         # Safety/compliance diagnostic registers (read-only, Issue #282)
         235: {'name': 'ntognd_detect',     'scale': 1, 'unit': '', 'access': 'R', 'desc': '0=Disable, 1=Enable — NToGND detection'},
@@ -744,7 +882,7 @@ MOD_6000_15000TL3_X = {
         # Aliased to ac_power so the generic ac_power sensor reflects the correct total.
         # Do NOT alias ac_power_r (reg 40/41) — that is Phase R only, not total.
         35: {'name': 'output_power_high', 'scale': 1, 'unit': '', 'pair': 36, 'alias': 'ac_power_high'},
-        36: {'name': 'output_power_low', 'scale': 1, 'unit': '', 'pair': 35, 'combined_scale': 0.1, 'combined_unit': 'W', 'alias': 'ac_power_low'},
+        36: {'name': 'output_power_low', 'scale': 1, 'unit': '', 'pair': 35, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True, 'alias': 'ac_power_low'},
 
         # === AC OUTPUT - THREE PHASE ===
         # Grid Frequency (shared across all phases)

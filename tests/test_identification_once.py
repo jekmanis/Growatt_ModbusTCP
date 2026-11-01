@@ -26,8 +26,9 @@ import pytest
 
 WIT_MAP = "WIT_4000_15000TL3"
 
-# The five reads a WIT identification pass issues, in order.
-WIT_IDENT_READS = [(23, 5), (9, 3), (125, 8), (30099, 1), (45, 6)]
+# The reads a WIT identification pass issues, in order. (82, 6) is upstream's firmware
+# build string (v2.0.x, #458), added to the same one-shot pass by the v2.0.6 merge.
+WIT_IDENT_READS = [(23, 5), (9, 3), (82, 6), (125, 8), (30099, 1), (45, 6)]
 
 
 class FakeHub:
@@ -147,7 +148,7 @@ def test_unanswered_reads_are_cached_per_register(coordinator_module):
 
     coord._run_identification()
     assert coord._identification_failed_reads == {
-        "serial", "inverter_type", "protocol_version", "clock"
+        "serial", "firmware_build", "inverter_type", "protocol_version", "clock"
     }
 
     # Force another pass the way a retry window expiring would.

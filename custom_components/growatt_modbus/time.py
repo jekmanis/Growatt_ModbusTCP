@@ -9,11 +9,13 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.entity import EntityCategory
+from homeassistant.exceptions import HomeAssistantError
 
+from .tou_packing import publish as tou_publish
 from .const import DOMAIN, WRITABLE_REGISTERS, CONF_REGISTER_MAP, get_device_type_for_control, DEVICE_TYPE_BATTERY, MOD_TOU_PERIODS, WIT_REGISTER_MAPS
 from .coordinator import GrowattModbusCoordinator
 from .entity import GrowattEntity
-from .growatt_modbus import ModbusWriteError
+from .growatt_modbus import ModbusWriteError, RATE_LIMITED_MESSAGE
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -58,10 +60,13 @@ async def async_setup_entry(
 
     # MOD TL3-XH TOU time pickers (4 start + 4 end = 8 entities)
     if 3038 in holding_registers:
+        tou_off = REGISTER_MAPS.get(register_map_name, {}).get('tou_disabled_by_default', False)
         for period_def in MOD_TOU_PERIODS:
-            p = period_def["period"]
-            entities.append(GrowattModTouTime(coordinator, config_entry, period_def, is_start=True))
-            entities.append(GrowattModTouTime(coordinator, config_entry, period_def, is_start=False))
+            for is_start in (True, False):
+                entity = GrowattModTouTime(coordinator, config_entry, period_def, is_start=is_start)
+                if tou_off:
+                    entity._attr_entity_registry_enabled_default = False
+                entities.append(entity)
         _LOGGER.info("MOD TOU time controls enabled (%d time entities for %d periods)",
                      len(MOD_TOU_PERIODS) * 2, len(MOD_TOU_PERIODS))
 
@@ -316,6 +321,8 @@ class GrowattGenericTime(GrowattEntity, TimeEntity):
         except ModbusWriteError:
             _LOGGER.error("Failed to write %s (register %d)", self._control_name, register)
             return
+        if not write_ok:
+            raise HomeAssistantError(RATE_LIMITED_MESSAGE.format(name=self._control_name))
         if write_ok:
             if verified:
                 _LOGGER.info(
@@ -471,6 +478,10 @@ class GrowattModTouTime(GrowattEntity, TimeEntity):
             )
             self.coordinator.track_write(period["start_reg"], new_start, period["start_field"])
             self.coordinator.track_write(period["end_reg"], new_end, period["end_field"])
+            # Show it on every entity of this period now, not after the next poll (#475).
+            tou_publish(self.coordinator.data, period["start_field"], period["end_field"],
+                        new_start, new_end)
+            self.coordinator.async_update_listeners()
             await self.coordinator.async_request_refresh()
         else:
             _LOGGER.warning(

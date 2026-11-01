@@ -83,18 +83,33 @@ def _resolve_list(name: str) -> list[str]:
     raise AssertionError(f"cannot resolve {name} to a list literal")
 
 
+def _battery_mode_aliases() -> dict[str, str]:
+    """diagnostic._BATTERY_MODE_ALIASES, read from source (HA is not importable here)."""
+    match = re.search(r"^_BATTERY_MODE_ALIASES = (\{.*?\})$", DIAGNOSTIC_SRC, re.M)
+    assert match, "_BATTERY_MODE_ALIASES is no longer a module-level dict literal"
+    return ast.literal_eval(match.group(1))
+
+
 def _schema_values(constant: str, field: str) -> list[str]:
-    """The values `vol.In(...)` accepts for one required field of one schema."""
+    """The values `vol.In(...)` accepts for one required field of one schema.
+
+    Since the v2.0.6 merge the set_battery_mode field is
+    `vol.All(_battery_mode_alias, vol.In([...]))`: the alias maps the fork's spelling onto
+    upstream's list before vol.In checks it, so an alias key counts as accepted exactly
+    when the value it maps to is in the list.
+    """
     block = _schema_block(constant)
     match = re.search(
-        rf'vol\.Required\("{field}"\): vol\.In\(\s*(\[.*?\]|[A-Z_][A-Z_0-9]*)\s*\)',
+        rf'vol\.Required\("{field}"\): (vol\.All\(\s*_battery_mode_alias,\s*)?'
+        rf'vol\.In\(\s*(\[.*?\]|[A-Z_][A-Z_0-9]*)\s*\)',
         block, re.S,
     )
     assert match, f"{constant}: no vol.In for {field!r}"
-    literal = match.group(1)
-    if literal.startswith("["):
-        return ast.literal_eval(literal)
-    return _resolve_list(literal)
+    literal = match.group(2)
+    values = ast.literal_eval(literal) if literal.startswith("[") else _resolve_list(literal)
+    if match.group(1):
+        values = values + [k for k, v in _battery_mode_aliases().items() if v in values]
+    return values
 
 
 def _handler_source(name: str) -> str:
@@ -161,7 +176,9 @@ def test_the_tou_standby_power_word_is_documented_as_one_percent() -> None:
 
     for source in (_handler_source("set_battery_mode"),
                    (COMPONENT / "select.py").read_text(encoding="utf-8")):
-        assert "[start_min, end_min, 1]" in source, (
+        # [start, end, power]; upstream renamed the bounds to period_start/period_end
+        # when Hold learned to split a window across midnight (#423).
+        assert re.search(r"\[\w*start\w*, \w*end\w*, 1\]", source), (
             "the code that actually writes a TOU standby period no longer uses +1%; "
             "services.yaml and this test need revisiting together"
         )

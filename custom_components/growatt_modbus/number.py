@@ -6,6 +6,7 @@ from typing import Any
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.entity import EntityCategory
@@ -22,7 +23,7 @@ from .const import (
 )
 from .coordinator import GrowattModbusCoordinator
 from .entity import GrowattEntity
-from .growatt_modbus import ModbusWriteError
+from .growatt_modbus import ModbusWriteError, RATE_LIMITED_MESSAGE
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -231,6 +232,11 @@ class GrowattGenericNumber(GrowattEntity, NumberEntity):
             or friendly_overrides.get(control_name)
             or control_name.replace('_', ' ').title()
         )
+        if (
+            control_name == 'grid_first_discharge_stopped_soc'
+            and config_entry.data.get(CONF_REGISTER_MAP) == 'MIN_TL_XH_3000_10000_V201'
+        ):
+            friendly_name = 'On-Grid Discharge Stop SOC'
         self._attr_name = friendly_name
 
         # Set icon
@@ -254,13 +260,12 @@ class GrowattGenericNumber(GrowattEntity, NumberEntity):
 
         The second reason is a block that was not read at all this poll. Registers
         30100 / 30200-30201 / 30407-30410 are optional best-effort reads; when one is
-        missed, GrowattData still carries its dataclass default (0), which HA would
-        publish as a real "Disabled"/0 setting. That is the same class of defect as the
-        mode sensor frozen at "Passthrough" — a fabricated reading is worse than none.
-        VPP_CONTROL_AVAILABILITY_FLAG maps the control to the flag that proves its block
-        responded; controls not backed by such a block have no entry and are unaffected.
+        missed, GrowattData still carries its dataclass default (0), which would be
+        published as a real "Disabled"/0 setting. VPP_CONTROL_AVAILABILITY_FLAG maps the
+        control to the flag that proves its block responded; controls not backed by such
+        a block have no entry and are unaffected.
 
-        The two conditions are ANDed, not substituted for one another: they answer
+        The two conditions are ANDed rather than substituted for one another: they answer
         different questions ("will the write be accepted?" vs "do we know the current
         value?").
         """
@@ -287,6 +292,7 @@ class GrowattGenericNumber(GrowattEntity, NumberEntity):
             'gen_charge_current': 'mdi:current-ac',
             'bat_low_to_uti': 'mdi:battery-alert',
             'ac_to_bat_volt': 'mdi:battery-charging',
+            'bat_low_cutoff': 'mdi:battery-off-outline',
             'vpp_export_limit_power_rate': 'mdi:transmission-tower-export',
             'load_first_battery_minimum_soc': 'mdi:battery-sync',
         }
@@ -300,22 +306,14 @@ class GrowattGenericNumber(GrowattEntity, NumberEntity):
 
         # Check if battery-dependent
         if self._control_config.get('battery_dependent', False):
-            # Read battery type from coordinator data
-            battery_type = getattr(self.coordinator.data, 'battery_type', None) if self.coordinator.data else None
-            is_lithium = (battery_type == 3)  # 3 = Lithium
-
-            if is_lithium:
-                # Lithium: 0-1000 raw = 0% - 100%
-                self._attr_native_min_value = 0.0
-                self._attr_native_max_value = 100.0
-                self._attr_native_step = 1.0
-                self._attr_native_unit_of_measurement = "%"
-            else:
-                # Non-Lithium: 200-640 raw = 20.0V - 64.0V
-                self._attr_native_min_value = 20.0
-                self._attr_native_max_value = 64.0
-                self._attr_native_step = 0.1
-                self._attr_native_unit_of_measurement = "V"
+            # Seed the attributes so the entity is valid before the first read. The real
+            # values come from the properties below, which follow battery_type at runtime —
+            # these are only the starting point. See _battery_dependent_bounds() (#428).
+            bounds = self._battery_dependent_bounds()
+            self._attr_native_min_value = bounds[0]
+            self._attr_native_max_value = bounds[1]
+            self._attr_native_step = bounds[2]
+            self._attr_native_unit_of_measurement = bounds[3]
         else:
             # Normal number control
             self._attr_native_min_value = float(valid_range[0]) * scale
@@ -342,17 +340,20 @@ class GrowattGenericNumber(GrowattEntity, NumberEntity):
         if data is None:
             return None
 
-        # A block that was not read this poll carries dataclass defaults — report
-        # unknown rather than a fabricated value (see available()). Kept in addition to
-        # the availability gate because HA keeps the last state of an unavailable entity
-        # around, and a 0 written there once would linger as a plausible-looking value.
-        # Written out rather than factored into a helper shared with available(): the
-        # wiring is asserted at source level by
-        # tests/test_optional_holding_backoff.py::test_control_entities_consult_the_availability_map,
-        # which counts two literal flag lookups per platform file (so this comment must
-        # not spell the expression out a third time).
+        # A block that was not read this poll carries dataclass defaults - report unknown
+        # rather than a fabricated value (see available()). Kept in addition to the
+        # availability gate because Home Assistant keeps the last state of an unavailable
+        # entity, and a 0 written there once would linger as a plausible-looking value.
         flag = VPP_CONTROL_AVAILABILITY_FLAG.get(self._control_name)
         if flag is not None and not getattr(data, flag, False):
+            return None
+
+        # Same reasoning one step finer: the read path marks an individual control unread
+        # when its register answered with something that is not a value - an SPF 5000 ES
+        # returns 0xFFFF for generator charge current because it has no such setting (#444).
+        # The field keeps its 0 default, so without this the entity would publish 0 A, which
+        # is a plausible-looking limit rather than an obviously absent one.
+        if self._control_name in getattr(data, 'unread_fields', ()):
             return None
 
         raw_value = getattr(data, self._control_name, None)
@@ -362,6 +363,161 @@ class GrowattGenericNumber(GrowattEntity, NumberEntity):
         # Apply scale
         scale = self._control_config.get('scale', 1)
         return round(float(raw_value) * scale, 2)
+
+    # ------------------------------------------------------------------
+    # Paired-register bounds (#387)
+    #
+    # Some registers constrain each other. On SPF, Bulk (Program 19, register 35) is the
+    # constant-voltage stage and Float (Program 20, register 36) the maintenance stage, and
+    # the firmware refuses a bulk voltage below float. Both sliders spanned the same
+    # 48.0-58.4 V independently, so nothing stopped a user asking for the combination the
+    # hardware will always reject.
+    #
+    # What that looked like from the outside was not "invalid setting". The write was
+    # acknowledged, the inverter discarded it, the read-back check noticed, and the user got
+    # "settings are being reverted" - a repair notice about the integration, for a request
+    # the inverter was right to refuse.
+    #
+    # Only this pair is known to interact. Constraints are declared per control rather than
+    # inferred, because inventing relationships between registers on the strength of one
+    # documented case would be worse than leaving them independent.
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Battery-type-dependent bounds (#428)
+    #
+    # On SPF, registers 37 and 95 are a voltage threshold on lead-acid and self-defined
+    # battery types, and a percentage of state of charge on lithium. Two different units and
+    # two different ranges behind one register.
+    #
+    # These used to be resolved once in __init__ and frozen as _attr_ values. That fails in
+    # two ways. A reporter with 3x AXE 5.0 lithium had 75 (%) validated against the lead-acid
+    # ceiling of 64 V and could not set any target above 64 % from Home Assistant at all. And
+    # battery_type is itself a writable control here, so changing it left both entities on the
+    # old unit and range until Home Assistant was restarted.
+    #
+    # Resolved live instead, so they follow the register they depend on.
+    # ------------------------------------------------------------------
+
+    _LITHIUM_BATTERY_TYPE = 3
+
+    def _battery_dependent_bounds(self) -> tuple[float, float, float, str]:
+        """(min, max, step, unit) for a control whose meaning follows the battery type."""
+        data = self.coordinator.data
+        battery_type = getattr(data, 'battery_type', None) if data is not None else None
+
+        if battery_type == self._LITHIUM_BATTERY_TYPE:
+            # Percentage of state of charge: raw 0-1000 at scale 0.1 is 0-100 %.
+            return (0.0, 100.0, 1.0, "%")
+        # Battery voltage: raw 200-640 at scale 0.1 is 20.0-64.0 V.
+        return (20.0, 64.0, 0.1, "V")
+
+    @property
+    def _is_battery_dependent(self) -> bool:
+        return bool(self._control_config.get('battery_dependent', False))
+
+    @property
+    def native_step(self) -> float:
+        if self._is_battery_dependent:
+            return self._battery_dependent_bounds()[2]
+        return self._attr_native_step
+
+    @property
+    def native_unit_of_measurement(self) -> str:
+        if self._is_battery_dependent:
+            return self._battery_dependent_bounds()[3]
+        return self._attr_native_unit_of_measurement
+
+    def _paired_bound(self, other_control: str) -> float | None:
+        """Live display value of another control, if it is usable as a bound.
+
+        Returns None when the value is missing or outside this control's own static range -
+        which is what an unread register looks like, since it keeps its 0.0 default. Without
+        that guard a Float slider would take its maximum from a Bulk register that had not
+        been read yet and collapse to 0.
+        """
+        data = self.coordinator.data
+        if data is None:
+            return None
+
+        raw_value = getattr(data, other_control, None)
+        if raw_value is None or other_control in getattr(data, 'unread_fields', ()):
+            return None
+
+        other = WRITABLE_REGISTERS.get(other_control)
+        if not other:
+            return None
+
+        value = round(float(raw_value) * other.get('scale', 1), 2)
+        # The range this control has right now. A battery-dependent pair is % on Lithium and
+        # V otherwise, so its partner has to be judged against that, not the static range.
+        if self._is_battery_dependent:
+            lo, hi = self._battery_dependent_bounds()[:2]
+        else:
+            lo, hi = self._attr_native_min_value, self._attr_native_max_value
+        if not (lo <= value <= hi):
+            return None
+        return value
+
+    def _check_paired_constraint(self, value: float) -> None:
+        """Raise if `value` would cross a paired control. No-op where none is declared."""
+        floor_from = self._control_config.get('not_below')
+        if floor_from:
+            paired = self._paired_bound(floor_from)
+            if paired is not None and value < paired:
+                raise HomeAssistantError(
+                    f"{self._attr_name or self._control_name} cannot be set below "
+                    f"{paired} {self.native_unit_of_measurement}, the current "
+                    f"{self._friendly(floor_from)}. The inverter "
+                    f"refuses this combination, and the write would appear to succeed and "
+                    f"then revert."
+                )
+
+        ceiling_from = self._control_config.get('not_above')
+        if ceiling_from:
+            paired = self._paired_bound(ceiling_from)
+            if paired is not None and value > paired:
+                raise HomeAssistantError(
+                    f"{self._attr_name or self._control_name} cannot be set above "
+                    f"{paired} {self.native_unit_of_measurement}, the current "
+                    f"{self._friendly(ceiling_from)}. The inverter "
+                    f"refuses this combination, and the write would appear to succeed and "
+                    f"then revert."
+                )
+
+    @staticmethod
+    def _friendly(control_name: str) -> str:
+        """Readable name for the paired control, for an error a user has to act on."""
+        return control_name.replace('_', ' ').title()
+
+    @property
+    def native_min_value(self) -> float:
+        """Minimum, raised to the paired control's value where one is declared.
+
+        The pair applies to battery-dependent controls too. They used to return their range
+        before the pair was considered, which was harmless while only Bulk/Float had one -
+        and would have made the SPF switchover pair (#471) decorative.
+        """
+        lo = (self._battery_dependent_bounds()[0] if self._is_battery_dependent
+              else self._attr_native_min_value)
+        floor_from = self._control_config.get('not_below')
+        if floor_from:
+            paired = self._paired_bound(floor_from)
+            if paired is not None:
+                return max(lo, paired)
+        return lo
+
+    @property
+    def native_max_value(self) -> float:
+        """Maximum, lowered to the paired control's value where one is declared."""
+        hi = (self._battery_dependent_bounds()[1] if self._is_battery_dependent
+              else self._attr_native_max_value)
+        ceiling_from = self._control_config.get('not_above')
+        if ceiling_from:
+            paired = self._paired_bound(ceiling_from)
+            if paired is not None:
+                return min(hi, paired)
+        return hi
 
     async def async_set_native_value(self, value: float) -> None:
         """Update the current value."""
@@ -373,6 +529,15 @@ class GrowattGenericNumber(GrowattEntity, NumberEntity):
         # Validate range
         valid_range = self._control_config.get('valid_range', (0, 100))
         raw_value = max(valid_range[0], min(raw_value, valid_range[1]))
+
+        # Paired-register constraint (#387). The dynamic bounds above stop this being
+        # reachable from the UI slider, but number.set_value from a script or the REST API
+        # bypasses them entirely - and that is the path an automation would take.
+        #
+        # Refused with a reason rather than clamped silently: someone asking for 52.0 V when
+        # float sits at 54.0 V has a mistaken idea of what the inverter will do, and quietly
+        # writing 54.0 V instead would hide that.
+        self._check_paired_constraint(value)
 
         # Write to Modbus register with read-back verification
         register = self._control_config['register']
@@ -402,23 +567,30 @@ class GrowattGenericNumber(GrowattEntity, NumberEntity):
         # revert each other. This brings the single-register path in line with it.
         #
         # One extra read, on a user-initiated write only. Nothing here writes by itself.
-        current_raw = await self.hass.async_add_executor_job(
-            self.coordinator.modbus_client.read_holding_registers, register, 1
-        )
-        if current_raw is not None and len(current_raw) >= 1:
-            if int(current_raw[0]) == (raw_value & 0xFFFF):
-                _LOGGER.debug(
-                    "%s already reads %s (raw %d) — skipping write to register %d",
-                    self._control_name, value, raw_value, register,
-                )
-                return
-        else:
-            # Unreadable: the comparison is meaningless, so the write goes ahead. A
-            # skipped write that should have happened is worse than a redundant one.
-            _LOGGER.debug(
-                "%s: could not read register %d before writing - proceeding without the "
-                "no-op check", self._control_name, register,
+        #
+        # Not for a command register. The EEPROM argument does not apply to one the
+        # protocol marks "not stored" (VPP 30408/30409), and there the write itself can be
+        # the command: rewriting 30408 with the same duration is how an automation would
+        # expect to restart the window, and skipping it would leave the old one running
+        # (#481).
+        if not self._control_config.get('not_stored'):
+            current_raw = await self.hass.async_add_executor_job(
+                self.coordinator.modbus_client.read_holding_registers, register, 1
             )
+            if current_raw is not None and len(current_raw) >= 1:
+                if int(current_raw[0]) == (raw_value & 0xFFFF):
+                    _LOGGER.debug(
+                        "%s already reads %s (raw %d) — skipping write to register %d",
+                        self._control_name, value, raw_value, register,
+                    )
+                    return
+            else:
+                # Unreadable: the comparison is meaningless, so the write goes ahead. A
+                # skipped write that should have happened is worse than a redundant one.
+                _LOGGER.debug(
+                    "%s: could not read register %d before writing - proceeding without the "
+                    "no-op check", self._control_name, register,
+                )
         try:
             write_ok, verified = await self.hass.async_add_executor_job(
                 self.coordinator.modbus_client.write_register_verified,
@@ -428,6 +600,9 @@ class GrowattGenericNumber(GrowattEntity, NumberEntity):
         except ModbusWriteError:
             _LOGGER.error("Failed to write %s (register %d)", self._control_name, register)
             return
+
+        if not write_ok:
+            raise HomeAssistantError(RATE_LIMITED_MESSAGE.format(name=self._control_name))
 
         if write_ok:
             if verified:
@@ -516,6 +691,9 @@ class GrowattExportLimitPowerNumber(GrowattEntity, NumberEntity):
             _LOGGER.error("Failed to write export_limit_power (register %d)", register)
             return
 
+        if not write_ok:
+            raise HomeAssistantError(RATE_LIMITED_MESSAGE.format(name='export_limit_power'))
+
         if write_ok:
             if verified:
                 _LOGGER.info("Set export_limit_power to %.1f%% (raw=%d, verified)", value, raw_value)
@@ -588,6 +766,9 @@ class GrowattActivePowerRateNumber(GrowattEntity, NumberEntity):
         except ModbusWriteError:
             _LOGGER.error("Failed to write active_power_rate (register %d)", register)
             return
+
+        if not write_ok:
+            raise HomeAssistantError(RATE_LIMITED_MESSAGE.format(name='active_power_rate'))
 
         if write_ok:
             if verified:
@@ -743,6 +924,20 @@ class GrowattWitActivePowerRateNumber(GrowattEntity, NumberEntity):
 # WIT VPP-specific Number Entities (30xxx registers)
 # =============================================================================
 
+def _polled_soc(data, field: str) -> float | None:
+    """A WIT VPP SOC limit as last polled, or None when it was not read.
+
+    The cut-off numbers used to show a copy kept by the entity itself, which started at a
+    fixed default (100 / 10) and only changed when written from Home Assistant. A limit set
+    in ShinePhone, or before a restart, never reached it: a WIT showed 10 % while 30405
+    held 30 % (#481).
+    """
+    if data is None or field in getattr(data, 'unread_fields', ()):
+        return None
+    value = getattr(data, field, None)
+    return None if value is None else float(value)
+
+
 class GrowattWitVppPowerPercentNumber(GrowattEntity, NumberEntity):
     """WIT VPP: Power percentage for charge/discharge operations.
 
@@ -814,7 +1009,7 @@ class GrowattWitVppChargeCutoffSocNumber(GrowattEntity, NumberEntity):
 
     @property
     def native_value(self) -> float | None:
-        return float(getattr(self.coordinator, "wit_vpp_charge_cutoff_soc", 100))
+        return _polled_soc(self.coordinator.data, "vpp_charge_stop_soc")
 
     async def async_set_native_value(self, value: float) -> None:
         raw_value = int(value)
@@ -828,7 +1023,9 @@ class GrowattWitVppChargeCutoffSocNumber(GrowattEntity, NumberEntity):
             )
 
             if success:
-                setattr(self.coordinator, "wit_vpp_charge_cutoff_soc", raw_value)
+                if self.coordinator.data is not None:
+                    self.coordinator.data.vpp_charge_stop_soc = raw_value
+                    self.coordinator.async_update_listeners()
                 _LOGGER.info("[WIT-VPP] Successfully set charge cutoff SOC to %d%%", raw_value)
                 await self.coordinator.async_request_refresh()
             else:
@@ -839,7 +1036,7 @@ class GrowattWitVppChargeCutoffSocNumber(GrowattEntity, NumberEntity):
 
 
 class GrowattWitVppDischargeCutoffSocNumber(GrowattEntity, NumberEntity):
-    """WIT VPP: Discharge cutoff SOC (30405) - stop discharging when SOC drops to this %."""
+    """WIT VPP: On-grid discharge cutoff SOC (30405) - stop discharging when SOC drops to this %."""
 
     # Box rather than slider - see GrowattGenericNumber (#402).
     _attr_mode = NumberMode.BOX
@@ -863,12 +1060,13 @@ class GrowattWitVppDischargeCutoffSocNumber(GrowattEntity, NumberEntity):
             "vpp_discharge_cutoff_soc",
             get_device_type_for_control("work_mode"),
         )
-        self._attr_name = "Discharge Cutoff SOC"
+        # 30405 is the on-grid floor; off-grid has its own (30475), so say which (#481).
+        self._attr_name = "On-Grid Discharge Cutoff SOC"
 
 
     @property
     def native_value(self) -> float | None:
-        return float(getattr(self.coordinator, "wit_vpp_discharge_cutoff_soc", 10))
+        return _polled_soc(self.coordinator.data, "vpp_ongrid_discharge_soc")
 
     async def async_set_native_value(self, value: float) -> None:
         raw_value = int(value)
@@ -882,7 +1080,9 @@ class GrowattWitVppDischargeCutoffSocNumber(GrowattEntity, NumberEntity):
             )
 
             if success:
-                setattr(self.coordinator, "wit_vpp_discharge_cutoff_soc", raw_value)
+                if self.coordinator.data is not None:
+                    self.coordinator.data.vpp_ongrid_discharge_soc = raw_value
+                    self.coordinator.async_update_listeners()
                 _LOGGER.info("[WIT-VPP] Successfully set discharge cutoff SOC to %d%%", raw_value)
                 await self.coordinator.async_request_refresh()
             else:

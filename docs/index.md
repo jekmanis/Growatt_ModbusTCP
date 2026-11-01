@@ -25,7 +25,7 @@ The integration polls your inverter directly over Modbus — the same protocol t
 - **[Battery & Scheduling](controls/battery-scheduling.md)** — TOU and charge/discharge scheduling
 - **[WIT Inverter Guide](controls/wit-guide.md)** — VPP protocol control for WIT models
 - **[Raising an Issue](troubleshooting/raising-an-issue.md)** — what to include when reporting a bug
-- **[Diagnostic Service](troubleshooting/diagnostic-service.md)** — Universal Register Scanner
+- **[Diagnostic Actions](troubleshooting/diagnostic-service.md)** — Universal Register Scanner
 - **[DTC Debugging](troubleshooting/dtc-debugging.md)** — device type code reference
 - **[RS485 Gateways](troubleshooting/rs485-gateways.md)** — which adapters work, and diagnosing one that doesn't
 - **[Adding Sensors](developer/adding-sensors.md)** — add registers and sensors to an existing profile
@@ -69,14 +69,25 @@ The setup wizard runs auto-detection automatically for VPP-capable inverters. Fo
 | Host / Device | IP address (e.g. `192.168.1.100`) | Path (e.g. `/dev/ttyUSB0`) |
 | Port / Baudrate | `502` | `9600` |
 | Slave ID | `1` (usually) | `1` (usually) |
+| Connection hardware | What the inverter is reached through | - |
+
+**Connection hardware** decides the polling timings you start with. The defaults suit a
+dedicated RS485 gateway; a Growatt ShineWiFi-X or ShineLan dongle needs slower, smaller
+reads or it drops out a minute or two after setup. Pick the one that matches and the four
+timing settings are filled in for you — see
+[RS485 Gateways](troubleshooting/rs485-gateways.md#setup-asks-what-your-hardware-is) for
+the values and the evidence behind them. You can change any of them afterwards.
 
 **Options (after setup):**
 
 | Option | Default | Description |
 | --- | --- | --- |
 | Device Name | "Growatt" | Prefix for all sensor names |
-| Scan Interval | 30 s | Polling frequency (5–300 s) |
+| Connection hardware | Dedicated RS485 gateway | Re-applies suggested timings for that hardware |
+| Scan Interval | 60 s | Polling frequency (5–300 s) |
 | Connection Timeout | 10 s | Response timeout (1–60 s) |
+| Modbus Request Delay | 250 ms | Pause between requests (50–1000 ms) |
+| Max Register Block Size | Auto | Registers per read — lower it for a gateway that truncates |
 | Invert Grid Power | Auto | Fix a backwards CT clamp |
 | USB / Serial Port | - | Change the adapter path without re-adding the entry |
 | Host / TCP Port | - | Change the gateway address without re-adding the entry |
@@ -186,13 +197,22 @@ The integration pre-configures sensors with the correct `state_class` and `devic
 
 ## Night-time Behaviour
 
-When the inverter powers down at night the integration detects the absence of valid register data and marks the inverter as offline. Sensors retain their last daytime values rather than dropping to zero or showing unavailable — preventing phantom energy spikes in the HA Energy Dashboard.
+Inverters behave in one of two ways once the sun goes down, and the integration treats them differently. Which one you see depends on your hardware, not on a setting.
 
-- Sensors remain **available** with last known values
-- `last_successful_update` attribute shows when data was last confirmed fresh
+**It still answers Modbus, but reports zeros ("dormant").** Common on hybrids, which stay powered for the battery. Sensors stay **available** holding their last daytime values, rather than dropping to zero — a lifetime total falling from 5000 kWh to 0 would otherwise read as a counter reset and spike the Energy Dashboard.
+
+**It stops answering Modbus entirely.** Usual on grid-tied models, which power down completely with no sun. The inverter is marked offline and **all entities go unavailable**. That is deliberate: Home Assistant's statistics engine ignores unavailable states, so an unresponsive inverter leaves a gap rather than recording a flatline as though it were measured.
+
+So **unavailable entities overnight are normal** on a model that powers down, and are not a fault to report. The same is true of the first minutes of daylight — an inverter showing a few watts on its display may not be answering Modbus yet.
+
+In both cases:
+
+- `last_successful_update` shows when data was last confirmed fresh
 - Lifetime energy totals are **persisted to HA storage** and restored across HA restarts
+- Sensors resume normal operation automatically when the inverter wakes
 
-Sensors resume normal operation automatically when the inverter wakes at sunrise.
+!!! note "After a Home Assistant restart there is nothing to hold"
+    Retained values live in the running integration. Restart Home Assistant while the inverter is asleep and the entities stay unavailable until the first poll that succeeds, even on a model that would otherwise hold its values.
 
 ---
 

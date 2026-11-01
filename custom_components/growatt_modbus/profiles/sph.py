@@ -1,6 +1,6 @@
 from .vpp_v201 import (
     VPP_V201_STATUS, VPP_V201_PV2_INPUT, VPP_V201_PV2_TOTAL,
-    VPP_V201_PV3_AND_TOTAL, VPP_V201_ENERGY_1P, VPP_V201_TEMPERATURE_1P,
+    VPP_V201_PV3_AND_TOTAL, VPP_V201_ENERGY_1P,
     VPP_V201_BATTERY2, VPP_V201_HOLDING_1P,
 )
 
@@ -82,8 +82,12 @@ SPH_3000_6000 = {
         1040: {'name': 'battery_temp', 'scale': 0.1, 'unit': '°C', 'signed': True, 'desc': 'Battery temperature'},
 
         # Power Flow — grid import/export and load (Issue #326)
-        1015: {'name': 'power_to_user_high', 'scale': 1, 'unit': '', 'pair': 1016, 'desc': 'Power to user (grid import when positive)'},
-        1016: {'name': 'power_to_user_low', 'scale': 1, 'unit': '', 'pair': 1015, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1015: {'name': 'power_to_user_r_high', 'scale': 1, 'unit': '', 'pair': 1016, 'desc': 'Power to user (grid import when positive)'},
+        1016: {'name': 'power_to_user_r_low', 'scale': 1, 'unit': '', 'pair': 1015, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1017: {'name': 'power_to_user_s_high', 'scale': 1, 'unit': '', 'pair': 1018, 'desc': 'Grid import S phase HIGH (PactouserS)'},
+        1018: {'name': 'power_to_user_s_low', 'scale': 1, 'unit': '', 'pair': 1017, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1019: {'name': 'power_to_user_t_high', 'scale': 1, 'unit': '', 'pair': 1020, 'desc': 'Grid import T phase HIGH (PactouserT)'},
+        1020: {'name': 'power_to_user_t_low', 'scale': 1, 'unit': '', 'pair': 1019, 'combined_scale': 0.1, 'combined_unit': 'W'},
         # 1021 was mapped as power_to_load and 1037 as self_consumption_power, which is
         # the wrong way round (#369). Per V1.39 the storage range runs in four 8-register
         # blocks — R, S, T, Total — so:
@@ -104,8 +108,8 @@ SPH_3000_6000 = {
         #
         # 1021 keeps a suffixed name so it does not collide with 1015 and does not
         # participate in fallback, matching what SPH_TL3_3000_10000_V201 already does.
-        1021: {'name': 'power_to_user_total_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal) — grid import'},
-        1022: {'name': 'power_to_user_total_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1021: {'name': 'power_to_user_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal) — grid import'},
+        1022: {'name': 'power_to_user_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
         1029: {'name': 'power_to_grid_high', 'scale': 1, 'unit': '', 'pair': 1030, 'desc': 'AC power to grid total (positive=export)'},
         1030: {'name': 'power_to_grid_low', 'scale': 1, 'unit': '', 'pair': 1029, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
         1037: {'name': 'power_to_load_high', 'scale': 1, 'unit': '', 'pair': 1038, 'desc': 'INV power to local load total H (PLocalLoad total) — house load'},
@@ -158,7 +162,7 @@ SPH_3000_6000 = {
         #
         # battery_current had no register at all on these profiles before this, so the
         # entity published its default of 0.00 A permanently - the same shape as #395.
-        1088: {'name': 'battery_current', 'scale': 0.01, 'unit': 'A', 'signed': True, 'desc': 'Battery current from BMS (confirmed vs clamp meter, #397)'},
+        1088: {'name': 'battery_current', 'scale': 0.01, 'unit': 'A', 'signed': True, 'desc': 'Battery current from BMS (confirmed vs clamp meter on this model, #397)'},
         1052: {'name': 'battery_discharge_today_high', 'scale': 1, 'unit': '', 'pair': 1053, 'desc': 'Battery discharge energy today HIGH (Edischarge1_today)'},
         1053: {'name': 'battery_discharge_today_low', 'scale': 1, 'unit': '', 'pair': 1052, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
         1054: {'name': 'battery_discharge_total_high', 'scale': 1, 'unit': '', 'pair': 1055, 'desc': 'Battery discharge energy total HIGH (Edischarge1_total)'},
@@ -307,27 +311,34 @@ SPH_3000_6000 = {
                    1: 'Enabled'
                }},
 
-        # Battery First extended time slots 4-6 (GEN3, registers 1017-1025)
-        1017: {'name': 'batt_first_time_period_4_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 4 start (hex-packed)'},
-        1018: {'name': 'batt_first_time_period_4_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 4 end (hex-packed)'},
-        1019: {'name': 'batt_first_time_period_4_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 4'},
-        1020: {'name': 'batt_first_time_period_5_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 5 start (hex-packed)'},
-        1021: {'name': 'batt_first_time_period_5_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 5 end (hex-packed)'},
-        1022: {'name': 'batt_first_time_period_5_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 5'},
-        1023: {'name': 'batt_first_time_period_6_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 6 start (hex-packed)'},
-        1024: {'name': 'batt_first_time_period_6_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 6 end (hex-packed)'},
-        1025: {'name': 'batt_first_time_period_6_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 6'},
+        # Slots 4-6 start at 1018, not the 1017 that Protocol V1.39 and the SPH-HUB manual
+        # print. Set in the app with marker times on an SPH3600 (firmware RAAa919486), each
+        # start/end landed one register later, and enabling Battery First 4 / Grid First 4
+        # changed only 1020 / 1029; 1017 stayed 0 (#484). The document's own table ends with
+        # a stray second 'Bat First Start Time 4' at 1035, the mark of a table numbered one
+        # off. Writing Battery First 5 and Grid First 6 from Home Assistant on b12 changed
+        # exactly their three registers each, read back in the app (#484).
+        # Battery First extended time slots 4-6 (GEN3, registers 1018-1026)
+        1018: {'name': 'batt_first_time_period_4_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 4 start (hex-packed)'},
+        1019: {'name': 'batt_first_time_period_4_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 4 end (hex-packed)'},
+        1020: {'name': 'batt_first_time_period_4_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 4'},
+        1021: {'name': 'batt_first_time_period_5_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 5 start (hex-packed)'},
+        1022: {'name': 'batt_first_time_period_5_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 5 end (hex-packed)'},
+        1023: {'name': 'batt_first_time_period_5_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 5'},
+        1024: {'name': 'batt_first_time_period_6_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 6 start (hex-packed)'},
+        1025: {'name': 'batt_first_time_period_6_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 6 end (hex-packed)'},
+        1026: {'name': 'batt_first_time_period_6_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 6'},
 
-        # Grid First extended time slots 4-6 (GEN3, registers 1026-1034)
-        1026: {'name': 'grid_first_time_period_4_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 4 start (hex-packed)'},
-        1027: {'name': 'grid_first_time_period_4_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 4 end (hex-packed)'},
-        1028: {'name': 'grid_first_time_period_4_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 4'},
-        1029: {'name': 'grid_first_time_period_5_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 5 start (hex-packed)'},
-        1030: {'name': 'grid_first_time_period_5_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 5 end (hex-packed)'},
-        1031: {'name': 'grid_first_time_period_5_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 5'},
-        1032: {'name': 'grid_first_time_period_6_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 6 start (hex-packed)'},
-        1033: {'name': 'grid_first_time_period_6_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 6 end (hex-packed)'},
-        1034: {'name': 'grid_first_time_period_6_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 6'},
+        # Grid First extended time slots 4-6 (GEN3, registers 1027-1035)
+        1027: {'name': 'grid_first_time_period_4_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 4 start (hex-packed)'},
+        1028: {'name': 'grid_first_time_period_4_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 4 end (hex-packed)'},
+        1029: {'name': 'grid_first_time_period_4_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 4'},
+        1030: {'name': 'grid_first_time_period_5_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 5 start (hex-packed)'},
+        1031: {'name': 'grid_first_time_period_5_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 5 end (hex-packed)'},
+        1032: {'name': 'grid_first_time_period_5_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 5'},
+        1033: {'name': 'grid_first_time_period_6_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 6 start (hex-packed)'},
+        1034: {'name': 'grid_first_time_period_6_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 6 end (hex-packed)'},
+        1035: {'name': 'grid_first_time_period_6_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 6'},
 
         # Grid First extended time slots 7-9 (GEN3, registers 1080-1088)
         1080: {'name': 'grid_first_time_period_7_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 7 start (hex-packed)'},
@@ -401,8 +412,12 @@ SPH_7000_10000 = {
         1040: {'name': 'battery_temp', 'scale': 0.1, 'unit': '°C', 'signed': True, 'desc': 'Battery temperature'},
 
         # Power Flow — grid import/export and load (Issue #326)
-        1015: {'name': 'power_to_user_high', 'scale': 1, 'unit': '', 'pair': 1016, 'desc': 'Power to user (grid import when positive)'},
-        1016: {'name': 'power_to_user_low', 'scale': 1, 'unit': '', 'pair': 1015, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1015: {'name': 'power_to_user_r_high', 'scale': 1, 'unit': '', 'pair': 1016, 'desc': 'Power to user (grid import when positive)'},
+        1016: {'name': 'power_to_user_r_low', 'scale': 1, 'unit': '', 'pair': 1015, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1017: {'name': 'power_to_user_s_high', 'scale': 1, 'unit': '', 'pair': 1018, 'desc': 'Grid import S phase HIGH (PactouserS)'},
+        1018: {'name': 'power_to_user_s_low', 'scale': 1, 'unit': '', 'pair': 1017, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1019: {'name': 'power_to_user_t_high', 'scale': 1, 'unit': '', 'pair': 1020, 'desc': 'Grid import T phase HIGH (PactouserT)'},
+        1020: {'name': 'power_to_user_t_low', 'scale': 1, 'unit': '', 'pair': 1019, 'combined_scale': 0.1, 'combined_unit': 'W'},
         # 1021 was mapped as power_to_load and 1037 as self_consumption_power, which is
         # the wrong way round (#369). Per V1.39 the storage range runs in four 8-register
         # blocks — R, S, T, Total — so:
@@ -423,8 +438,8 @@ SPH_7000_10000 = {
         #
         # 1021 keeps a suffixed name so it does not collide with 1015 and does not
         # participate in fallback, matching what SPH_TL3_3000_10000_V201 already does.
-        1021: {'name': 'power_to_user_total_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal) — grid import'},
-        1022: {'name': 'power_to_user_total_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1021: {'name': 'power_to_user_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal) — grid import'},
+        1022: {'name': 'power_to_user_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
         1029: {'name': 'power_to_grid_high', 'scale': 1, 'unit': '', 'pair': 1030, 'desc': 'AC power to grid total (positive=export)'},
         1030: {'name': 'power_to_grid_low', 'scale': 1, 'unit': '', 'pair': 1029, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
         1037: {'name': 'power_to_load_high', 'scale': 1, 'unit': '', 'pair': 1038, 'desc': 'INV power to local load total H (PLocalLoad total) — house load'},
@@ -477,7 +492,7 @@ SPH_7000_10000 = {
         #
         # battery_current had no register at all on these profiles before this, so the
         # entity published its default of 0.00 A permanently - the same shape as #395.
-        1088: {'name': 'battery_current', 'scale': 0.01, 'unit': 'A', 'signed': True, 'desc': 'Battery current from BMS (confirmed vs clamp meter, #397)'},
+        1088: {'name': 'battery_current', 'scale': 0.01, 'unit': 'A', 'signed': True, 'desc': 'Battery current from BMS (10 mA per ESS 0x0017; clamp-meter confirmation #397 was on a 3-6kW unit sharing this block)'},
         1052: {'name': 'battery_discharge_today_high', 'scale': 1, 'unit': '', 'pair': 1053, 'desc': 'Battery discharge energy today HIGH (Edischarge1_today)'},
         1053: {'name': 'battery_discharge_today_low', 'scale': 1, 'unit': '', 'pair': 1052, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
         1054: {'name': 'battery_discharge_total_high', 'scale': 1, 'unit': '', 'pair': 1055, 'desc': 'Battery discharge energy total HIGH (Edischarge1_total)'},
@@ -634,27 +649,34 @@ SPH_7000_10000 = {
                    1: 'Enabled'
                }},
 
-        # Battery First extended time slots 4-6 (GEN3, registers 1017-1025)
-        1017: {'name': 'batt_first_time_period_4_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 4 start (hex-packed)'},
-        1018: {'name': 'batt_first_time_period_4_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 4 end (hex-packed)'},
-        1019: {'name': 'batt_first_time_period_4_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 4'},
-        1020: {'name': 'batt_first_time_period_5_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 5 start (hex-packed)'},
-        1021: {'name': 'batt_first_time_period_5_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 5 end (hex-packed)'},
-        1022: {'name': 'batt_first_time_period_5_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 5'},
-        1023: {'name': 'batt_first_time_period_6_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 6 start (hex-packed)'},
-        1024: {'name': 'batt_first_time_period_6_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 6 end (hex-packed)'},
-        1025: {'name': 'batt_first_time_period_6_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 6'},
+        # Slots 4-6 start at 1018, not the 1017 that Protocol V1.39 and the SPH-HUB manual
+        # print. Set in the app with marker times on an SPH3600 (firmware RAAa919486), each
+        # start/end landed one register later, and enabling Battery First 4 / Grid First 4
+        # changed only 1020 / 1029; 1017 stayed 0 (#484). The document's own table ends with
+        # a stray second 'Bat First Start Time 4' at 1035, the mark of a table numbered one
+        # off. Writing Battery First 5 and Grid First 6 from Home Assistant on b12 changed
+        # exactly their three registers each, read back in the app (#484).
+        # Battery First extended time slots 4-6 (GEN3, registers 1018-1026)
+        1018: {'name': 'batt_first_time_period_4_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 4 start (hex-packed)'},
+        1019: {'name': 'batt_first_time_period_4_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 4 end (hex-packed)'},
+        1020: {'name': 'batt_first_time_period_4_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 4'},
+        1021: {'name': 'batt_first_time_period_5_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 5 start (hex-packed)'},
+        1022: {'name': 'batt_first_time_period_5_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 5 end (hex-packed)'},
+        1023: {'name': 'batt_first_time_period_5_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 5'},
+        1024: {'name': 'batt_first_time_period_6_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 6 start (hex-packed)'},
+        1025: {'name': 'batt_first_time_period_6_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Battery First period 6 end (hex-packed)'},
+        1026: {'name': 'batt_first_time_period_6_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 6'},
 
-        # Grid First extended time slots 4-6 (GEN3, registers 1026-1034)
-        1026: {'name': 'grid_first_time_period_4_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 4 start (hex-packed)'},
-        1027: {'name': 'grid_first_time_period_4_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 4 end (hex-packed)'},
-        1028: {'name': 'grid_first_time_period_4_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 4'},
-        1029: {'name': 'grid_first_time_period_5_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 5 start (hex-packed)'},
-        1030: {'name': 'grid_first_time_period_5_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 5 end (hex-packed)'},
-        1031: {'name': 'grid_first_time_period_5_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 5'},
-        1032: {'name': 'grid_first_time_period_6_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 6 start (hex-packed)'},
-        1033: {'name': 'grid_first_time_period_6_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 6 end (hex-packed)'},
-        1034: {'name': 'grid_first_time_period_6_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 6'},
+        # Grid First extended time slots 4-6 (GEN3, registers 1027-1035)
+        1027: {'name': 'grid_first_time_period_4_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 4 start (hex-packed)'},
+        1028: {'name': 'grid_first_time_period_4_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 4 end (hex-packed)'},
+        1029: {'name': 'grid_first_time_period_4_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 4'},
+        1030: {'name': 'grid_first_time_period_5_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 5 start (hex-packed)'},
+        1031: {'name': 'grid_first_time_period_5_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 5 end (hex-packed)'},
+        1032: {'name': 'grid_first_time_period_5_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 5'},
+        1033: {'name': 'grid_first_time_period_6_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 6 start (hex-packed)'},
+        1034: {'name': 'grid_first_time_period_6_end',    'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 6 end (hex-packed)'},
+        1035: {'name': 'grid_first_time_period_6_enable', 'scale': 1, 'unit': '', 'access': 'RW', 'values': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 6'},
 
         # Grid First extended time slots 7-9 (GEN3, registers 1080-1088)
         1080: {'name': 'grid_first_time_period_7_start',  'scale': 1, 'unit': '', 'access': 'RW', 'valid_range': (0, 5947), 'desc': 'Grid First period 7 start (hex-packed)'},
@@ -720,13 +742,32 @@ SPH_8000_10000_HU = {
         1012: {'name': 'charge_power_low', 'scale': 1, 'unit': '', 'pair': 1011, 'combined_scale': 0.1, 'combined_unit': 'W'},
 
         # Power Flow - Critical for grid import/export tracking
-        1015: {'name': 'power_to_user_high', 'scale': 1, 'unit': '', 'pair': 1016, 'desc': 'Power to user (grid import when positive)'},
-        1016: {'name': 'power_to_user_low', 'scale': 1, 'unit': '', 'pair': 1015, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        #
+        # HU-US split-phase exposes useful per-leg readings in the R/S slots. Keep aliases
+        # to the generic V1.39 R/S names so the whole-service fallback added in #419 still
+        # resolves these registers while Home Assistant can expose stable L1/L2 entity IDs.
+        # Field capture on SPH-10000-US UL2.21: 1031/1032 = 116 W and 1033/1034 = 45 W,
+        # exactly matching the 161 W total at 1037/1038. Import R/S were also live in the
+        # same scan. Export leg addresses follow the same V1.39 R/S/T/Total layout.
+        1015: {'name': 'ct_grid_import_l1_high', 'alias': 'power_to_user_r_high', 'scale': 1, 'unit': '', 'pair': 1016, 'desc': 'L1 grid import HIGH (PactouserR)'},
+        1016: {'name': 'ct_grid_import_l1_low', 'alias': 'power_to_user_r_low', 'scale': 1, 'unit': '', 'pair': 1015, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1017: {'name': 'ct_grid_import_l2_high', 'alias': 'power_to_user_s_high', 'scale': 1, 'unit': '', 'pair': 1018, 'desc': 'L2 grid import HIGH (PactouserS)'},
+        1018: {'name': 'ct_grid_import_l2_low', 'alias': 'power_to_user_s_low', 'scale': 1, 'unit': '', 'pair': 1017, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1019: {'name': 'power_to_user_t_high', 'scale': 1, 'unit': '', 'pair': 1020, 'desc': 'Grid import T phase HIGH (PactouserT; unused on split phase)'},
+        1020: {'name': 'power_to_user_t_low', 'scale': 1, 'unit': '', 'pair': 1019, 'combined_scale': 0.1, 'combined_unit': 'W'},
         # Same correction as the two profiles above — see #369 and the note there.
-        1021: {'name': 'power_to_user_total_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal) — grid import'},
-        1022: {'name': 'power_to_user_total_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1021: {'name': 'power_to_user_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal) — grid import'},
+        1022: {'name': 'power_to_user_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1023: {'name': 'ct_grid_export_l1_high', 'alias': 'power_to_grid_r_high', 'scale': 1, 'unit': '', 'pair': 1024, 'desc': 'L1 grid export HIGH (PactogridR)'},
+        1024: {'name': 'ct_grid_export_l1_low', 'alias': 'power_to_grid_r_low', 'scale': 1, 'unit': '', 'pair': 1023, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1025: {'name': 'ct_grid_export_l2_high', 'alias': 'power_to_grid_s_high', 'scale': 1, 'unit': '', 'pair': 1026, 'desc': 'L2 grid export HIGH (PactogridS)'},
+        1026: {'name': 'ct_grid_export_l2_low', 'alias': 'power_to_grid_s_low', 'scale': 1, 'unit': '', 'pair': 1025, 'combined_scale': 0.1, 'combined_unit': 'W'},
         1029: {'name': 'power_to_grid_high', 'scale': 1, 'unit': '', 'pair': 1030, 'desc': 'AC power to grid total H (Pactogrid total, positive=export)'},
         1030: {'name': 'power_to_grid_low', 'scale': 1, 'unit': '', 'pair': 1029, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
+        1031: {'name': 'inverter_to_load_l1_high', 'alias': 'power_to_load_r_high', 'scale': 1, 'unit': '', 'pair': 1032, 'desc': 'L1 inverter-to-load HIGH (PLocalLoadR)'},
+        1032: {'name': 'inverter_to_load_l1_low', 'alias': 'power_to_load_r_low', 'scale': 1, 'unit': '', 'pair': 1031, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1033: {'name': 'inverter_to_load_l2_high', 'alias': 'power_to_load_s_high', 'scale': 1, 'unit': '', 'pair': 1034, 'desc': 'L2 inverter-to-load HIGH (PLocalLoadS)'},
+        1034: {'name': 'inverter_to_load_l2_low', 'alias': 'power_to_load_s_low', 'scale': 1, 'unit': '', 'pair': 1033, 'combined_scale': 0.1, 'combined_unit': 'W'},
         1037: {'name': 'power_to_load_high', 'scale': 1, 'unit': '', 'pair': 1038, 'desc': 'INV power to local load total H (PLocalLoad total) — house load'},
         1038: {'name': 'power_to_load_low', 'scale': 1, 'unit': '', 'pair': 1037, 'combined_scale': 0.1, 'combined_unit': 'W'},
         1039: {'name': 'self_consumption_percentage', 'scale': 1, 'unit': '%'},
@@ -779,11 +820,41 @@ SPH_8000_10000_HU = {
         #     #397 already corrects that at read time on any firmware that does so.
         # Neither has a device report behind it and no HU owner has measured either.
         1087: {'name': 'battery_voltage', 'scale': 0.1, 'unit': 'V', 'desc': 'Battery voltage from BMS (shadowed by 1013; scale unverified)'},
-        1088: {'name': 'battery_current', 'scale': 0.01, 'unit': 'A', 'desc': 'Battery current from BMS (ESS Protocol 0x0017, 10 mA)', 'signed': True},
+        # NOT battery current on this family, whatever V1.39 says for the block generally.
+        #
+        # Measured on an SPH-10000-US, firmware UL2.21 (#420). A direct scan gave 1088=1400
+        # while the battery was doing 355 W at 53.0 V - 6.70 A - which no scale reconciles:
+        # 0.1 gives 140 A, 0.01 gives 14 A. In the same scan 1090 (the documented
+        # BMS_MaxCurr) read 0, and 1089 read 334 = 33.4 C, so the block is not shifted -
+        # 1088 is the documented address carrying something else on this firmware.
+        #
+        # A month of history settles what: over 53 samples it holds 140.0 exactly 22 times
+        # and 40.0 exactly 8 times, is flat near 140 below 94% SOC, tapers through the
+        # mid-90s and floors at 40 above 98%, and is **never negative** across a month in
+        # which the battery certainly discharged. A measurement does not repeat to a tenth
+        # of an amp thirty times in fifty-three samples; a setpoint does. At ~53 V that is
+        # a 7.4 kW envelope falling to 2.1 kW - a charge limit entering constant-voltage.
+        #
+        # Scoped to this profile. SPH_3000_6000 and SPH_TL3 have 1088 confirmed as real
+        # current against instruments (#397, #403), so the block is not wrong generally.
+        #
+        # No sensor is created for it yet - the name records what the register is so that
+        # battery_current cannot quietly return here.
+        1088: {'name': 'bms_charge_current_limit', 'scale': 0.1, 'unit': 'A', 'desc': 'BMS charge current limit, tapers with SOC (#420 - NOT live battery current on HU)'},
         1089: {'name': 'battery_temp', 'scale': 0.1, 'unit': '°C', 'desc': 'Battery temperature from BMS (whole degrees per ESS; corrected at read time)', 'signed': True},
         1090: {'name': 'bms_max_current', 'scale': 0.1, 'unit': 'A', 'desc': 'Max charge/discharge current from BMS'},
-        1091: {'name': 'bms_gauge_rm', 'scale': 1, 'unit': '', 'desc': 'Gauge RM from BMS'},
-        1092: {'name': 'bms_gauge_fcc', 'scale': 1, 'unit': '', 'desc': 'Gauge FCC from BMS'},
+        # 10 mAh units per the ESS Protocol (0x001A/0x001B), so 0.01 Ah. The unit itself is
+        # now confirmed on hardware - an SPH-TL3 reading 52.50 Ah against a 50.0 Ah ARK
+        # nameplate - so this is no longer documentation alone.
+        #
+        # Still not measured on THIS profile, though, and that distinction is worth keeping:
+        # register 1088 on the HU turned out not to be what the same document implied
+        # (#420). The unit is settled; whether these two addresses mean the same thing on HU
+        # hardware is not (#403).
+        1091: {'name': 'bms_gauge_rm', 'scale': 0.01, 'unit': 'Ah',
+               'desc': 'BMS_GaugeRM - remaining capacity (ESS 0x001A, 10 mAh units)'},
+        1092: {'name': 'bms_gauge_fcc', 'scale': 0.01, 'unit': 'Ah',
+               'desc': 'BMS_GaugeFCC - full charge capacity (ESS 0x001B, 10 mAh units)'},
         1093: {'name': 'bms_fw_version', 'scale': 1, 'unit': '', 'desc': 'BMS firmware version'},
         1094: {'name': 'bms_delta_volt', 'scale': 0.001, 'unit': 'V', 'desc': 'Delta V from BMS'},
         1095: {'name': 'bms_cycle_count', 'scale': 1, 'unit': '', 'desc': 'Cycle Count from BMS'},
@@ -849,8 +920,8 @@ SPH_3000_6000_V201 = {
         # single-phase hardware, so naming them identically was harmless in effect — but
         # it left _find_register_by_name() picking whichever came first in iteration
         # order, which is not something to rely on. Matches SPH_TL3_3000_10000_V201.
-        1021: {'name': 'power_to_user_total_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal)'},
-        1022: {'name': 'power_to_user_total_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1021: {'name': 'power_to_user_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal)'},
+        1022: {'name': 'power_to_user_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
         1029: {'name': 'power_to_grid_high', 'scale': 1, 'unit': '', 'pair': 1030, 'desc': 'AC power to grid total H (Pactogrid total)'},
         1030: {'name': 'power_to_grid_low', 'scale': 1, 'unit': '', 'pair': 1029, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
         1037: {'name': 'power_to_load_high', 'scale': 1, 'unit': '', 'pair': 1038, 'desc': 'INV power to local load total H (PLocalLoad total)'},
@@ -896,7 +967,7 @@ SPH_3000_6000_V201 = {
         #
         # battery_current had no register at all on these profiles before this, so the
         # entity published its default of 0.00 A permanently - the same shape as #395.
-        1088: {'name': 'battery_current', 'scale': 0.01, 'unit': 'A', 'signed': True, 'desc': 'Battery current from BMS (confirmed vs clamp meter, #397)'},
+        1088: {'name': 'battery_current', 'scale': 0.01, 'unit': 'A', 'signed': True, 'desc': 'Battery current from BMS (confirmed vs clamp meter on this model, #397)'},
         1052: {'name': 'battery_discharge_today_high', 'scale': 1, 'unit': '', 'pair': 1053, 'desc': 'Battery discharge today (Edischarge1_today)'},
         1053: {'name': 'battery_discharge_today_low', 'scale': 1, 'unit': '', 'pair': 1052, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
         1054: {'name': 'battery_discharge_total_high', 'scale': 1, 'unit': '', 'pair': 1055, 'desc': 'Battery discharge total (Edischarge1_total)'},
@@ -912,21 +983,13 @@ SPH_3000_6000_V201 = {
         1062: {'name': 'load_energy_total_high', 'scale': 1, 'unit': '', 'pair': 1063},
         1063: {'name': 'load_energy_total_low', 'scale': 1, 'unit': '', 'pair': 1062, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
-        # === MIN/MOD RANGE REGISTERS (3000-3124) ===
-        # Grid Energy (to grid / export)
-        3071: {'name': 'energy_to_grid_today_high_mod', 'scale': 1, 'unit': '', 'pair': 3072, 'maps_to': 'energy_to_grid_today'},
-        3072: {'name': 'energy_to_grid_today_low_mod', 'scale': 1, 'unit': '', 'pair': 3071, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        3073: {'name': 'energy_to_grid_total_high_mod', 'scale': 1, 'unit': '', 'pair': 3074, 'maps_to': 'energy_to_grid_total'},
-        3074: {'name': 'energy_to_grid_total_low_mod', 'scale': 1, 'unit': '', 'pair': 3073, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-
-        # Load Energy
-        3075: {'name': 'load_energy_today_high_mod', 'scale': 1, 'unit': '', 'pair': 3076, 'maps_to': 'load_energy_today'},
-        3076: {'name': 'load_energy_today_low_mod', 'scale': 1, 'unit': '', 'pair': 3075, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        3077: {'name': 'load_energy_total_high_mod', 'scale': 1, 'unit': '', 'pair': 3078, 'maps_to': 'load_energy_total'},
-        3078: {'name': 'load_energy_total_low_mod', 'scale': 1, 'unit': '', 'pair': 3077, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-
-        # Dry Contact State (V1.39 input register — 0=Off, 1=On)
-        3119: {'name': 'dry_contact_state', 'scale': 1, 'unit': '', 'desc': 'Dry contact relay current state: 0=Off, 1=On'},
+        # NO 3000-range input registers. 3071-3078 (grid / load energy) and 3119 (dry contact)
+        # were mapped here, but the storage range above already supplies those energy
+        # counters (1049/1051/1061/1063 are found first by name), so they were never used for
+        # a value - and on three DTC 3501 units the 3000 range held only zeros or one value
+        # repeated (3293 at 3071-3073 and 3119). Their only effect was a 3000-3119 read, which
+        # one SPH6000 bridge answered with a truncated 89-register frame on every retry
+        # (#470).
 
         # === V2.01 REGISTERS (31000+ range) ===
         **VPP_V201_STATUS,
@@ -947,12 +1010,11 @@ SPH_3000_6000_V201 = {
         31112: {'name': 'meter_power_high', 'scale': 1, 'unit': '', 'pair': 31113, 'desc': 'Grid power (same as backup power)'},
         31113: {'name': 'meter_power_low', 'scale': 1, 'unit': '', 'pair': 31112, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
 
-        # Load Power — maps_to 'load_power' (SPH name; MIN/TL-XH use 'power_to_load').
-        31118: {'name': 'load_power_high_vpp', 'scale': 1, 'unit': '', 'pair': 31119, 'maps_to': 'load_power'},
-        31119: {'name': 'load_power_low_vpp', 'scale': 1, 'unit': '', 'pair': 31118, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        # Energy to user today (V2.01-V2.05). Was labelled load power; see vpp_v201.py.
+        31118: {'name': 'energy_to_user_today_vpp_high', 'scale': 1, 'unit': '', 'pair': 31119},
+        31119: {'name': 'energy_to_user_today_vpp_low',  'scale': 1, 'unit': '', 'pair': 31118, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
         **VPP_V201_ENERGY_1P,
-        **VPP_V201_TEMPERATURE_1P,
 
         # Battery Cluster 1 State (31200–31222) — SPH-specific register layout.
         # Registers 31202–31209 are energy counters here (charge today, charge total,
@@ -981,7 +1043,10 @@ SPH_3000_6000_V201 = {
         31218: {'name': 'battery_soh', 'scale': 1, 'unit': '%', 'desc': 'Battery state of health'},
         # Note: Registers 31220-31221 appear to contain incorrect data when paired as 32-bit
         # AC charge energy total is available in register 115 (legacy range) instead
-        31222: {'name': 'battery_temp_vpp', 'scale': 0.1, 'unit': '°C', 'maps_to': 'battery_temp', 'signed': True},
+        31222: {'name': 'battery_gauge_rm_low', 'scale': 1, 'unit': '',
+                'desc': 'Low word of the reserved UINT32 at 31221 (battery remaining capacity, Ah) - NOT temperature (#440)'},
+        31223: {'name': 'battery_temp_vpp', 'scale': 0.1, 'unit': '°C', 'maps_to': 'battery_temp', 'signed': True,
+                'desc': 'Battery environmental temperature (VPP spec: INT16, 0.1C, range -400..1250)'},
 
         # Battery Cluster 2 State (31300-31323) - Optional second battery
         **VPP_V201_BATTERY2,
@@ -1022,8 +1087,8 @@ SPH_7000_10000_V201 = {
         # single-phase hardware, so naming them identically was harmless in effect — but
         # it left _find_register_by_name() picking whichever came first in iteration
         # order, which is not something to rely on. Matches SPH_TL3_3000_10000_V201.
-        1021: {'name': 'power_to_user_total_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal)'},
-        1022: {'name': 'power_to_user_total_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        1021: {'name': 'power_to_user_high', 'scale': 1, 'unit': '', 'pair': 1022, 'desc': 'AC power to user total H (PactouserTotal)'},
+        1022: {'name': 'power_to_user_low', 'scale': 1, 'unit': '', 'pair': 1021, 'combined_scale': 0.1, 'combined_unit': 'W'},
         1029: {'name': 'power_to_grid_high', 'scale': 1, 'unit': '', 'pair': 1030, 'desc': 'AC power to grid total H (Pactogrid total)'},
         1030: {'name': 'power_to_grid_low', 'scale': 1, 'unit': '', 'pair': 1029, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
         1037: {'name': 'power_to_load_high', 'scale': 1, 'unit': '', 'pair': 1038, 'desc': 'INV power to local load total H (PLocalLoad total)'},
@@ -1069,7 +1134,7 @@ SPH_7000_10000_V201 = {
         #
         # battery_current had no register at all on these profiles before this, so the
         # entity published its default of 0.00 A permanently - the same shape as #395.
-        1088: {'name': 'battery_current', 'scale': 0.01, 'unit': 'A', 'signed': True, 'desc': 'Battery current from BMS (confirmed vs clamp meter, #397)'},
+        1088: {'name': 'battery_current', 'scale': 0.01, 'unit': 'A', 'signed': True, 'desc': 'Battery current from BMS (10 mA per ESS 0x0017; clamp-meter confirmation #397 was on a 3-6kW unit sharing this block)'},
         1052: {'name': 'battery_discharge_today_high', 'scale': 1, 'unit': '', 'pair': 1053, 'desc': 'Battery discharge today (Edischarge1_today)'},
         1053: {'name': 'battery_discharge_today_low', 'scale': 1, 'unit': '', 'pair': 1052, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
         1054: {'name': 'battery_discharge_total_high', 'scale': 1, 'unit': '', 'pair': 1055, 'desc': 'Battery discharge total (Edischarge1_total)'},
@@ -1085,21 +1150,13 @@ SPH_7000_10000_V201 = {
         1062: {'name': 'load_energy_total_high', 'scale': 1, 'unit': '', 'pair': 1063},
         1063: {'name': 'load_energy_total_low', 'scale': 1, 'unit': '', 'pair': 1062, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
-        # === MIN/MOD RANGE REGISTERS (3000-3124) ===
-        # Grid Energy (to grid / export)
-        3071: {'name': 'energy_to_grid_today_high_mod', 'scale': 1, 'unit': '', 'pair': 3072, 'maps_to': 'energy_to_grid_today'},
-        3072: {'name': 'energy_to_grid_today_low_mod', 'scale': 1, 'unit': '', 'pair': 3071, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        3073: {'name': 'energy_to_grid_total_high_mod', 'scale': 1, 'unit': '', 'pair': 3074, 'maps_to': 'energy_to_grid_total'},
-        3074: {'name': 'energy_to_grid_total_low_mod', 'scale': 1, 'unit': '', 'pair': 3073, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-
-        # Load Energy
-        3075: {'name': 'load_energy_today_high_mod', 'scale': 1, 'unit': '', 'pair': 3076, 'maps_to': 'load_energy_today'},
-        3076: {'name': 'load_energy_today_low_mod', 'scale': 1, 'unit': '', 'pair': 3075, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-        3077: {'name': 'load_energy_total_high_mod', 'scale': 1, 'unit': '', 'pair': 3078, 'maps_to': 'load_energy_total'},
-        3078: {'name': 'load_energy_total_low_mod', 'scale': 1, 'unit': '', 'pair': 3077, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
-
-        # Dry Contact State (V1.39 input register — 0=Off, 1=On)
-        3119: {'name': 'dry_contact_state', 'scale': 1, 'unit': '', 'desc': 'Dry contact relay current state: 0=Off, 1=On'},
+        # NO 3000-range input registers. 3071-3078 (grid / load energy) and 3119 (dry contact)
+        # were mapped here, but the storage range above already supplies those energy
+        # counters (1049/1051/1061/1063 are found first by name), so they were never used for
+        # a value - and on three DTC 3501 units the 3000 range held only zeros or one value
+        # repeated (3293 at 3071-3073 and 3119). Their only effect was a 3000-3119 read, which
+        # one SPH6000 bridge answered with a truncated 89-register frame on every retry
+        # (#470).
 
         # === V2.01 REGISTERS (31000+ range) ===
         **VPP_V201_STATUS,
@@ -1119,12 +1176,11 @@ SPH_7000_10000_V201 = {
         31112: {'name': 'meter_power_high', 'scale': 1, 'unit': '', 'pair': 31113},
         31113: {'name': 'meter_power_low', 'scale': 1, 'unit': '', 'pair': 31112, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
 
-        # Load Power
-        31118: {'name': 'load_power_high_vpp', 'scale': 1, 'unit': '', 'pair': 31119, 'maps_to': 'load_power'},
-        31119: {'name': 'load_power_low_vpp', 'scale': 1, 'unit': '', 'pair': 31118, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        # Energy to user today (V2.01-V2.05). Was labelled load power; see vpp_v201.py.
+        31118: {'name': 'energy_to_user_today_vpp_high', 'scale': 1, 'unit': '', 'pair': 31119},
+        31119: {'name': 'energy_to_user_today_vpp_low',  'scale': 1, 'unit': '', 'pair': 31118, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
         **VPP_V201_ENERGY_1P,
-        **VPP_V201_TEMPERATURE_1P,
 
         # Battery Cluster 1 State — SPH energy-counter layout (see SPH_3000_6000_V201)
         # VPP V2.01 protocol: 31202=charge today, 31204=charge total,
@@ -1148,7 +1204,10 @@ SPH_7000_10000_V201 = {
         # Note: Registers 31220-31221 appear to contain incorrect data when paired as 32-bit
         # AC charge energy total is available in registers 114/115 (legacy range) instead,
         # inherited from SPH_7000_10000 above.
-        31222: {'name': 'battery_temp_vpp', 'scale': 0.1, 'unit': '°C', 'maps_to': 'battery_temp', 'signed': True},
+        31222: {'name': 'battery_gauge_rm_low', 'scale': 1, 'unit': '',
+                'desc': 'Low word of the reserved UINT32 at 31221 (battery remaining capacity, Ah) - NOT temperature (#440)'},
+        31223: {'name': 'battery_temp_vpp', 'scale': 0.1, 'unit': '°C', 'maps_to': 'battery_temp', 'signed': True,
+                'desc': 'Battery environmental temperature (VPP spec: INT16, 0.1C, range -400..1250)'},
 
         # Battery Cluster 2 State
         **VPP_V201_BATTERY2,

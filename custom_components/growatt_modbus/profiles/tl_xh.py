@@ -3,7 +3,7 @@
 
 from .vpp_v201 import (
     VPP_V201_STATUS, VPP_V201_PV2_INPUT, VPP_V201_PV3_AND_TOTAL,
-    VPP_V201_ENERGY_1P, VPP_V201_TEMPERATURE_1P,
+    VPP_V201_ENERGY_1P,
     VPP_V201_BATTERY2, VPP_V201_HOLDING_1P,
 )
 
@@ -103,7 +103,7 @@ TL_XH_3000_10000 = {
         105: {'name': 'fault_code', 'scale': 1, 'unit': ''},
         112: {'name': 'warning_code', 'scale': 1, 'unit': ''},
 
-        # Backup Box (Growatt ARK transfer switch, RS485 at regs 3250-3374)
+        # Backup Box (Growatt SYN backup box, RS485 at regs 3250-3374)
         # Gate: reg 3320 (box_connect_flag) = 1 means backup box is present and communicating.
         3281: {'name': 'box_bypass_status', 'scale': 1,   'unit': '',   'desc': '0=Off, 1=On'},
         3282: {'name': 'box_work_mode',     'scale': 1,   'unit': '',   'desc': '0=Offgrid, 1=Ongrid, 2=Generator'},
@@ -147,6 +147,11 @@ TL_XH_3000_10000_V201 = {
     'name': 'TL-XH 3000-10000 (V2.01)',
     'description': 'Single-phase hybrid inverter with battery (3-10kW) and VPP Protocol V2.01',
     'notes': 'Combines legacy (0-124 range) with V2.01 (30000+ range). Overlapping values served at both addresses.',
+    # Same omission as SPH-TL3's V2.01 variant, found by the same audit: the base carries
+    # this flag, the variant writes its own top-level keys, and it was not repeated. Not
+    # reported on this hardware - the pv1/pv2 energy registers are inherited and present,
+    # so the flag does what it does on the base (#441).
+    'use_mppt_energy_today': True,
     'input_registers': {
         # === Legacy REGISTERS (0-124 range) ===
         **TL_XH_3000_10000['input_registers'],
@@ -176,16 +181,13 @@ TL_XH_3000_10000_V201 = {
                 'maps_to': 'power_to_grid'},
         31113: {'name': 'meter_power_low',     'scale': 1,    'unit': '',   'pair': 31112,
                 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
-        31118: {'name': 'load_power_high_vpp', 'scale': 1,    'unit': '',   'pair': 31119,
-                'maps_to': 'power_to_load'},
-        31119: {'name': 'load_power_low_vpp',  'scale': 1,    'unit': '',   'pair': 31118,
-                'combined_scale': 0.1, 'combined_unit': 'W'},
+        # Energy to user today (V2.01-V2.05). Was labelled load power; see vpp_v201.py.
+        31118: {'name': 'energy_to_user_today_vpp_high', 'scale': 1, 'unit': '', 'pair': 31119},
+        31119: {'name': 'energy_to_user_today_vpp_low',  'scale': 1, 'unit': '', 'pair': 31118,
+                'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
-        # Energy today / total — VPP_V201_ENERGY_1P (31120–31123)
+        # Energy to user total / to grid today — VPP_V201_ENERGY_1P (31120–31123)
         **VPP_V201_ENERGY_1P,
-
-        # Temperatures — VPP_V201_TEMPERATURE_1P (31130–31132)
-        **VPP_V201_TEMPERATURE_1P,
 
         # Battery Cluster 1 (31200–31222) — TL-XH specific power layout.
         # Unlike SPH (energy counters at 31202–31209), TL-XH uses charge/discharge power here.
@@ -252,6 +254,12 @@ MIN_TL_XH_3000_10000_V201 = {
     'name': 'MIN TL-XH 3000-10000 (V2.01)',
     'description': 'MIN series TL-XH hybrid with battery (3-10kW) using 3000+ and 31000+ ranges',
     'notes': 'Uses MIN 3000+ range for base sensors and VPP 31200+ range for battery. 3-6kW models have 2 PV strings, 7-10kW models have 3 PV strings. Found in MIN 6000/10000 TL-XH models with DTC 5100.',
+    # TOU entities exist but start disabled until a Modbus write is confirmed (#400).
+    'tou_disabled_by_default': True,
+    # ShinePhone "Allow Grid Charge" followed holding 3049 in both states (Disabled=0,
+    # Enabled=1), but a Modbus write has not yet been confirmed. Expose the control for
+    # validation without enabling an untested write path for every MIN TL-XH install (#400).
+    'allow_grid_charge_disabled_by_default': True,
     'input_registers': {
         # === MIN SERIES BASE RANGE (3000+) ===
         # System Status
@@ -330,9 +338,36 @@ MIN_TL_XH_3000_10000_V201 = {
 
         # Diagnostics
         3086: {'name': 'derating_mode', 'scale': 1, 'unit': '', 'desc': 'Derating status'},
-        3087: {'name': 'pv_iso', 'scale': 1, 'unit': 'kΩ', 'desc': 'PV insulation resistance'},
-        3088: {'name': 'dci_r', 'scale': 0.1, 'unit': 'mA', 'desc': 'DC injection current (R-phase / single-phase)'},
-        3091: {'name': 'gfci', 'scale': 1, 'unit': 'mA', 'desc': 'Residual/leakage current (GFCI)'},
+        # Safety measurements: PV insulation resistance, DC injection and leakage current.
+        # INPUT 200-205 (FC04). Holding 201/202/203 at the same addresses are PID working
+        # mode, PID on/off and PID voltage - WRITE registers for a completely different
+        # subsystem.
+        #
+        # These were read from input 3087-3091 until #404, and that mapping was NOT a
+        # guess: V1.39 documents input 3087-3091 as ISO/DCI_R/DCI_S/DCI_T/GFCI with the
+        # same scales. Whether a device honours it depends on the firmware.
+        #
+        # Four scans show that block echoing SERIAL-NUMBER text instead: 22616 is 0x5858,
+        # ASCII "XX", three different quantities reading the same value, and the same values
+        # coming back from the holding space, where V1.39 documents 3087-3092 as Serial
+        # Number 1-6. So an insulation resistance of 2261.6 kOhm was being published from
+        # serial-number characters.
+        #
+        # But a MOD 10KTL3-XH on DTC 5400 / DN1.0 / V2.02 returns LIVE measurements from
+        # 3087-3091 - the same values as 200-205, DCI drifting together across paired reads.
+        # An earlier version of this note claimed no device honoured the block; that was four
+        # devices, not the family, and it was wrong.
+        #
+        # 200-205 is mapped because it works on both kinds of firmware. Note the two blocks
+        # are NOT one offset by a constant: GFCI is the fifth word of the old block (3091)
+        # and the sixth of the new (205), with 204 constant at 0 in between (#404).
+        #
+        # 200-205 move between scans the way a measurement does, and the mapping is
+        # confirmed from outside this project: Growatt's own app shows `Gfci(mA)` and
+        # `Iso(KOhm)` beside the values our scan reads from 205 and 200 (#404).
+        200: {'name': 'pv_iso', 'scale': 1, 'unit': 'kΩ', 'desc': 'PVISO - PV insulation resistance'},
+        201: {'name': 'dci_r', 'scale': 0.1, 'unit': 'mA', 'desc': 'R_DCI - DC injection, R phase'},
+        205: {'name': 'gfci', 'scale': 1, 'unit': 'mA', 'desc': 'GFCI - residual/leakage current'},
         3092: {'name': 'bus_voltage', 'scale': 0.1, 'unit': 'V', 'desc': 'DC bus voltage'},
 
         # Temperatures
@@ -419,10 +454,19 @@ MIN_TL_XH_3000_10000_V201 = {
         # Battery power (calculated from charge/discharge)
         31220: {'name': 'battery_power', 'scale': 1, 'unit': 'W', 'desc': 'Battery power (positive=discharge, negative=charge)', 'signed': True},
 
+        # Battery pack description (VPP V2.01). Read on a MIN 4200TL-XH with two APX modules
+        # as 1 / 2 / 512 / 1000 - one cluster of two modules, 51.2 V and 100.0 Ah each at the
+        # documented 0.1 scaling (#460). Describes the pack, not the brand: nothing in the
+        # protocol names the battery maker.
+        31225: {'name': 'battery_cluster_sum', 'scale': 1, 'unit': '', 'desc': 'Number of battery clusters'},
+        31226: {'name': 'battery_module_number', 'scale': 1, 'unit': '', 'desc': 'Battery modules per cluster'},
+        31227: {'name': 'battery_module_rated_voltage', 'scale': 0.1, 'unit': 'V', 'desc': 'Module rated voltage'},
+        31228: {'name': 'battery_module_rated_capacity', 'scale': 0.1, 'unit': 'Ah', 'desc': 'Module rated capacity'},
+
         # Battery Cluster 2 — VPP_V201_BATTERY2 (31300–31303, 31314–31322)
         **VPP_V201_BATTERY2,
 
-        # Backup Box (Growatt ARK transfer switch, RS485 at regs 3250-3374)
+        # Backup Box (Growatt SYN backup box, RS485 at regs 3250-3374)
         # Gate: reg 3320 (box_connect_flag) = 1 means backup box is present and communicating.
         3281: {'name': 'box_bypass_status', 'scale': 1,   'unit': '',   'desc': '0=Off, 1=On'},
         3282: {'name': 'box_work_mode',     'scale': 1,   'unit': '',   'desc': '0=Offgrid, 1=Ongrid, 2=Generator'},
@@ -455,12 +499,53 @@ MIN_TL_XH_3000_10000_V201 = {
 
         # EMS controls — Priority mode and Battery First / Grid First power and SOC limits (V1.39, Issues #311)
         # Register 3018: hardware-confirmed on MIN 4200TL-XH (0=Load First, 2=Battery First, 3=Grid First)
-        3018: {'name': 'tl_xh_priority_mode', 'scale': 1, 'unit': '', 'access': 'RW',
+        #
+        # maps_to feeds profile_register_names() (#448) so diagnostics correctly lists
+        # priority_mode as a name this profile actually backs. It does not by itself
+        # populate the generic sensor - growatt_modbus.py translates the raw value into
+        # data.priority_mode explicitly, because the two registers use different numeric
+        # encodings for the same three states (#400).
+        3018: {'name': 'tl_xh_priority_mode', 'maps_to': 'priority_mode',
+               'scale': 1, 'unit': '', 'access': 'RW',
                'desc': 'Priority mode (0=Load First, 2=Battery First, 3=Grid First — hardware confirmed MIN TL-XH)'},
+        # TOU periods 1-9 - V1.39 "Time 1-9 (xh)", 3038-3045 and 3050-3059. Same packing as
+        # MOD TL3-XH: start = bit15 enable, bits13-14 priority (0 Load, 1 Battery, 2 Grid),
+        # bits8-12 hour, bits0-7 minute; end = hour << 8 | minute.
+        #
+        # Decoding confirmed on a MIN 4200TL-XH (#400): period 1 set in ShinePhone as Battery
+        # First 00:00-07:00 read 3038 = 40960 (0xA000) and 3039 = 1792 (0x0700), and moving
+        # the end to 07:01 and 07:02 read back 1793 and 1794. Writes over Modbus have not
+        # been tested yet, so the entities are created disabled (tou_disabled_by_default).
+        3038: {'name': 'mod_tou_1_start', 'scale': 1, 'unit': '', 'access': 'RW'},
+        3039: {'name': 'mod_tou_1_end',   'scale': 1, 'unit': '', 'access': 'RW'},
+        3040: {'name': 'mod_tou_2_start', 'scale': 1, 'unit': '', 'access': 'RW'},
+        3041: {'name': 'mod_tou_2_end',   'scale': 1, 'unit': '', 'access': 'RW'},
+        3042: {'name': 'mod_tou_3_start', 'scale': 1, 'unit': '', 'access': 'RW'},
+        3043: {'name': 'mod_tou_3_end',   'scale': 1, 'unit': '', 'access': 'RW'},
+        3044: {'name': 'mod_tou_4_start', 'scale': 1, 'unit': '', 'access': 'RW'},
+        3045: {'name': 'mod_tou_4_end',   'scale': 1, 'unit': '', 'access': 'RW'},
+        # ShinePhone Allow Grid Charge tracked direct holding reads on this MIN TL-XH:
+        # Disabled returned 0 and Enabled returned 1. Writing still needs a round-trip (#400).
+        3049: {'name': 'allow_grid_charge', 'scale': 1, 'unit': '', 'access': 'RW',
+               'desc': 'Allow charging from the grid (read mapping confirmed on MIN TL-XH; write pending)'},
+        3050: {'name': 'mod_tou_5_start', 'scale': 1, 'unit': '', 'access': 'RW'},
+        3051: {'name': 'mod_tou_5_end',   'scale': 1, 'unit': '', 'access': 'RW'},
+        3052: {'name': 'mod_tou_6_start', 'scale': 1, 'unit': '', 'access': 'RW'},
+        3053: {'name': 'mod_tou_6_end',   'scale': 1, 'unit': '', 'access': 'RW'},
+        3054: {'name': 'mod_tou_7_start', 'scale': 1, 'unit': '', 'access': 'RW'},
+        3055: {'name': 'mod_tou_7_end',   'scale': 1, 'unit': '', 'access': 'RW'},
+        3056: {'name': 'mod_tou_8_start', 'scale': 1, 'unit': '', 'access': 'RW'},
+        3057: {'name': 'mod_tou_8_end',   'scale': 1, 'unit': '', 'access': 'RW'},
+        3058: {'name': 'mod_tou_9_start', 'scale': 1, 'unit': '', 'access': 'RW'},
+        3059: {'name': 'mod_tou_9_end',   'scale': 1, 'unit': '', 'access': 'RW'},
+
         3047: {'name': 'batt_first_charge_power_rate',    'scale': 1, 'unit': '%', 'access': 'RW',
                'valid_range': (1, 100), 'desc': 'Charge power rate when Battery First mode (1-100%)'},
         3048: {'name': 'batt_first_charge_stopped_soc',   'scale': 1, 'unit': '%', 'access': 'RW',
                'valid_range': (0, 100), 'desc': 'SOC to stop charging when Battery First mode is active (0-100%)'},
+        30475: {'name': 'vpp_offgrid_discharge_soc', 'scale': 1, 'unit': '%', 'access': 'RW',
+                'valid_range': (10, 100),
+                'desc': 'Off-grid discharge stop SOC (VPP V2.01; hardware-confirmed after firmware update, #400)'},
         3067: {'name': 'grid_first_discharge_stopped_soc', 'scale': 1, 'unit': '%', 'access': 'RW',
                'valid_range': (1, 100), 'desc': 'SOC to stop discharging when Grid First mode is active (V1.39: US model / firmware ZACA-08+)'},
 
@@ -512,6 +597,8 @@ MIN_TL_XH2_3000_10000_V201 = {
         'VPP_V201_PV2_INPUT and is defined inline. Verified against the Growatt portal '
         'on a MIN 4200TL-XH2 (Issue #361).'
     ),
+    # The clock lives only at 30104-30109 here - 45-51 is in the dead base range (#461).
+    'clock_register': 30104,
     'input_registers': {
         # === Status (31000-31004) ===
         **VPP_V201_STATUS,
@@ -618,6 +705,8 @@ MIN_TL_XH2_3000_10000_V201 = {
                 'desc': 'Battery current (INT32; positive=charging)'},
         31217: {'name': 'battery_soc', 'scale': 1, 'unit': '%',
                 'desc': 'Battery SOC (verified against app, Issue #361)'},
+        # VPP 31218, UINT8 %. Read 100 on a MIN 3000TL-XH2 with a new APX pack (#461).
+        31218: {'name': 'battery_soh', 'scale': 1, 'unit': '%', 'desc': 'Battery state of health'},
         # Spec puts battery temperature at 31223, not 31222 — 31222 is the low word of the
         # reserved UINT32 at 31221 and reads 0. NOTE: 31223 also reads 0 on the MIN
         # 4200TL-XH2, while 31224 ("reserved for maximum battery temperature") reads 365
@@ -627,6 +716,34 @@ MIN_TL_XH2_3000_10000_V201 = {
     },
     'holding_registers': {
         **VPP_V201_HOLDING_1P,
+
+        # Validated on a MIN 3000TL-XH2 with an APX 5.0M-B3 (#461), each by a real change,
+        # a read-back and the inverter acting on it - with ShineWiFi connected and seen to
+        # write nothing during the tests.
+        #
+        # 30405: 10 -> 20, still 20 twenty minutes later; back to 10, held.
+        # 30404: 100 -> 95, still 95 more than an hour later. (A first report read as a
+        # revert after six minutes; the reporter had set it back himself.)
+        30404: {'name': 'vpp_charge_stop_soc', 'scale': 1, 'unit': '%', 'access': 'RW',
+                'valid_range': (10, 100),
+                'desc': 'Charge cut-off SOC (VPP 30404; validated on MIN TL-XH2, #461)'},
+        30405: {'name': 'vpp_ongrid_discharge_soc', 'scale': 1, 'unit': '%', 'access': 'RW',
+                'valid_range': (10, 100),
+                'desc': 'On-grid discharge cut-off SOC (VPP 30405; validated on MIN TL-XH2, #461)'},
+
+        # Remote power control. 30408 = 5, 30409 = 20, 30410 = 1, then 30100 = 1 and
+        # 30407 = 1: the battery charged from the grid, visible on battery charge power and
+        # grid import. 30407 = 0 and 30100 = 0 stopped it (#461). Mapping these is also what
+        # lets the Set Battery Mode action run on this model.
+        30407: {'name': 'remote_power_control_enable', 'scale': 1, 'unit': '', 'access': 'RW',
+                'desc': 'Remote power control enable (0=off, 1=on). Not stored'},
+        30408: {'name': 'remote_power_control_charging_time', 'scale': 1, 'unit': 'min',
+                'access': 'RW', 'desc': 'Remote control duration (0=unlimited, 1-1440 min). Not stored'},
+        30409: {'name': 'remote_charge_and_discharge_power', 'scale': 1, 'unit': '%',
+                'access': 'RW', 'signed': True,
+                'desc': 'Remote charge/discharge power (-100..100, positive=charge). Not stored'},
+        30410: {'name': 'vpp_ac_charge_enable', 'scale': 1, 'unit': '', 'access': 'RW',
+                'desc': 'AC charging enable (0=off, 1=PV first, 2=AC first)'},
     },
 }
 

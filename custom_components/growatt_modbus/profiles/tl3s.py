@@ -6,6 +6,10 @@
 TL3_S_3000_15000 = {
     'name': 'TL3-S 3000-15000',
     'description': 'Three-phase grid-tied string inverter (3-15kW), legacy protocol',
+    # Firmware dhaa01 answers Illegal Function to a 113-register input read (0-112) but
+    # serves the same data in reads of up to 50, confirmed at 50/25/10/5/1 (#432,
+    # @JHPHendriks). The DH1.0 reference unit (#299) reads 125 at once, so 50 suits both.
+    'max_block_size': 50,
     'notes': (
         'Legacy 0-179 register range. Two MPPT inputs: PV1 (regs 3-6), PV2 voltage/current only (regs 7-8). '
         'Regs 9-10 are firmware version bytes (ASCII "DH"/"1.") not PV2 power — pv2_power stays 0, use pv_total_power. '
@@ -75,12 +79,22 @@ TL3_S_3000_15000 = {
         53: {'name': 'energy_today_low', 'scale': 0.1, 'unit': 'kWh', 'desc': 'AC energy today (standalone 16-bit)'},
         55: {'name': 'energy_total_low', 'scale': 0.1, 'unit': 'kWh', 'desc': 'AC energy total (standalone 16-bit)'},
 
-        # Diagnostics
-        105: {'name': 'fault_code', 'scale': 1, 'unit': ''},
-        112: {'name': 'warning_code', 'scale': 1, 'unit': ''},
+        # Diagnostics - V3.14 input 40 "Fault code" and 64 "WarningCode".
+        #
+        # These were 105 and 112, which in V3.14 sit inside the grid fault history (90-114,
+        # five records of code / year|month / day|hour / min|sec / value). A TL3-S showed
+        # "Fault Code 30" and "Warning Code 1042" permanently (#432): 105 is record 4's code
+        # (30 = "AC V Outrange", value 2530 = 253.0 V) and 112 is record 5's day|hour
+        # (0x0412 = day 4, 18:00), from 2022. Three scans read 40 = 0 and 64 = 0.
+        40: {'name': 'fault_code', 'scale': 1, 'unit': '',
+             'desc': 'Inverter fault code (V3.14 table &*1; 30 = AC V Outrange)'},
+        64: {'name': 'warning_code', 'scale': 1, 'unit': '', 'desc': 'Warning code (V3.14)'},
     },
     'holding_registers': {
-        0: {'name': 'on_off', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': '0=Off, 1=On'},
+        # Legacy protocol V3.14: two settings in one register. 0x0101 (257) is the documented
+        # default and what a dhaa01 unit reads back (#432) - a plain 0 or 1 clears auto start.
+        0: {'name': 'on_off', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': 'Low byte: on/off (1/0), High byte: auto start (1/0)',
+            'onoff_encoding': 'legacy_autostart'},
         3: {'name': 'active_power_rate', 'scale': 1, 'unit': '%', 'access': 'RW', 'desc': 'Max output active power percent (0-100)'},
         30: {'name': 'com_address', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': 'Modbus communication address'},
     },

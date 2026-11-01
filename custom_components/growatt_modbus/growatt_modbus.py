@@ -58,68 +58,135 @@ try:
 except ImportError:
     TCP_AVAILABLE = False
 
+try:
+    from pymodbus.exceptions import ConnectionException as _PymodbusConnectionException
+except ImportError:  # pragma: no cover - pymodbus always provides this
+    _PymodbusConnectionException = None
+
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# --- Optional-register backoff tuning -------------------------------------------------
-# Optional VPP ranges/blocks are skipped for a while after they fail, so a firmware that
-# genuinely does not implement them doesn't get hammered every poll (each unanswered
-# request costs a timeout and can leave a stale response in the adapter buffer, which
-# shows up later as a transaction-ID mismatch).
+# --- Optional-register backoff --------------------------------------------------------
+# The optional VPP holding blocks (30100, 30200-30201, 30407-30410) are skipped for a
+# while after they fail, so firmware that genuinely does not implement them is not asked
+# every poll. #370 made that skip time-limited; these two constants make it also require
+# more than one failure, because a single Modbus timeout on a healthy inverter is a
+# routine transient event and not evidence about the register.
 #
-# Both backoffs are *temporary*.  A permanent blacklist is wrong: registers 30100 /
-# 30200-30201 / 30407-30410 are read from live hardware and a single Modbus timeout is
-# a routine transient event, not proof the firmware lacks the register.
-_OPTIONAL_RANGE_RETRY_SECONDS = 300
-
-# Optional holding-register blocks (VPP 30000+) use the same retry window, but are only
-# skipped after several *consecutive* failures — one transient error must never take a
-# control block out of service.
-#
-# Upstream names this window _VPP_HOLDING_RETRY_S (#370) and
-# tests/test_vpp_holding_retry.py asserts it is literally the same number as
-# _OPTIONAL_RANGE_RETRY_SECONDS ("same mechanism, different numbers" is what it guards
-# against), so it is spelled out rather than aliased to it.
+# The window is spelled out rather than derived from _OPTIONAL_RANGE_RETRY_SECONDS
+# because tests/test_vpp_holding_retry.py asserts the two numbers are literally the same.
 _VPP_HOLDING_RETRY_S = 300
-_OPTIONAL_HOLDING_RETRY_SECONDS = _VPP_HOLDING_RETRY_S
-_OPTIONAL_HOLDING_FAIL_THRESHOLD = 3
+_VPP_HOLDING_FAIL_THRESHOLD = 3
 
-# Why an optional read came back empty.  The two cases need opposite treatment when the
-# shared socket is re-established:
+# Fork: optional input ranges use the same window, at module level so tests can reach it
+# (upstream keeps it as a local inside _fetch_data).
+_OPTIONAL_RANGE_RETRY_SECONDS = 300
+# Fork names for the two constants above, from before upstream adopted the mechanism.
+# Aliases, not copies: one number, two spellings.
+_OPTIONAL_HOLDING_RETRY_SECONDS = _VPP_HOLDING_RETRY_S
+_OPTIONAL_HOLDING_FAIL_THRESHOLD = _VPP_HOLDING_FAIL_THRESHOLD
+
+# Fork: optional reads (identification, VPP blocks) are allowed to fail. Giving them the
+# full connection timeout and pymodbus's default retry count means a single unanswered
+# register costs ~40s; these limits cap it at a couple of seconds without touching
+# critical reads. See optional_read_limits().
+OPTIONAL_READ_TIMEOUT_SECONDS = 3.0
+OPTIONAL_READ_RETRIES = 0
+
+# Why an optional read came back empty. The two cases need opposite treatment when the
+# connection is re-established:
 #
-#   ERROR_KIND_LINK        the transport raised (broken pipe, connection reset, connect
-#                          failure).  Says nothing about the register, and a reconnect
-#                          makes it worth retrying immediately.
-#   ERROR_KIND_NO_RESPONSE pymodbus returned an error *response*: the request went out on
-#                          a working socket and the inverter never answered (or answered
-#                          with an exception code).  That is evidence about the register
-#                          itself, and repeating it costs a full timeout x retries every
-#                          poll, so it must survive a reconnect and stay backed off.
+#   ERROR_KIND_LINK        the transport raised (broken pipe, connection reset, no client
+#                          at all). Says nothing about the register, and a fresh socket
+#                          makes it worth retrying at once.
+#   ERROR_KIND_NO_RESPONSE the request went out on a working socket and came back as an
+#                          error response, a short frame or nothing. That is evidence
+#                          about the register itself, and re-arming it on every reconnect
+#                          costs a full timeout per poll, so it must survive one.
+#
+# This is the limitation #370 recorded honestly and left open: "a transport error and a
+# genuine illegal data address are still conflated here, because read_holding_registers
+# returns None for both".
 ERROR_KIND_LINK = "link"
 ERROR_KIND_NO_RESPONSE = "no-response"
 
-# Optional reads (identification, VPP blocks) are allowed to fail. Giving them the full
-# connection timeout and pymodbus's default retry count means a single unanswered register
-# costs ~40s; these limits cap it at a couple of seconds without touching critical reads.
-OPTIONAL_READ_TIMEOUT_SECONDS = 3.0
-OPTIONAL_READ_RETRIES = 0
+# MIN TL-XH holding 3018 uses a different numeric encoding from the common priority_mode
+# sensor (0/1/2). Keep the raw value for the writable select and translate it for the
+# existing diagnostic sensor so both entities describe the same inverter state (#400).
+TL_XH_PRIORITY_MODE_TO_STANDARD = {0: 0, 2: 1, 3: 2}
+
+
+def _peer_closed_the_connection(exc: Exception) -> bool:
+    """True when the failure was the far end hanging up, not failing to answer.
+
+    These are two different faults and the post-failure quiet window only makes sense for
+    one of them:
+
+    - **The peer stopped answering.** A gateway that serialises clients is busy with
+      somebody else, and opening another socket queues behind whatever is stalling it.
+      Backing off is right, and that is what the window is for.
+    - **The peer closed the socket.** There is nothing left to queue behind - pymodbus
+      calls `close()` before raising, so the transport is already gone. The only way back
+      is a new connection, and refusing to make one just extends the outage.
+
+    Treating the second as the first is a regression from v1.10.0. On a ShineWiFi-X that
+    drops its end regularly, the reset-and-retry that used to recover the block was refused
+    from the second consecutive failure onward, so a recoverable blip took the entities
+    offline instead (#433):
+
+        read_input_registers(0, 7) transport error ... Connection unexpectedly closed
+        not reconnecting yet: 2.0s of the post-failure quiet window remain (2 reset(s))
+        not reconnecting yet: 4.0s of the post-failure quiet window remain (3 reset(s))
+        Failed to read register block (0-6)
+        -> entities unavailable
+
+    Typed rather than matched on the message: pymodbus raises `ConnectionException` for a
+    closed socket and `ModbusIOException` for a timeout, which is exactly the distinction
+    needed. `OSError` covers the socket errors that can surface underneath it.
+    """
+    if _PymodbusConnectionException is not None and isinstance(
+            exc, _PymodbusConnectionException):
+        return True
+    return isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError))
 
 
 # =============================================================================
 # Custom Exceptions for better error reporting
 # =============================================================================
 
-class ModbusWriteError(Exception):
-    """Exception raised when a Modbus write operation fails.
+# Registers whose 0 hands control back to the inverter: VPP control authority and remote
+# power control. Writing 0 to either is exempt from the WIT control cooldown (#481).
+VPP_RELEASE_REGISTERS = (30100, 30407)
 
-    Contains detailed error information including the register address,
-    values attempted, and the actual Modbus error message.
+# Raised to Home Assistant when the cooldown refused a control write, so an automation
+# sees the failure instead of a service call that returned normally (#481).
+RATE_LIMITED_MESSAGE = (
+    "{name} was not written: WIT control registers accept one write every 30 seconds, "
+    "and this one was written less than 30 seconds ago. Nothing was sent to the "
+    "inverter. Try again shortly."
+)
+
+
+class ModbusWriteError(Exception):
+    """Raised for a failed Modbus operation - not only writes.
+
+    `_bus()` serialises reads, writes and whole polls on the same lock and raises this on
+    a timeout regardless of which one was waiting, so callers that only distinguish it from
+    other exceptions (everything except _bus() itself) keep working unchanged. `operation`
+    exists so the message says what actually failed: a lock timeout on a read is not a
+    write failure, and telling a user their read timed out via "Failed to write registers"
+    sends them looking at the wrong half of the driver (#432, @JHPHendriks - the read/write
+    mismatch in a bus-busy message on a plain register read).
     """
-    def __init__(self, register: int, values: list, error_message: str):
+    def __init__(self, register: int, values: list, error_message: str, operation: str = "write"):
         self.register = register
         self.values = values
         self.error_message = error_message
-        super().__init__(f"Failed to write registers {register}-{register + len(values) - 1}: {error_message}")
+        if operation == "write":
+            summary = f"Failed to write registers {register}-{register + len(values) - 1}: {error_message}"
+        else:
+            summary = f"Failed to {operation}: {error_message}"
+        super().__init__(summary)
 
 
 def _format_modbus_error(result) -> str:
@@ -163,6 +230,127 @@ def _format_modbus_error(result) -> str:
 # Write verification constants (cloud override detection)
 # =============================================================================
 
+# How long to leave a gateway alone after a reset before re-opening a socket.
+#
+# Enforced by REFUSING to connect during the window, never by sleeping. The hub
+# lock is held for a whole poll, so sleeping inside it would block every other
+# user of the same gateway -- a second config entry's poll, and any user-initiated
+# write -- for the length of the wait. Refusing instead lets the poll fail fast and
+# release the bus; the coordinator retries on its next cycle, which is exactly the
+# spacing this is trying to achieve.
+#
+# The first window is deliberately SHORT. Most transport errors are one-offs, and
+# making every one of them cost tens of seconds would turn a blip into a missed
+# poll. Two seconds is enough to stop a tight reconnect loop, which is all the
+# first retry needs to do.
+#
+# Repeated resets are a different situation, and the reason this escalates. On the
+# gateway that prompted this change, a second client is stalled for about 30
+# seconds (measured: a 300 ms read took 30,338 ms while another client held a
+# connection). A fixed 2 s wait cannot outlast that, so a run of failures would
+# keep re-opening sockets into a peer that is still busy — which is exactly the
+# behaviour that never recovers. Doubling per consecutive reset takes the wait
+# past the stall within a few attempts, and the ceiling keeps it bounded.
+#
+# The counter is cleared by a successful READ, not a successful connect: during
+# the failure this addresses, connects succeed and reads time out, so keying it to
+# connects would reset the escalation on every attempt and never escalate at all.
+# How many discarded frames a single poll may re-read before giving up on the rest.
+#
+# One extra request per stale frame, on a socket that is otherwise working. The ceiling is
+# a stop on a pathological gateway doubling every request indefinitely, not a rationing of
+# a scarce resource - a healthy adapter never reaches this path at all, and the worst real
+# one measured needs about 17 (#433).
+MAX_STALE_FRAME_RETRIES_PER_POLL = 30
+
+# Above this magnitude, a sign-bit-set 32-bit pair is a not-implemented sentinel rather
+# than a value that dipped below zero.
+#
+# Every unsigned pair we map is a physical quantity at 0.1 scale, so 1,000,000 raw is
+# 100 kW, 100 kAh or 100,000 kWh - past anything domestic or light-commercial hardware
+# produces, and far past the small negatives an underflow makes. A daily counter going
+# one count below zero arrives as 4,294,967,279; an unimplemented register answers with
+# something from the 0xFF.. family (#401).
+_UNDERFLOW_PLAUSIBLE_MAGNITUDE = 1_000_000
+
+# A 32-bit pair whose HIGH word carries a small integer while its LOW word sits at one end
+# of its range is a word-level corruption, not a reading (#446).
+#
+# An SPH-TL3 owner captured 16 of them over two days on grid import (1021/1022):
+#
+#     published W        raw        hex        high    low
+#        6,553.8       65538   0x00010002       1        2
+#       19,661.0      196610   0x00030002       3        2
+#       98,301.9      983019   0x000EFFEB      14    65515
+#    1,841,481.3    18414813   0x0118FCDD     280    64733
+#
+# In all 16 the high word held 1-280 where a correct reading has 0, and the low word was
+# within 7 counts of 0x0000 or within 803 of 0xFFFF - never in between. The published
+# figure is essentially `high x 6553.6 W`, with the true small reading sitting in the low
+# word. The rest of the frame decoded cleanly in the same poll, so this is not a corrupt
+# frame: RTU checksums the whole frame and a bad one costs every value in it.
+#
+# Magnitude alone cannot catch this. His smallest sample published 6,553.8 W, which is an
+# ordinary reading for a house with an EV charger - only the word shape distinguishes it.
+#
+# The margin is asymmetric, and has to be: his 16 samples cluster tight at the bottom (low
+# within 7 of 0x0000, nine of them) and loose at the top (within 74 of 0xFFFF in six, and
+# one outlier at 802). A single margin wide enough for the top outlier - 1000 - left the
+# bottom permissive from 8 up to 1000, and a MOD TL3-XH owner hit it: power_to_load read
+# high=1 low=167, a genuine 6,570 W load with an EV charger on it, confirmed against an
+# independent register (backup_box_load_power) reading 6,506.9 W the same poll. 167 is nine
+# times the widest genuine bottom sample seen and comfortably clear of the withheld reading
+# below it - narrowing here recovers real load readings without touching the sample that
+# set the top margin (#446, @KevlarD-67).
+_PAIR_WORD_LOW_END_MARGIN = 16
+_PAIR_WORD_HIGH_END_MARGIN = 1000
+
+# ...and the high word has to be SMALL. His 16 samples ran 1 to 280, which is what a value
+# landing in the wrong half looks like when the true reading is near zero.
+#
+# Without this bound the rule would also catch 0x7FFFFFFF - high 32767, low 65535 - which
+# tests/test_register_decoding.py pins as decoding normally: the line for the sign-bit guard
+# is drawn at the sign bit and not at plausibility (#401). A genuine reading that large is
+# absurd but it is not this fault, and narrowing here costs nothing.
+_PAIR_HIGH_WORD_MAX_FOR_CORRUPTION = 1024
+
+# The same fault on a SIGNED pair needs a different test (#447).
+#
+# A signed pair cannot use the rule above: a legitimate small negative carries 0xFFFF in its
+# high word, which is the corrupt shape for an unsigned pair. But the real values still sit
+# at one end or the other, and the corruption sits in between:
+#
+#     -0.9 W      high 65535        +1,810 W     high 0
+#     -246 W      high 65535       +11,862 W     high 1
+#  -11,862 W      high 65534       +30,000 W     high 4
+#
+#     corrupt:    high 579, 915, 1373, 63726, 65289   <- neither end
+#
+# A second SPH 10000 TL3 BH-UP owner photographed +9 MW and +6 MW spikes on grid power,
+# which decode from high words of 1373 and 915. His own register scan caught two of them
+# live, at 1017 and 1019. Grid power is declared signed on his profile, so the unsigned
+# guard steps over it - the gap this closes.
+#
+# 16 counts of headroom at each end is roughly +/-107 kW at 0.1 W, far beyond any inverter
+# this integration supports, so no real reading can reach the middle.
+_SIGNED_PAIR_HIGH_WORD_BAND = 16
+
+# ...but on an UNSIGNED pair a genuine reading near a multiple of 65536 raw counts has the
+# same shape, and a steady one would be withheld for ever. So the same high word repeating
+# this many polls in a row for one register is believed and published. The same high word,
+# not just any suspect shape: garbage varies from poll to poll and a steady load does not,
+# and counting any shape published multi-megawatt readings (#446).
+#
+# Signed pairs have no such escape - the middle band they withhold starts ~107 kW from
+# zero, where no genuine reading can be.
+#
+# Warnings for either guard are emitted once per register per session; repeats are debug
+# lines, so counting WARNING lines in a log undercounts events (@KevlarD-67, #446).
+_PAIR_SHAPE_REPEATS_BEFORE_BELIEVED = 3
+
+RECONNECT_QUIET_BASE_SECONDS = 2.0
+RECONNECT_QUIET_MAX_SECONDS = 32.0
+
 WRITE_VERIFY_DELAY = 0.5           # seconds — delay before read-back after write
 WRITE_VERIFY_MAX_RETRIES = 3       # read-back checks after the single write (#402)
 WRITE_VERIFY_MAX_DELAY = 2.0       # seconds - ceiling for the backoff between checks
@@ -170,6 +358,12 @@ WRITE_VERIFY_MAX_DELAY = 2.0       # seconds - ceiling for the backoff between c
 # Minimum battery power before the WIT scale detection will draw a conclusion (#406).
 # Below this the current registers disagree and the comparison is meaningless.
 _BATTERY_SCALE_MIN_POWER_W = 500.0
+
+# Below this a battery-current candidate is treated as NOT REPORTING rather than as a
+# reading that contradicts the others (#430). Some models map several current addresses and
+# implement only one; the rest sit at zero permanently, and counting that as dissent blocked
+# scale detection for the life of the connection.
+_BATTERY_CURRENT_SILENT_A = 0.2
 WRITE_VERIFY_RETRY_DELAY = 1.5     # seconds — delay between retry attempts
 
 
@@ -192,6 +386,19 @@ class GrowattData:
     # it at all - so the entity goes unknown for that poll and leaves a gap in history, rather
     # than recording a zero that reads as a real measurement.
     unread_fields: set = field(default_factory=set)
+
+    # True when this profile's directional meter registers are the only usable source of
+    # grid direction, so the energy-balance estimate must not stand in for them. Carried on
+    # the data rather than read from the map in sensor.py, which never sees the profile.
+    # Set from the register map on every poll; see _signed_grid_power() in sensor.py.
+    grid_flow_from_meter_only: bool = False
+
+    # Whether the grid-side measurement source is being received, from MeterLink (V1.39
+    # holding 180: 0 = Missed, 1 = Received). None means we never established it - the
+    # register is not mapped on this profile, or it did not answer this poll. Only read on
+    # profiles that declare `grid_flow_from_meter_only`, which are the only ones that act
+    # on it. See _signed_grid_power() in sensor.py.
+    meter_link: int | None = None
 
     # Solar Input
     pv1_voltage: float = 0.0          # V
@@ -243,6 +450,13 @@ class GrowattData:
     power_to_user: float = 0.0        # W
     power_to_grid: float = 0.0        # W (export)
     power_to_load: float = 0.0        # W
+    # SPH-HU US split-phase CT / local-load legs (#418). R maps to L1, S maps to L2.
+    ct_grid_import_l1: float = 0.0    # W
+    ct_grid_import_l2: float = 0.0    # W
+    ct_grid_export_l1: float = 0.0    # W
+    ct_grid_export_l2: float = 0.0    # W
+    inverter_to_load_l1: float = 0.0  # W
+    inverter_to_load_l2: float = 0.0  # W
     system_output_power: float = 0.0  # W (total system output per inverter)
     
     # Energy & Status
@@ -283,7 +497,7 @@ class GrowattData:
     extra_energy_today: float = 0.0   # kWh
     extra_energy_total: float = 0.0   # kWh
 
-    # Backup Box (Growatt ARK transfer switch, RS485 via TL-X/TL-XH inverter, input regs 3281-3342)
+    # Backup Box (Growatt SYN backup box, RS485 via TL-X/TL-XH inverter, input regs 3281-3342)
     box_connect_flag: int = 0          # 0=Abnormal/absent, 1=Normal/connected (reg 3320)
     box_bypass_status: int = 0         # 0=Off, 1=On (reg 3281)
     box_work_mode: int = 0             # 0=Offgrid, 1=Ongrid, 2=Generator (reg 3282)
@@ -334,11 +548,12 @@ class GrowattData:
     derating_mode: int = 0
     fault_code: int = 0
     warning_code: int = 0
-    pv_iso: float = 0.0          # kΩ — PV insulation resistance (reg 3087)
-    dci_r: float = 0.0           # mA — DC injection R-phase (reg 3088)
-    dci_s: float = 0.0           # mA — DC injection S-phase (reg 3089, 3-phase only)
-    dci_t: float = 0.0           # mA — DC injection T-phase (reg 3090, 3-phase only)
-    gfci: float = 0.0            # mA — residual/leakage current (reg 3091)
+    # Input 200-205, NOT 3087-3091 — that block returns serial-number text (#404).
+    pv_iso: float = 0.0          # kΩ — PV insulation resistance (input 200)
+    dci_r: float = 0.0           # mA — DC injection R-phase (input 201)
+    dci_s: float = 0.0           # mA — DC injection S-phase (input 202, 3-phase only)
+    dci_t: float = 0.0           # mA — DC injection T-phase (input 203, 3-phase only)
+    gfci: float = 0.0            # mA — residual/leakage current (input 205)
     # Safety/compliance diagnostic registers 235-238 (read-only, Issue #282)
     ntognd_detect: int = 0           # reg 235 — NToGND grounding protection detection
     nonstd_vac_enable: int = 0       # reg 236 — non-standard VAC enable
@@ -346,6 +561,7 @@ class GrowattData:
     fast_mppt_enable: int = 0        # reg 238 — fast MPPT algorithm enable
 
     # Control registers (writable holding registers)
+    spf_blu_lbu_mode: int = 0         # SPF holding 116: 0=BLU (battery first), 1=LBU (load first)
     export_limit_mode: int = 0        # 0=Disabled, 1=RS485, 2=RS232, 3=CT
     export_limit_power: int = 0       # 0-1000 (0-100.0%)
     export_limit_failed_power_rate: int = 0       # 0-1000 raw (×0.1 = 0-100%); fallback output power cap when export limit fails
@@ -403,6 +619,19 @@ class GrowattData:
     tl_xh_priority_mode: int = 3               # MIN TL-XH priority mode: 0=Load First, 2=Battery First, 3=Grid First (register 3018)
     batt_first_charge_stopped_soc: int = 0     # SOC % to stop charging in Battery First mode (register 3048)
     grid_first_discharge_stopped_soc: int = 0  # SOC % to stop discharging in Grid First mode (register 3067)
+    vpp_offgrid_discharge_soc: int = 10        # SOC % to stop discharging off-grid (register 30475)
+    vpp_ongrid_discharge_soc: int = 10         # SOC % to stop discharging on-grid (register 30405)
+    vpp_charge_stop_soc: int = 100             # SOC % to stop charging (register 30404)
+
+    # Battery working status (VPP input 31001, #460): 0 standby, 1 disconnected, 2 charging,
+    # 3 discharging, 4 fault, 5 upgrade
+    battery_working_status: int = 0
+
+    # Battery pack description (VPP input 31225-31228, #460)
+    battery_cluster_sum: float = 0.0            # Number of battery clusters
+    battery_module_number: float = 0.0          # Modules per cluster
+    battery_module_rated_voltage: float = 0.0   # V, per module
+    battery_module_rated_capacity: float = 0.0  # Ah, per module
 
     # MOD TL3-XH peak shaving / demand management (holding 3307-3312, #372).
     # Undocumented in any public protocol; mapped from portal round-trips. See mod.py.
@@ -477,6 +706,7 @@ class GrowattData:
     gen_charge_current: int = 0       # 0-800 (0-80A with scale 0.1)
     bat_low_to_uti: int = 0           # Battery-dependent: Non-Lithium 200-640 (20-64V), Lithium 5-100 (0.5-10%)
     ac_to_bat_volt: int = 0           # Battery-dependent: Non-Lithium 200-640 (20-64V), Lithium 5-100 (0.5-10%)
+    bat_low_cutoff: int = 0           # Battery-dependent, same encoding (holding 82, wBatLowCutOff)
 
     # WIT VPP SOC and AC Charge control registers (read from holding registers)
     # (vpp_ac_charge_enable is declared above in the WIT VPP Remote Control block)
@@ -535,6 +765,29 @@ def optional_read_limits(client, timeout: float = OPTIONAL_READ_TIMEOUT_SECONDS,
                 setattr(obj, attr, value)
             except Exception:  # pragma: no cover
                 pass
+def _describe_socket(client) -> str:
+    """The OS-level identity of a pymodbus client's socket, for #426.
+
+    Counting sockets says something leaked; the local port says WHICH one, and it is the
+    field that maps a log line onto a row of `ss -tn` output. The hub's own bookkeeping was
+    shown correct by the b2 tracing - one hub, one client, released and closed cleanly -
+    while the OS still held two connections per client and freed one on close. That gap is
+    below the hub, so this looks at what pymodbus actually holds.
+    """
+    socket_obj = getattr(client, "socket", None)
+    if socket_obj is None:
+        return "socket=None"
+    try:
+        local = socket_obj.getsockname()
+        peer = socket_obj.getpeername()
+        return f"socket=fd{socket_obj.fileno()} {local[0]}:{local[1]}->{peer[0]}:{peer[1]}"
+    except Exception:
+        # A closed or half-open socket raises rather than answering, which is itself the
+        # useful signal here.
+        try:
+            return f"socket=fd{socket_obj.fileno()} (no address - closed or half-open)"
+        except Exception:
+            return "socket=<unusable>"
 
 
 class SharedModbusConnection:
@@ -583,12 +836,12 @@ class SharedModbusConnection:
         self._lock = threading.RLock()
         self._refcount = 0
         self._connected = False
-        # Incremented every time a *new* socket is established. Consumers use it to
-        # drop state that was derived from the previous session (see
-        # GrowattModbus._sync_optional_blacklists_with_connection).
+        # Incremented every time a *new* socket is established. Consumers use it to drop
+        # state derived from the previous session — see
+        # GrowattModbus._sync_optional_blacklists_with_connection().
         self.connection_generation = 0
-        # Why the most recent read on this hub failed:
-        # ERROR_KIND_LINK / ERROR_KIND_NO_RESPONSE / None on success.
+        # Why the most recent read on this hub failed: ERROR_KIND_LINK /
+        # ERROR_KIND_NO_RESPONSE, or None after a successful read.
         self.last_error_kind: Optional[str] = None
         # Per-poll budget for transport-error recoveries (Issue #364). A block-level
         # reset+retry (see read_input_registers/read_holding_registers) is cheap for the
@@ -597,6 +850,28 @@ class SharedModbusConnection:
         # TCP reconnects. begin_poll() resets the budget once per poll cycle.
         self._recoveries_this_poll = 0
         self._max_recoveries_per_poll = 2
+
+        # Separate, much larger budget for re-reading a discarded frame (#433). Set here as
+        # well as in begin_poll() because reads happen outside a poll: the setup connection
+        # test and the device-identification reads both run before begin_poll() is ever
+        # called, and an attribute that only exists once a poll has started would fail there.
+        self._stale_frame_retries_this_poll = 0
+
+        # Set by release_ref(). A hub that has been released must never build a new
+        # client: an in-flight poll survives unload (it runs in an executor thread that
+        # nothing cancels), and without this flag its next reset() would call
+        # ensure_connected(), find _client None, and open a socket owned by a hub that
+        # is already out of the registry. That orphan then races the socket the NEW hub
+        # opens on reload -- two clients against a gateway that serialises the second one
+        # for ~30 s, which is longer than the read timeout. The timeouts read as
+        # transport errors, whose handler resets and reconnects, and the cascade never
+        # ends. Measured on a WIT gateway, 2026-09-06.
+        self._released = False
+        # When the last reset() happened, and how many resets have run without a
+        # successful read in between, so a reconnect can leave the peer a moment of
+        # quiet instead of immediately re-opening a socket it is still busy stalling.
+        self._reset_at = 0.0
+        self._consecutive_resets = 0
 
         # Lifetime tallies of frames this gateway answered correctly vs. answered with
         # something that was not a reply to the question asked. Read by the coordinator to
@@ -620,10 +895,19 @@ class SharedModbusConnection:
 
     def acquire_ref(self) -> None:
         self._refcount += 1
+        # Lifecycle tracing for #426. A reload should reuse one hub or build exactly one
+        # replacement; a reporter measured a socket added per reload that was never
+        # reaped. Identity is the thing to follow - counting sockets says something
+        # leaked, saying WHICH hub opened them says what failed to close.
+        logger.debug(
+            "[SharedConn %s] hub=0x%x acquire_ref -> refcount %d",
+            self.connection_id, id(self), self._refcount,
+        )
 
     def begin_poll(self) -> None:
-        """Reset the per-poll recovery budget. Call once per poll, before any reads."""
+        """Reset the per-poll recovery budgets. Call once per poll, before any reads."""
         self._recoveries_this_poll = 0
+        self._stale_frame_retries_this_poll = 0
 
     def end_poll(self) -> None:
         """Give an exclusive serial port back between polls.
@@ -641,11 +925,68 @@ class SharedModbusConnection:
         Reopening a serial port costs about 2 ms, which is nothing next to a poll that reads
         98 registers. The lock still serializes entries that do share a hub.
         """
+        if self._released:
+            # The hub was released while this poll was running (a reload, or Home
+            # Assistant shutting down). The poll owns the socket until it ends, so this
+            # is the first safe moment to close it -- and closing it here is what stops
+            # an orphaned connection outliving its hub.
+            with self._lock:
+                self.disconnect()
+                self._client = None
+            return
+
         if not self.is_serial:
             return
         with self._lock:
             self.disconnect()
             self._client = None
+
+    def _note_transaction_succeeded(self) -> None:
+        """The gateway answered a question correctly, so start the escalation over.
+
+        Any completed transaction counts, read or write: what the counter tracks is
+        "how many times in a row has this connection failed with nothing working in
+        between". Counting only reads made a poll of writes look like an unbroken run
+        of failures and blocked the next write's legitimate #364 retry.
+        """
+        self._consecutive_resets = 0
+
+    def _quiet_period(self) -> float:
+        """Seconds to leave the peer alone before reconnecting, after N resets.
+
+        ZERO for the first reset, deliberately. That one is the reset-and-retry-once
+        recovery from #364, which exists for a silently-dropped socket that pymodbus
+        has not noticed: it is cheap, it usually works, and delaying it would turn a
+        recoverable blip into a lost poll. The window starts at the SECOND consecutive
+        reset, where a one-off has already been ruled out.
+        """
+        if self._consecutive_resets <= 1:
+            return 0.0
+        exponent = max(0, self._consecutive_resets - 2)
+        return min(RECONNECT_QUIET_BASE_SECONDS * (2 ** exponent),
+                   RECONNECT_QUIET_MAX_SECONDS)
+
+    def connect_refusal_reason(self) -> str:
+        """Why the last ensure_connected() said no — for a caller's error message.
+
+        A write refused during the quiet window is not the same failure as a gateway
+        that cannot be reached, and telling them apart is the difference between
+        "try again shortly" and "go and look at the wiring".
+        """
+        remaining = self._quiet_remaining()
+        if remaining > 0:
+            return (f"Gateway is in a post-failure quiet period after "
+                    f"{self._consecutive_resets} reset(s); retry in "
+                    f"{remaining:.0f}s")
+        if self._released:
+            return "This shared connection has been released"
+        return "Could not connect to shared Modbus gateway"
+
+    def _quiet_remaining(self) -> float:
+        """Seconds still to run on the post-failure window; 0 when clear."""
+        if not self._reset_at:
+            return 0.0
+        return max(0.0, self._quiet_period() - (time.monotonic() - self._reset_at))
 
     def _begin_recovery(self) -> bool:
         """True if a reset+retry is still within this poll's recovery budget."""
@@ -654,11 +995,61 @@ class SharedModbusConnection:
         self._recoveries_this_poll += 1
         return True
 
-    def release_ref(self) -> None:
+    def _begin_stale_frame_retry(self) -> bool:
+        """True if a discarded frame may be re-read, within this poll's budget.
+
+        Deliberately NOT the recovery budget above. That one is two per poll because it
+        *resets the connection*, and reset storms are their own failure. Re-reading after a
+        stale frame costs one extra request on a socket that is working, so it is bounded
+        far more generously - and it has to be, because the gateways that need it are the
+        ones that do this many times per poll.
+
+        A ShineWiFi-X answered 17 of 200 requests with a frame belonging to some other
+        request (#433), and a PUSR bridge managed roughly one poll in three (#360, #367).
+        A budget of two would have left both of them losing almost everything they lose now.
+        """
+        if self._stale_frame_retries_this_poll >= MAX_STALE_FRAME_RETRIES_PER_POLL:
+            return False
+        self._stale_frame_retries_this_poll += 1
+        return True
+
+    def release_ref(self, lock_timeout: float = 5.0) -> None:
+        """Drop a reference; close the transport once nobody needs it.
+
+        The flag is set FIRST and without the lock, because it is what makes the
+        teardown safe: a poll running in an executor thread cannot be cancelled, and
+        marking the hub released stops that poll from re-creating a client no matter
+        when it next looks.
+
+        Then the lock is taken, so the socket is closed BETWEEN reads rather than
+        underneath one. Taking it is best-effort: a poll can legitimately hold the bus
+        for tens of seconds, and blocking unload on that would be worse than leaving the
+        socket to end_poll(), which now closes it for a released hub.
+        """
         self._refcount -= 1
-        if self._refcount <= 0:
-            self.disconnect()
-            self._client = None
+        logger.debug(
+            "[SharedConn %s] hub=0x%x release_ref -> refcount %d (client=%s)",
+            self.connection_id, id(self), self._refcount,
+            f"0x{id(self._client):x}" if self._client is not None else "None",
+        )
+        if self._refcount > 0:
+            return
+
+        self._released = True
+
+        if self._lock.acquire(timeout=lock_timeout):
+            try:
+                self.disconnect()
+                self._client = None
+            finally:
+                self._lock.release()
+            return
+
+        logger.debug(
+            "[SharedConn %s] release: a poll still holds the bus after %.0fs; the "
+            "hub is marked released and end_poll() will close it",
+            self.connection_id, lock_timeout,
+        )
 
     # ------------------------------------------------------------------
     # Connection lifecycle (call only while lock is held)
@@ -666,6 +1057,15 @@ class SharedModbusConnection:
 
     def ensure_connected(self) -> bool:
         """Connect if not already open; flush stale bytes on a new connection."""
+        if self._released:
+            # See _released in __init__. An orphaned poll must die quietly rather than
+            # open a socket nobody will ever close.
+            logger.debug(
+                "[SharedConn %s] refusing to connect: this hub has been released",
+                self.connection_id,
+            )
+            return False
+
         if self._client is None:
             if self.is_serial:
                 if not SERIAL_AVAILABLE:
@@ -698,10 +1098,38 @@ class SharedModbusConnection:
         except Exception:
             pass
 
+        # A reset means the peer just failed to answer. Re-opening a socket
+        # immediately is the worst thing to do to a gateway that serialises clients:
+        # the new connection queues behind whatever is still stalling it, times out in
+        # turn, and produces another reset.
+        #
+        # So the reconnect is REFUSED until the window has passed, rather than waited
+        # out: this runs with the hub lock held, and sleeping here would stall every
+        # other user of the gateway. The caller fails fast and the next poll picks it up.
+        remaining = self._quiet_remaining()
+        if remaining > 0:
+            logger.debug(
+                "[SharedConn %s] not reconnecting yet: %.1fs of the post-failure "
+                "quiet window remain (%d consecutive reset(s))",
+                self.connection_id, remaining, self._consecutive_resets,
+            )
+            return False
+
         result = self._client.connect()
         if result:
             self._connected = True
+            self._reset_at = 0.0
+            # Counts sockets, not connects: the optional-register backoff is scoped to the
+            # connection it was learned on, and a new socket invalidates a skip that only
+            # happened because the old one was dead (#409).
             self.connection_generation += 1
+            # #426: pairs with the acquire/release/close lines so one reload cycle can be
+            # read end to end - which hub opened which socket, and whether anything closed it.
+            logger.debug(
+                "[SharedConn %s] hub=0x%x opened client=0x%x %s",
+                self.connection_id, id(self), id(self._client),
+                _describe_socket(self._client),
+            )
             self._flush_receive_buffer()
         elif self.is_serial:
             # pyserial logs "[Errno 11] Could not exclusively lock port ..." and pymodbus
@@ -726,13 +1154,30 @@ class SharedModbusConnection:
 
     def disconnect(self) -> None:
         if self._client is not None:
+            logger.debug(
+                "[SharedConn %s] hub=0x%x closing client=0x%x %s",
+                self.connection_id, id(self), id(self._client),
+                _describe_socket(self._client),
+            )
             try:
                 self._client.close()
-            except Exception:
-                pass
+            except Exception as err:
+                # Swallowed deliberately - a close that fails must not stop teardown. Logged
+                # because a socket that would not close is exactly the shape being chased in
+                # #426, and it was previously invisible.
+                logger.debug(
+                    "[SharedConn %s] hub=0x%x close() raised: %s",
+                    self.connection_id, id(self), err,
+                )
+            # What close() actually did. A client still reporting an open socket here is a
+            # connection the hub believes it has released (#426).
+            logger.debug(
+                "[SharedConn %s] hub=0x%x after close: %s",
+                self.connection_id, id(self), _describe_socket(self._client),
+            )
             self._connected = False
 
-    def reset(self, reason: str = "") -> None:
+    def reset(self, reason: str = "", peer_closed: bool = False) -> None:
         """Force-close the socket so the next ensure_connected() does a real reconnect.
 
         pymodbus sync clients never clear their socket after a silent connection loss
@@ -740,11 +1185,28 @@ class SharedModbusConnection:
         sync clients), so is_socket_open() keeps returning True and ensure_connected()
         would reuse the dead socket forever. Without this, only an HA restart recovers
         a wedged connection.
+
+        `peer_closed` says the far end hung up rather than failed to answer, and it skips
+        the post-failure quiet window entirely - see _peer_closed_the_connection(). A closed
+        socket has nothing to back off from: the only route back is a new connection, and
+        the reconnect is still bounded by the per-poll recovery budget, so exempting it
+        cannot turn into a reconnect storm.
         """
         logger.warning(
             "[SharedConn %s] Resetting connection%s",
             self.connection_id, f": {reason}" if reason else "",
         )
+        if peer_closed:
+            # No window, and no escalation: repeated hang-ups are not evidence that the
+            # gateway is overloaded, which is the state the escalation is metering.
+            self._reset_at = 0.0
+            logger.debug(
+                "[SharedConn %s] peer closed the connection - reconnecting without a "
+                "quiet window", self.connection_id,
+            )
+        else:
+            self._reset_at = time.monotonic()
+            self._consecutive_resets += 1
         self.disconnect()
 
     def _flush_receive_buffer(self) -> None:
@@ -852,12 +1314,50 @@ class SharedModbusConnection:
             return None
 
         self.good_reads += 1
+        # Whatever went wrong before is over — see _note_transaction_succeeded().
+        # Deliberately not on a successful CONNECT: see RECONNECT_QUIET_BASE_SECONDS.
+        self._note_transaction_succeeded()
         return registers
+
+    def _retry_after_stale_frame(self, attempt: int, malformed_before: int,
+                                 start: int, count: int) -> bool:
+        """True when the frame just discarded should be re-read on the same socket.
+
+        A frame whose length does not match the request is not a refusal and not a broken
+        socket: it is somebody else's answer arriving on our stream. Until now that cost the
+        whole block for the poll - the guard discarded the frame, correctly, and returned
+        None with nothing to publish. On the gateways that do this often, the effect was
+        entities going unavailable in ones and twos with the connection working fine.
+
+        `_validate_registers` has already drained the receive buffer by this point, so the
+        re-read is asking into a clean stream rather than the misaligned one that produced
+        the bad frame. That is what makes a plain retry worth anything here.
+
+        Distinguished from a protocol refusal by the malformed counter having moved. An
+        `isError()` response also returns None, and re-reading that is pointless: several
+        profiles probe ranges their hardware rejects on every poll, and retrying each one
+        would double those requests for nothing (#360, #361).
+        """
+        if attempt != 0:
+            return False
+        if self.malformed_reads <= malformed_before:
+            return False        # a refusal, not a stale frame
+        if not self._begin_stale_frame_retry():
+            logger.debug(
+                "[SharedConn %s] %d stale frames re-read this poll already; leaving "
+                "%d (+%d) unread",
+                self.connection_id, self._stale_frame_retries_this_poll, start, count,
+            )
+            return False
+        logger.debug(
+            "[SharedConn %s] re-reading %d (+%d) after a discarded frame",
+            self.connection_id, start, count,
+        )
+        return True
 
     def read_input_registers(self, start: int, count: int, slave_id: int) -> Optional[list]:
         if self._client is None:
-            # No socket at all is a link problem, not evidence about the register
-            # (see ERROR_KIND_LINK) — a reconnect makes it worth retrying at once.
+            # No socket at all is a link problem, not evidence about the register.
             self.last_error_kind = ERROR_KIND_LINK
             return None
         # Issue #364: a block read can fail two structurally different ways.
@@ -889,25 +1389,32 @@ class SharedModbusConnection:
                         "(%s) — resetting and retrying once",
                         self.connection_id, start, count, exc,
                     )
-                    self.reset("transport error during block read")
+                    self.reset("transport error during block read",
+                               peer_closed=_peer_closed_the_connection(exc))
                     if self.ensure_connected():
                         continue
                 logger.debug("[SharedConn %s] read_input_registers(%d, %d, slave=%d) error: %s",
                              self.connection_id, start, count, slave_id, exc)
                 return None
 
+            before = self.malformed_reads
             registers = self._validate_registers(resp, start, count)
-            # The request went out on a working socket; an error response or a
-            # short/misaligned frame is evidence about the register itself, so it must
-            # survive a reconnect (see ERROR_KIND_NO_RESPONSE).
+            # A discarded frame is re-read once before any of this is believed (#433). A
+            # stale frame is somebody else's answer arriving on our stream, which is not
+            # evidence about the register we asked for - classifying it as such would back
+            # a block off for a reason that has nothing to do with the block.
+            if registers is None and self._retry_after_stale_frame(
+                    attempt, before, start, count):
+                continue
+            # The request went out on a working socket, so an error response or a short
+            # frame is evidence about the register itself and must survive a reconnect.
             self.last_error_kind = None if registers is not None else ERROR_KIND_NO_RESPONSE
             return registers
         return None
 
     def read_holding_registers(self, start: int, count: int, slave_id: int) -> Optional[list]:
         if self._client is None:
-            # No socket at all is a link problem, not evidence about the register
-            # (see ERROR_KIND_LINK) — a reconnect makes it worth retrying at once.
+            # No socket at all is a link problem, not evidence about the register.
             self.last_error_kind = ERROR_KIND_LINK
             return None
         # Same transport-vs-protocol distinction as read_input_registers() above.
@@ -928,17 +1435,25 @@ class SharedModbusConnection:
                         "(%s) — resetting and retrying once",
                         self.connection_id, start, count, exc,
                     )
-                    self.reset("transport error during block read")
+                    self.reset("transport error during block read",
+                               peer_closed=_peer_closed_the_connection(exc))
                     if self.ensure_connected():
                         continue
                 logger.debug("[SharedConn %s] read_holding_registers(%d, %d, slave=%d) error: %s",
                              self.connection_id, start, count, slave_id, exc)
                 return None
 
+            before = self.malformed_reads
             registers = self._validate_registers(resp, start, count)
-            # The request went out on a working socket; an error response or a
-            # short/misaligned frame is evidence about the register itself, so it must
-            # survive a reconnect (see ERROR_KIND_NO_RESPONSE).
+            # A discarded frame is re-read once before any of this is believed (#433). A
+            # stale frame is somebody else's answer arriving on our stream, which is not
+            # evidence about the register we asked for - classifying it as such would back
+            # a block off for a reason that has nothing to do with the block.
+            if registers is None and self._retry_after_stale_frame(
+                    attempt, before, start, count):
+                continue
+            # The request went out on a working socket, so an error response or a short
+            # frame is evidence about the register itself and must survive a reconnect.
             self.last_error_kind = None if registers is not None else ERROR_KIND_NO_RESPONSE
             return registers
         return None
@@ -986,7 +1501,8 @@ class SharedModbusConnection:
                         "resetting and retrying once",
                         self.connection_id, register, value, exc,
                     )
-                    self.reset("transport error during write")
+                    self.reset("transport error during write",
+                               peer_closed=_peer_closed_the_connection(exc))
                     if self.ensure_connected():
                         continue
                 logger.debug("[SharedConn %s] write_register(%d, %d, slave=%d) error: %s",
@@ -1001,6 +1517,7 @@ class SharedModbusConnection:
                     self.connection_id, register, value, result,
                 )
                 return False
+            self._note_transaction_succeeded()
             return True
         return False
 
@@ -1023,7 +1540,8 @@ class SharedModbusConnection:
                         "(%s) — resetting and retrying once",
                         self.connection_id, register, len(values), exc,
                     )
-                    self.reset("transport error during write")
+                    self.reset("transport error during write",
+                               peer_closed=_peer_closed_the_connection(exc))
                     if self.ensure_connected():
                         continue
                 logger.debug("[SharedConn %s] write_registers(%d, slave=%d) error: %s",
@@ -1042,6 +1560,7 @@ class SharedModbusConnection:
                     self.connection_id, register, len(values), result,
                 )
                 return False
+            self._note_transaction_succeeded()
             return True
         return False
 
@@ -1100,6 +1619,12 @@ class GrowattModbus:
 
         # Impossible-PV-zero suppressions this session. Warned once, then debug (#384).
         self._impossible_pv_zero_count: int = 0
+        # Warn-once: the PVISO sentinel is reported on every poll for the whole life of
+        # an affected device, so one line a session is enough (#404).
+        self._pv_iso_sentinel_logged: bool = False
+        self._ac_charge_impossible_logged: bool = False
+        # Warn-once for the orphan-socket check; see _check_for_orphan_client_socket (#426).
+        self._orphan_socket_warned: bool = False
 
         # Whether the battery current candidates agreed on the last poll, and whether we
         # have already said so. Gates the battery power scale detection (#406).
@@ -1146,34 +1671,27 @@ class GrowattModbus:
         # Entries expire after _OPTIONAL_RANGE_RETRY_SECONDS and are retried.
         self._failed_optional_ranges: dict = {}
 
-        # Track failed optional VPP holding-register blocks (30000+ range) with
-        # timestamps, exactly like _failed_optional_ranges above.
-        # Format: dict mapping anchor_addr -> (last_fail_time, consecutive_fail_count)
-        # A block is skipped only after _OPTIONAL_HOLDING_FAIL_THRESHOLD consecutive
-        # failures, and even then only for _OPTIONAL_HOLDING_RETRY_SECONDS.  A single
-        # successful read clears the entry.
-        #
-        # This used to be a plain set that was never cleared: one transient Modbus
-        # error permanently blacklisted the block for the life of the process, so
-        # GrowattData kept reporting its dataclass defaults (remote_power_control_enable
-        # = 0 -> "Passthrough") while the inverter was actually running an override.
+        # Anchor address -> (last_fail_time, consecutive_fail_count) for the optional VPP
+        # holding blocks (30100, 30200, 30407). Skipped only after
+        # _VPP_HOLDING_FAIL_THRESHOLD consecutive failures, and even then only until the
+        # retry window expires — see the read path for what a permanent skip cost the user
+        # who found it in #370, and why one failure is not enough to act on.
         self._failed_optional_holding_addrs: dict = {}
 
-        # Generation of the shared TCP connection the blacklists above were built
-        # against. A reconnect invalidates them: whatever made the reads fail was
-        # very likely the connection itself.
+        # Generation of the shared connection the two records above were built against.
+        # A reconnect invalidates the failures that were caused by the connection itself.
         self._optional_blacklist_conn_generation: int = (
             getattr(shared_conn, 'connection_generation', 0) if shared_conn is not None else 0
         )
 
-        # Why each backed-off optional read last failed, so a reconnect can re-arm the
-        # ones that were only ever a symptom of a dead socket while leaving the ones the
-        # inverter genuinely refuses to answer backed off.  Keys are ('range', range_key)
-        # and ('holding', anchor); values are ERROR_KIND_LINK / ERROR_KIND_NO_RESPONSE.
+        # Why each backed-off optional read last failed, so a reconnect can re-arm the ones
+        # that were only ever a symptom of a dead socket while leaving the ones the inverter
+        # genuinely does not answer backed off. Keys are ('range', range_key) and
+        # ('holding', anchor); values are ERROR_KIND_LINK / ERROR_KIND_NO_RESPONSE.
         self._optional_failure_kinds: dict = {}
 
-        # Classification of the most recent read (set by read_holding_registers /
-        # read_input_registers, consumed by the optional-read bookkeeping).
+        # Classification of the most recent read, set by the read methods below and
+        # consumed by _note_optional_failure_kind().
         self._last_read_error_kind: Optional[str] = None
 
         # Last successfully read battery SOC — used to hold value if VPP range is
@@ -1220,6 +1738,31 @@ class GrowattModbus:
         self._battery_power_scale_override = None  # None = use profile default, 0.1 or 1.0 = detected scale
         self._battery_power_scale_samples = []  # Store validation samples
         self._battery_power_scale_validated = False  # Set to True once detection is complete
+
+        # True when this poll's voltage x current says the profile's documented scale is
+        # wrong, but the override has not committed yet. Set by _detect_battery_power_scale
+        # and consumed at the decode, which withholds the reading rather than publish a
+        # figure it has just been told is a factor of ten out (#434).
+        self._battery_power_scale_disputed = False
+
+        # Set when a validated scale was restored from storage rather than detected in
+        # this session. The override is in force, but `_validated` stays False on purpose
+        # so detection keeps running and can correct a stored value that turns out to be
+        # wrong - a persisted mistake that could not be re-earned would be #406 made
+        # permanent.
+        self._battery_power_scale_restored = False
+
+        # Warn-once for the withheld reading above. The condition can hold for several
+        # polls, and a guard working as designed should not file a line a minute.
+        self._battery_power_scale_disputed_warned = False
+
+        # Consecutive polls in which a 32-bit pair showed the word-level corruption shape
+        # (#446), keyed by (address, pair address). Cleared by any normal reading.
+        self._pair_shape_suspect: dict = {}
+        # Phase-total quantities whose total register has read non-zero this session, so
+        # the firmware is known to populate it and a zero there is a real zero (#446).
+        self._phase_total_populated: set = set()
+        self._pair_shape_warned: set = set()
 
         # Battery register range detection (VPP vs fallback)
         self._battery_register_range = None  # 'vpp' or 'fallback' - determined on first read
@@ -1397,30 +1940,69 @@ class GrowattModbus:
     # Optional-register backoff bookkeeping
     # ------------------------------------------------------------------
 
+    def _optional_holding_blocked(self, anchor: int) -> bool:
+        """Whether an optional holding block should be skipped on this poll."""
+        entry = self._failed_optional_holding_addrs.get(anchor)
+        if not entry:
+            return False
+        last_fail, fail_count = entry
+        if fail_count < _VPP_HOLDING_FAIL_THRESHOLD:
+            # Not enough consecutive failures yet. A transient error must not take a
+            # control block out of service, which is what a threshold of one did.
+            return False
+        if time.time() - last_fail >= _VPP_HOLDING_RETRY_S:
+            # Retry window expired. The entry is deliberately kept so the count keeps
+            # growing (and the log line stays suppressed) if the re-read fails again; a
+            # successful read clears it.
+            return False
+        return True
+
+    def _record_optional_holding_failure(self, anchor: int, label: str) -> None:
+        """Count a failed optional holding-block read and log the transition once."""
+        previous = self._failed_optional_holding_addrs.get(anchor)
+        fail_count = (previous[1] + 1) if previous else 1
+        self._failed_optional_holding_addrs[anchor] = (time.time(), fail_count)
+        self._note_optional_failure_kind(('holding', anchor))
+        if fail_count == _VPP_HOLDING_FAIL_THRESHOLD:
+            logger.debug(
+                "[VPP] %s failed %d consecutive polls — skipping for %ds, then retrying. "
+                "If this repeats indefinitely the firmware likely does not implement it.",
+                label, fail_count, _VPP_HOLDING_RETRY_S,
+            )
+        else:
+            logger.debug("[VPP] %s read failed (attempt %d)", label, fail_count)
+
+    def _note_optional_failure_kind(self, key) -> None:
+        """Remember why an optional read last failed (see clear_optional_blacklists)."""
+        kind = self._last_read_error_kind
+        if kind is None and self._shared_conn is not None:
+            kind = getattr(self._shared_conn, 'last_error_kind', None)
+        self._optional_failure_kinds[key] = kind or ERROR_KIND_LINK
+
     def clear_optional_blacklists(self, reason: str = "", link_failures_only: bool = True) -> None:
         """Re-arm optional reads that were only backed off because the link was down.
 
-        Called when the connection is (re-)established.  A read that failed because the
-        transport raised (ERROR_KIND_LINK) says nothing about the register, so a fresh
-        socket must retry it.  A read that failed with ERROR_KIND_NO_RESPONSE went out on
-        a working socket and was ignored by the inverter; re-arming that on every
-        reconnect is how a poll ends up paying a full timeout per unanswered register
-        again and again, so those entries survive and keep counting down their retry
-        window.
+        A read that failed because the transport raised (ERROR_KIND_LINK) says nothing
+        about the register, so a fresh socket must retry it. A read that failed with
+        ERROR_KIND_NO_RESPONSE went out on a working socket and was not answered;
+        re-arming that on every reconnect is how a poll ends up paying a full timeout per
+        unanswered register again and again, so those entries survive and keep counting
+        down their retry window.
 
-        ``link_failures_only=False`` clears everything (used by tests and by an explicit
-        operator-driven reset).
+        ``link_failures_only=False`` clears everything.
         """
         def _keep(key) -> bool:
             if not link_failures_only:
                 return False
-            # Unknown kind is treated as a link failure: that is the conservative
-            # behaviour the earlier fix intended — a transient error must never take a
-            # control block out of service for the life of the process.
+            # An unknown kind is treated as a link failure: that is the conservative
+            # direction, since a transient error must never take a control block out of
+            # service for the life of the process.
             return self._optional_failure_kinds.get(key) == ERROR_KIND_NO_RESPONSE
 
         dropped_ranges = [k for k in self._failed_optional_ranges if not _keep(('range', k))]
-        dropped_holdings = [a for a in self._failed_optional_holding_addrs if not _keep(('holding', a))]
+        dropped_holdings = [
+            a for a in self._failed_optional_holding_addrs if not _keep(('holding', a))
+        ]
         if not dropped_ranges and not dropped_holdings:
             return
         logger.info(
@@ -1437,63 +2019,22 @@ class GrowattModbus:
             self._optional_failure_kinds.pop(('holding', anchor), None)
 
     def _sync_optional_blacklists_with_connection(self) -> None:
-        """Drop the backoff state when the shared connection has been re-established.
+        """Drop backoff state built against a connection that has since been replaced.
 
-        The shared hub owns the socket and can reconnect underneath us (silent
-        connection loss recovery, see SharedModbusConnection.reset()). Its
-        connection_generation changes on every fresh connect, which is our signal
-        that the previous session's failures no longer say anything.
+        The shared hub owns the socket and can reconnect underneath us (#354, #364). Its
+        connection_generation changes on every fresh connect, which is the signal that the
+        previous session's failures no longer say anything.
 
-        Only the shared path is handled here. The non-shared path reconnects on
-        *every* poll by design (_fetch_data disconnects before connecting), so
-        clearing there would disable the backoff entirely; that path relies on the
-        failure threshold and the retry window instead.
+        Only the shared path is handled here. The non-shared path reconnects on *every*
+        poll by design, so clearing there would disable the backoff entirely; that path
+        relies on the failure threshold and the retry window instead.
         """
         if self._shared_conn is None:
             return
         generation = getattr(self._shared_conn, 'connection_generation', 0)
         if generation != self._optional_blacklist_conn_generation:
             self._optional_blacklist_conn_generation = generation
-            self.clear_optional_blacklists("shared connection re-established")
-
-    def _optional_holding_blocked(self, anchor: int) -> bool:
-        """Whether an optional holding block should be skipped on this poll."""
-        entry = self._failed_optional_holding_addrs.get(anchor)
-        if not entry:
-            return False
-        last_fail, fail_count = entry
-        if fail_count < _OPTIONAL_HOLDING_FAIL_THRESHOLD:
-            # Not enough consecutive failures yet — a transient error must not
-            # take a control block out of service.
-            return False
-        if time.time() - last_fail >= _OPTIONAL_HOLDING_RETRY_SECONDS:
-            # Retry window expired. The entry is deliberately kept so the fail
-            # count keeps growing (and the WARNING stays suppressed) if the
-            # re-read fails again; a successful read clears it.
-            return False
-        return True
-
-    def _record_optional_holding_failure(self, anchor: int, label: str) -> None:
-        """Count a failed optional holding-block read and log the transition once."""
-        previous = self._failed_optional_holding_addrs.get(anchor)
-        fail_count = (previous[1] + 1) if previous else 1
-        self._failed_optional_holding_addrs[anchor] = (time.time(), fail_count)
-        self._note_optional_failure_kind(('holding', anchor))
-        if fail_count == _OPTIONAL_HOLDING_FAIL_THRESHOLD:
-            logger.warning(
-                "[VPP] %s failed %d consecutive polls — skipping for %ds. "
-                "Derived mode status and the matching controls report Unknown until it responds.",
-                label, fail_count, _OPTIONAL_HOLDING_RETRY_SECONDS,
-            )
-        else:
-            logger.debug("[VPP] %s read failed (attempt %d)", label, fail_count)
-
-    def _note_optional_failure_kind(self, key) -> None:
-        """Remember why an optional read last failed (see clear_optional_blacklists)."""
-        kind = self._last_read_error_kind
-        if kind is None and self._shared_conn is not None:
-            kind = getattr(self._shared_conn, 'last_error_kind', None)
-        self._optional_failure_kinds[key] = kind or ERROR_KIND_LINK
+            self.clear_optional_blacklists("connection re-established")
 
     def _track_read_success(self):
         """Track successful read and restore fast polling if we had backed off"""
@@ -1558,9 +2099,9 @@ class GrowattModbus:
 
         if self._shared_conn is not None:
             registers = self._shared_conn.read_input_registers(start_address, count, self.slave_id)
-            # The hub classifies *why* the read came back empty; the optional-block
-            # backoff needs that to tell a dead socket from a register the inverter
-            # refuses to answer (see _note_optional_failure_kind).
+            # The hub classifies *why* the read came back empty; the optional-register
+            # backoff needs that to tell a dead socket from a register the inverter does
+            # not answer (see _note_optional_failure_kind).
             self._last_read_error_kind = self._shared_conn.last_error_kind
             # This used to return directly, bypassing the failure counters below — so
             # _consecutive_read_failures never moved for any TCP entry and the adaptive
@@ -1869,13 +2410,37 @@ class GrowattModbus:
         A single candidate agrees with itself. Several agree when they point the same way
         and are the same size; disagreement means at least one of them is not the register
         we think it is, and none of them can be trusted to validate anything.
+
+        **A register sitting at zero is not disagreeing - it is not reporting.** That
+        distinction is the whole of #430. On a WIT 4-15kW under a 35 A discharge the three
+        candidates read:
+
+            reg 31215 (VPP)  -0.1 A     never carries current on this model
+            reg 3170  (3k)    0.0 A     never carries current on this model
+            reg 8035  (base) 34.1 A     the real reading, and the one selected
+
+        Counting the two dead registers as dissent made the candidates *permanently*
+        disagree while discharging, so the scale detector was blocked on every poll for the
+        life of the connection and the documented scale stood - which is wrong on that unit.
+        Battery power published a tenth of the truth, ~180 W against a measured ~1.8 kW.
+
+        Dropping them keeps #406 caught, which is the case this guard was built for. That
+        reporter's candidates were -0.1 A, 6.3 A and -4.3 A: discard the near-zero one and
+        6.3 against -4.3 still point opposite ways, so they still disagree and no scale is
+        inferred from them.
+
+        Genuine conflict is two registers each claiming a real current and contradicting
+        each other. Silence from a register that does not implement the address is not
+        evidence about the one that does.
         """
-        if len(values) <= 1:
+        live = [v for v in values if abs(v) > _BATTERY_CURRENT_SILENT_A]
+        if len(live) <= 1:
+            # Nothing left to contradict. Detection is still gated on real load by
+            # _BATTERY_SCALE_MIN_POWER_W, so an idle battery cannot latch a scale here.
             return True
-        signed = [v for v in values if abs(v) > 0.2]   # ignore near-zero noise for sign
-        if signed and not (all(v > 0 for v in signed) or all(v < 0 for v in signed)):
+        if not (all(v > 0 for v in live) or all(v < 0 for v in live)):
             return False
-        mags = [abs(v) for v in values]
+        mags = [abs(v) for v in live]
         lo, hi = min(mags), max(mags)
         if hi - lo <= 0.5:            # same size to within half an amp
             return True
@@ -1896,6 +2461,9 @@ class GrowattModbus:
         Returns:
             Detected scale (0.1 or 1.0), or None if detection uncertain
         """
+        # Nothing is in dispute until this poll's arithmetic says so.
+        self._battery_power_scale_disputed = False
+
         # Skip detection if already validated
         if self._battery_power_scale_validated:
             return self._battery_power_scale_override
@@ -1961,6 +2529,29 @@ class GrowattModbus:
 
         # Store sample for validation
         if detected_scale is not None:
+            # Does this poll contradict the scale currently in force?
+            #
+            # The three-sample rule protects against *latching* a wrong scale; it was never
+            # meant to make us publish a number we have this moment measured to be a factor
+            # of ten out. A WIT reporter watched exactly that: at 12:25:19 the first poll of
+            # a session read 230 W where voltage x current said 2310 W, because the override
+            # had not committed yet and the profile's documented 0.1 stood (#434).
+            #
+            # Recorded rather than acted on here - the decode withholds the reading. That is
+            # the trade this project takes everywhere: an unknown leaves a visible gap, a
+            # plausible-looking number goes into long-term statistics and cannot be told
+            # apart from a real one afterwards.
+            #
+            # Deliberately NOT "withhold until validated". Detection cannot run at all when
+            # the current candidates disagree (#406) or below the load gate, so a blanket
+            # rule would leave those owners with no battery power sensor for ever. This
+            # fires only when there is positive evidence of a contradiction.
+            in_force = self._battery_power_scale_override
+            if in_force is None:
+                in_force = self._documented_battery_power_scale()
+            if in_force is not None and detected_scale != in_force:
+                self._battery_power_scale_disputed = True
+
             self._battery_power_scale_samples.append(detected_scale)
 
             # Validate after collecting 3 consistent samples
@@ -1969,6 +2560,8 @@ class GrowattModbus:
                 if all(s == detected_scale for s in self._battery_power_scale_samples[-3:]):
                     self._battery_power_scale_override = detected_scale
                     self._battery_power_scale_validated = True
+                    self._battery_power_scale_disputed = False
+                    self._battery_power_scale_restored = False
                     logger.info(
                         f"WIT Battery Power Scale Auto-Detected: {detected_scale}W "
                         f"(V={voltage:.1f}V, I={current:.1f}A, Expected={expected_power:.0f}W, "
@@ -1977,6 +2570,96 @@ class GrowattModbus:
                     return detected_scale
 
         return None
+
+    @staticmethod
+    def _signed_pair_words_look_corrupted(high_value: int) -> bool:
+        """Does this SIGNED pair's high word sit in neither extreme band? (#447)
+
+        Real values cluster at both ends - near 0x0000 going up, near 0xFFFF going down.
+        A value that landed in the wrong half puts a mid-range number there instead.
+        """
+        return not (high_value <= _SIGNED_PAIR_HIGH_WORD_BAND
+                    or high_value >= 0xFFFF - _SIGNED_PAIR_HIGH_WORD_BAND)
+
+    @staticmethod
+    def _pair_words_look_corrupted(high_value: int, low_value: int) -> bool:
+        """Does this 32-bit pair have the word-level corruption shape? (#446)
+
+        A correct reading below 6553.6 W has a high word of 0. These have a small integer
+        there and a low word jammed against 0x0000 or 0xFFFF, which is what a value landing
+        in the wrong half of the pair looks like.
+        """
+        if high_value == 0 or high_value > _PAIR_HIGH_WORD_MAX_FOR_CORRUPTION:
+            return False
+        return (low_value <= _PAIR_WORD_LOW_END_MARGIN
+                or low_value >= 0xFFFF - _PAIR_WORD_HIGH_END_MARGIN)
+
+    def _documented_battery_power_scale(self) -> Optional[float]:
+        """The `combined_scale` the profile declares for battery power, or None.
+
+        This is what the decode applies when no override is in force, so it is the figure a
+        detected scale has to be compared against to know whether anything is in dispute.
+
+        Advisory only, and returns None rather than raising if the map cannot be reached:
+        the caller's fallback is "nothing is in dispute", which leaves the existing
+        behaviour exactly as it was. A lookup that exists to make the reading *more*
+        careful must not be able to break the reading itself.
+        """
+        try:
+            addr = self._find_register_by_name_with_fallback('battery_power_low')
+            if addr is None:
+                return None
+            register_map = getattr(self, 'register_map', None) or {}
+            info = (register_map.get('input_registers', {}).get(addr)
+                    or register_map.get('holding_registers', {}).get(addr))
+            if not info:
+                return None
+            scale = info.get('combined_scale')
+            return float(scale) if isinstance(scale, (int, float)) else None
+        except Exception:  # pragma: no cover - defensive, see docstring
+            return None
+
+    # ------------------------------------------------------------------
+    # Carrying a validated scale across the life of this object (#434)
+    #
+    # The override is instance state, and a WIT owner's gateway drops idle connections.
+    # Something rebuilds the client around those drops - the trigger is still unidentified -
+    # and a fresh object starts at None, so the documented 0.1 stands again. Above the
+    # detector's 500 W gate that self-heals within about three polls; below it detection
+    # cannot run, so the tenth persists until load rises. Overnight it never does, which is
+    # the whole of #434: not "it latched the wrong scale" but "it lost the right one and
+    # could not re-earn it while gated".
+    #
+    # So the coordinator persists a validated scale and hands it back here on the next
+    # setup. Two constraints, both from #406, where a bad detection at low load latched a
+    # wrong scale and produced 40 kW readings on a 6.5 kW battery:
+    #
+    #   * only a scale that passed the full validation is ever stored - never a restored
+    #     one, or a mistake would copy itself forward for ever
+    #   * a restored scale does not mark detection complete, so the detector keeps
+    #     watching and overwrites it the moment real load contradicts it
+    # ------------------------------------------------------------------
+
+    @property
+    def validated_battery_power_scale(self) -> Optional[float]:
+        """The scale this session detected and confirmed, or None. Safe to persist."""
+        if self._battery_power_scale_validated:
+            return self._battery_power_scale_override
+        return None
+
+    def restore_battery_power_scale(self, scale: float) -> None:
+        """Adopt a previously validated scale without treating detection as finished."""
+        if scale not in (0.1, 1.0):
+            logger.debug("[SCALE] Ignoring restored battery power scale %r", scale)
+            return
+        self._battery_power_scale_override = scale
+        self._battery_power_scale_restored = True
+        self._battery_power_scale_validated = False
+        logger.info(
+            "[SCALE] Restored the battery power scale of %sW confirmed in an earlier "
+            "session. Detection stays active and will correct it if real load disagrees.",
+            scale,
+        )
 
     def _set_from_register(self, data: "GrowattData", field_name: str, address: int) -> None:
         """Assign a decoded register to a field, or record that it could not be read.
@@ -1994,10 +2677,82 @@ class GrowattModbus:
             return
         setattr(data, field_name, value)
 
+    # Raw values at or above this from PVISO (input 200) are a not-measured sentinel, not
+    # an insulation resistance.
+    #
+    # Two unrelated inverters both report exactly 65530 - 0xFFFA, or -6 signed. Growatt's
+    # own app displays the same 65530 rather than a resistance, so it is what the inverter
+    # sends and not a decode error at either end. 65 MOhm is not a measurement.
+    #
+    # The threshold covers 0xFFFA-0xFFFF, the usual all-ones family of "no value" codes.
+    # The highest reading anyone has seen that behaves like a real measurement is 41077
+    # kOhm, well clear of it, and readings between scans move the way a measurement does
+    # (15489 -> 41077 on the same device).
+    #
+    # Withheld rather than published: a falling insulation resistance is how you find water
+    # in a connector, so a fixed 65530 that looks like a healthy array is worse than no
+    # sensor at all (#404).
+    PV_ISO_NOT_MEASURED_MIN = 65530.0
+
+    # Generator charge current (holding 83) at or above this is the same all-ones family of
+    # "not supported" codes, not a current.
+    #
+    # An SPF 5000 ES reads exactly 65535 there — it has no generator charge setting, and
+    # ShinePhone does not offer one on that model. Published raw it filled a writable number
+    # entity with 65535, which invites someone to correct it to a sensible figure and write
+    # a value the inverter does not have a register for. The profile's own ceiling is 80 A,
+    # so nothing legitimate comes near this (#444).
+    GEN_CHARGE_CURRENT_NOT_SUPPORTED = 65530
+
     # Deficit, in watts, that AC output must exceed before a PV reading of zero is treated
     # as impossible. Matches the margin the SPF sign correction uses for the same kind of
     # power-balance reasoning (#345), so the two agree about what counts as significant.
     PV_ZERO_BALANCE_MARGIN = 200.0
+
+    # Headroom for the AC-charge check below. AC charge is metered on the grid side and
+    # battery charge on the battery side, so conversion loss lets the first run a little
+    # ahead of the second - never by a quarter, and never by a whole kilowatt-hour.
+    AC_CHARGE_HEADROOM_FACTOR = 1.25
+    AC_CHARGE_HEADROOM_KWH = 1.0
+
+    def _withhold_impossible_ac_charge(self, data: "GrowattData") -> None:
+        """Withhold an AC charge counter that exceeds the battery's own charge counter.
+
+        Energy charged from the grid into the battery is part of all energy charged into it,
+        so AC charge can never meaningfully exceed battery charge. Protocol V1.39 gives input
+        112-115 two meanings, and SPH reads them as AC charge energy, confirmed on an SPH
+        3000-6000 (#390). An SPM 6000TL-HU uses the other meaning: 114 holds the inverter's
+        60 s start delay, so AC Charge Energy Total decoded as 393,216 kWh against a battery
+        charge total of 1.2 kWh, on a system that never charges from the grid (#463).
+
+        A test of the reading rather than of the model, so the units where 112-115 really
+        are the counter keep it, and nobody has to guess which side of the protocol's column
+        a given firmware falls on.
+        """
+        unread = data.unread_fields
+        for ac_attr, battery_attr in (
+            ("ac_charge_energy_today", "charge_energy_today"),
+            ("ac_charge_energy_total", "charge_energy_total"),
+        ):
+            if ac_attr in unread or battery_attr in unread:
+                continue
+            ac_value = getattr(data, ac_attr, 0) or 0
+            battery_value = getattr(data, battery_attr, 0) or 0
+            if battery_value <= 0:
+                continue  # nothing to compare against
+            limit = battery_value * self.AC_CHARGE_HEADROOM_FACTOR + self.AC_CHARGE_HEADROOM_KWH
+            if ac_value > limit:
+                unread.add(ac_attr)
+                if not self._ac_charge_impossible_logged:
+                    self._ac_charge_impossible_logged = True
+                    logger.info(
+                        "[%s] %s reads %.1f kWh, more than the battery has been charged in "
+                        "total (%s = %.1f kWh). The registers behind it do not hold AC charge "
+                        "energy on this inverter, so it is reported as unknown (#463). Not "
+                        "logged again this session.",
+                        self.register_map.get('name', '?'), ac_attr, ac_value,
+                        battery_attr, battery_value,
+                    )
 
     def _suppress_impossible_pv_zero(self, data: "GrowattData") -> None:
         """Withhold a PV reading of zero the inverter's own registers contradict (#384).
@@ -2158,6 +2913,36 @@ class GrowattModbus:
 
             # Handle signed values if specified
             if reg_info.get('signed') or pair_info.get('signed'):
+                # Same word-level corruption as #446, on a pair the unsigned guard cannot
+                # test (#447). See _SIGNED_PAIR_HIGH_WORD_BAND for the measured shapes.
+                #
+                # Never believed, however often it repeats. The band leaves ~107 kW of
+                # headroom each way, so a reading in the middle is never real - and an
+                # escape hatch here published a +8.5 MW spike on grid power, where the same
+                # impossible shape happened to hold for three polls (#446, @AzraelsDisk).
+                if self._signed_pair_words_look_corrupted(high_value):
+                    name = reg_info.get('name') or pair_info.get('name')
+                    _as_signed = (combined - 0x100000000
+                                  if combined > 0x7FFFFFFF else combined)
+                    if name not in self._pair_shape_warned:
+                        self._pair_shape_warned.add(name)
+                        logger.warning(
+                            "[PAIR SHAPE] %s (registers %d/%d) read HIGH=%d LOW=%d "
+                            "(0x%08X), which would publish %s. On a signed pair a real "
+                            "reading keeps its high word near 0 or near 65535; this one "
+                            "is in between, which is the signature of a value landing "
+                            "in the wrong half. Withholding it - no real reading can land "
+                            "here, so it is never published (#447). Repeats log at debug.",
+                            name, address, pair_addr, high_value, low_value, combined,
+                            f"{_as_signed * combined_scale:,.1f}",
+                        )
+                    else:
+                        logger.debug(
+                            "[PAIR SHAPE] %s withheld again: HIGH=%d LOW=%d",
+                            name, high_value, low_value,
+                        )
+                    return None
+
                 if combined > 0x7FFFFFFF:  # If sign bit is set
                     combined = combined - 0x100000000
             elif combined > 0x7FFFFFFF:
@@ -2195,19 +2980,101 @@ class GrowattModbus:
                 name = reg_info.get('name') or pair_info.get('name')
                 if name not in self._underflow_warned:
                     self._underflow_warned.add(name)
+                    as_signed = combined - 0x100000000
+
+                    # Say which of the two faults this looks like, rather than assuming.
+                    #
+                    # The message used to advise "the profile is probably missing 'signed':
+                    # True" for every case. That is right for a counter dipping a hair below
+                    # zero - -17 arriving as 4,294,967,279 - and badly wrong for a register
+                    # the firmware does not implement, which answers with an all-ones
+                    # pattern. One reporter read 0xFFED0000 and 0xFFE5FFE5 on per-phase grid
+                    # import and concluded the flag was missing, exactly as told. As signed
+                    # those are -124 kW and -170 kW on a 10 kW inverter: adding the flag
+                    # would have published them (#401).
+                    #
+                    # A genuine underflow sits just below zero. A sentinel does not.
+                    looks_like_sentinel = abs(as_signed) > _UNDERFLOW_PLAUSIBLE_MAGNITUDE
+                    if looks_like_sentinel:
+                        advice = (
+                            "That is too large to be a value dipping below zero, so this "
+                            "register is more likely not implemented on this firmware and "
+                            "answering with a not-set pattern. Do NOT add 'signed': True - "
+                            "it would publish that number. Report it on #401 with the raw "
+                            "value if the sensor matters to you."
+                        )
+                    else:
+                        advice = (
+                            "If this repeats, the profile is probably missing "
+                            "'signed': True for this register (#401)."
+                        )
+
                     logger.warning(
-                        "[UNDERFLOW] %s (registers %d/%d) read %d, which has the sign bit "
-                        "set on a pair not declared signed. As a signed value that is %s. "
-                        "Withholding it. If this repeats, the profile is probably missing "
-                        "'signed': True for this register (#401).",
-                        name, address, pair_addr, combined, combined - 0x100000000,
+                        "[UNDERFLOW] %s (registers %d/%d) read %d (0x%08X), which has the "
+                        "sign bit set on a pair not declared signed. As a signed value that "
+                        "is %s. Withholding it. %s",
+                        name, address, pair_addr, combined, combined, as_signed, advice,
                     )
                 else:
                     logger.debug(
                         "[UNDERFLOW] %s: %d withheld again (signed: %s)",
                         name, combined, combined - 0x100000000,
                     )
+                # A poll of a different kind breaks a word-corruption streak - "in a row"
+                # has to mean consecutive polls. Left alone, garbage alternating between
+                # this and the shape below accumulated into a believed reading (#446).
+                self._pair_shape_suspect.pop((address, pair_addr), None)
                 return None
+
+            else:
+                # An unsigned pair with the sign bit clear. This is where a word-level
+                # corruption lands, because it is small enough not to trip the guard above
+                # (#446). See _PAIR_WORD_LOW_END_MARGIN / _PAIR_WORD_HIGH_END_MARGIN for
+                # the measured signature.
+                #
+                # Only reached for unsigned pairs: a signed pair legitimately carries
+                # 0xFFFF in its high word for small negatives, which is the same shape.
+                shape_key = (address, pair_addr)
+                if self._pair_words_look_corrupted(high_value, low_value):
+                    # Only the SAME high word counts toward belief. A genuine steady
+                    # reading near a 65536 boundary keeps its high word (1 for a 6.6 kW
+                    # load, 2 for a 13 kW EV charge); garbage does not. Counting any
+                    # suspect shape published an SPH-TL3 owner's per-phase import at
+                    # 6,022,667 W after three different corrupted reads - high words 19,
+                    # 724 and 918 - fed straight into grid import (#446, @AzraelsDisk).
+                    prev_seen, prev_high = self._pair_shape_suspect.get(shape_key, (0, None))
+                    seen = prev_seen + 1 if prev_high == high_value else 1
+                    self._pair_shape_suspect[shape_key] = (seen, high_value)
+                    if seen < _PAIR_SHAPE_REPEATS_BEFORE_BELIEVED:
+                        name = reg_info.get('name') or pair_info.get('name')
+                        if name not in self._pair_shape_warned:
+                            self._pair_shape_warned.add(name)
+                            logger.warning(
+                                "[PAIR SHAPE] %s (registers %d/%d) read HIGH=%d LOW=%d "
+                                "(0x%08X), which would publish %s. The high word carries a "
+                                "small value where a correct reading has 0, and the low "
+                                "word is at one end of its range - the signature of a "
+                                "word-level corruption rather than a measurement. "
+                                "Withholding it. If the same high word repeats %d polls in "
+                                "a row it will be published as genuine (#446). Repeats log "
+                                "at debug.",
+                                name, address, pair_addr, high_value, low_value, combined,
+                                f"{combined * combined_scale:,.1f}",
+                                _PAIR_SHAPE_REPEATS_BEFORE_BELIEVED,
+                            )
+                        else:
+                            logger.debug(
+                                "[PAIR SHAPE] %s withheld again: HIGH=%d LOW=%d",
+                                name, high_value, low_value,
+                            )
+                        return None
+                    logger.debug(
+                        "[PAIR SHAPE] %s has held the same shape for %d polls - publishing "
+                        "it as a genuine reading",
+                        reg_info.get('name') or pair_info.get('name'), seen,
+                    )
+                else:
+                    self._pair_shape_suspect.pop(shape_key, None)
 
             # WIT Battery Power Scale Override (auto-detected if needed)
             reg_name = reg_info.get('name') or pair_info.get('name')
@@ -2229,10 +3096,50 @@ class GrowattModbus:
 
             return raw_value * scale
 
+    def _check_for_orphan_client_socket(self) -> None:
+        """Warn if this client has a socket of its own while a hub is in charge (#426).
+
+        Under a shared hub every read and write is routed through the hub's client, and
+        `connect()` returns early without opening anything - so `self.client`, which is
+        constructed regardless, should never hold a connection. pymodbus sync clients
+        auto-connect on their first transaction, so if any path reached this one directly it
+        would open a socket the hub does not know about, never closes, and cannot see.
+
+        That would fit what was measured on #426 exactly: two OS connections per logged
+        client, one freed by close() and one left behind, accumulating one per reload.
+
+        Stated as a hypothesis under test rather than a finding. Reading the code, the read
+        and write paths do branch on `_shared_conn` and return before touching this client -
+        so if this never fires, the second socket is inside pymodbus and this rules out a
+        whole layer. Warned once per connection either way; it must not become per-poll
+        noise on a system that is behaving.
+        """
+        if self._shared_conn is None or self._orphan_socket_warned:
+            return
+        client = getattr(self, "client", None)
+        if client is None:
+            return
+        try:
+            if not client.is_socket_open():
+                return
+        except Exception:
+            return
+
+        self._orphan_socket_warned = True
+        logger.warning(
+            "[%s@%s] This client holds its own socket while the shared hub is in charge - "
+            "%s. Nothing closes it, and the hub cannot see it. Please report this line on "
+            "issue #426.",
+            self.register_map.get('name', '?'), self.connection_id,
+            _describe_socket(client),
+        )
+
     def read_all_data(self) -> Optional[GrowattData]:
         """Read all relevant data from inverter"""
-        # A reconnect invalidates the optional-register backoff built up on the
-        # previous socket (see _sync_optional_blacklists_with_connection).
+        self._check_for_orphan_client_socket()
+
+        # A reconnect invalidates the optional-register backoff built up on the previous
+        # socket (see _sync_optional_blacklists_with_connection).
         self._sync_optional_blacklists_with_connection()
 
         data = GrowattData()
@@ -2465,7 +3372,7 @@ class GrowattModbus:
                             for chunk_start in range(min_addr_block, max_addr_block + 1, 125):
                                 chunk_count = min(125, max_addr_block - chunk_start + 1)
                                 logger.debug(f"Reading 3000 sub-chunk ({chunk_start}-{chunk_start+chunk_count-1}, {chunk_count} registers)")
-                                registers = self.read_input_registers(chunk_start, chunk_count)
+                                registers = self.read_input_registers(chunk_start, chunk_count, log_errors=_3000_is_primary)
                                 if registers is None:
                                     _3000_any_fail = True
                                     logger.debug(f"3000 sub-chunk failed ({chunk_start}-{chunk_start+chunk_count-1})")
@@ -2475,7 +3382,7 @@ class GrowattModbus:
                                         self._register_cache[chunk_start + i] = value
                         else:
                             logger.debug(f"Reading 3000 sub-range ({min_addr_block}-{max_addr_block}, {count_block} registers)")
-                            registers = self.read_input_registers(min_addr_block, count_block)
+                            registers = self.read_input_registers(min_addr_block, count_block, log_errors=_3000_is_primary)
                             if registers is None:
                                 _3000_any_fail = True
                                 logger.debug(f"3000 sub-range failed ({min_addr_block}-{max_addr_block})")
@@ -2489,7 +3396,11 @@ class GrowattModbus:
                 else:
                     # Single read is sufficient
                     logger.debug(f"Reading 3000 range (3000-{max_3000_addr}, {count_3000} registers)")
-                    registers = self.read_input_registers(3000, count_3000)
+                    # An optional block reports its own failure once, then retries every
+                    # _3000_RETRY_S at debug. The per-request warning inside
+                    # read_input_registers fired on every one of those retries, so a model
+                    # without the range logged it every five minutes indefinitely (#467).
+                    registers = self.read_input_registers(3000, count_3000, log_errors=_3000_is_primary)
                     if registers is None:
                         _3000_any_fail = True
                     else:
@@ -2625,7 +3536,19 @@ class GrowattModbus:
                         _fail_count = (_prev[1] + 1) if _prev else 1
                         self._failed_optional_ranges[range_key] = (time.time(), _fail_count)
                         self._note_optional_failure_kind(('range', range_key))
-                        if _fail_count == 1:
+                        # Battery stacks 2-4 (31300-31599) are optional hardware. With a
+                        # single stack the block simply does not answer, every session, and a
+                        # warning that "battery sensors may be temporarily unavailable" sends
+                        # people looking for a fault on a healthy one-battery system (#483).
+                        # A missing second stack is visible anyway: its sensors never appear.
+                        extra_stack = 31300 <= min_addr_block < 31600
+                        if _fail_count == 1 and extra_stack:
+                            logger.debug(
+                                f"Battery stack range ({min_addr_block}-{max_addr_block}) did "
+                                f"not answer - expected with a single battery stack. "
+                                f"Will retry in {_OPTIONAL_RANGE_RETRY_SECONDS}s."
+                            )
+                        elif _fail_count == 1:
                             logger.warning(
                                 f"Optional VPP range ({min_addr_block}-{max_addr_block}) failed — "
                                 f"battery sensors may be temporarily unavailable. "
@@ -2946,6 +3869,30 @@ class GrowattModbus:
                 data.ac_power_s = power_s_reg
                 data.ac_power_t = power_t_reg
 
+            # Aggregate AC power from the phases when the total register does not answer.
+            #
+            # On a MID 25KTL3-XH the 35/36 pair is simply not served: AC Power sat unknown
+            # while the three phase sensors read normally. Those phase figures were already
+            # V x I - 236.2 V x 0.7 A = 165.3 W, to the tenth - so the phase registers are
+            # not answered either. The phases had a fallback and the aggregate did not, so
+            # one entity was permanently unknown on hardware where the information was
+            # entirely available (#427).
+            #
+            # Same rule the grid flow already uses in _resolve_phase_total(): believe the
+            # total where it is populated, otherwise sum the phases. Only reached when the
+            # total did not read, so a working aggregate register is never overridden.
+            if is_three_phase and 'ac_power' in data.unread_fields:
+                if not self._inherit_unread(data, 'ac_power',
+                                            'ac_power_r', 'ac_power_s', 'ac_power_t'):
+                    data.ac_power = round(
+                        data.ac_power_r + data.ac_power_s + data.ac_power_t, 1)
+                    data.unread_fields.discard('ac_power')
+                    logger.debug(
+                        "AC Power: total register did not read; using the phase sum "
+                        "%.1f + %.1f + %.1f = %.1f W",
+                        data.ac_power_r, data.ac_power_s, data.ac_power_t, data.ac_power,
+                    )
+
             # Line-to-Line Voltages
             ac_voltage_rs_addr = self._find_register_by_name('line_voltage_rs')
             ac_voltage_st_addr = self._find_register_by_name('line_voltage_st')
@@ -2987,30 +3934,27 @@ class GrowattModbus:
             # 31100/31101 is the inverter's own 3-phase output while 31112/31113 is metered
             # grid exchange. v0.8.6 remapped it for that reason; re-read mid.py before
             # changing it.
-            for _flow_attr, _flow_name in (
-                ('power_to_grid', 'power_to_grid_low'),
-                ('power_to_user', 'power_to_user_low'),
+            data.grid_flow_from_meter_only = bool(
+                self.register_map.get('grid_flow_from_meter_only', False))
+            for _flow_attr, _flow_name, _phase_names in (
+                ('power_to_grid', 'power_to_grid_low', ()),
+                ('power_to_user', 'power_to_user_low',
+                 ('power_to_user_r_low', 'power_to_user_s_low', 'power_to_user_t_low')),
             ):
-                _addresses = self._find_all_registers_by_name(_flow_name)
-                _value = None
-                for _addr in _addresses:
-                    _candidate = self._get_register_value(_addr)
-                    if _candidate is None:
-                        continue
-                    if _value is None:
-                        _value = _candidate  # Remember the first real read as the floor.
-                    if _candidate != 0.0:
-                        _value = _candidate
-                        if _addr != _addresses[0]:
-                            logger.debug(
-                                "%s: %s read 0, using reg %d instead: %sW",
-                                _flow_name, _addresses[0], _addr, _candidate,
-                            )
-                        break
-                if _addresses:
-                    setattr(data, _flow_attr, _value if _value is not None else 0.0)
+                self._resolve_phase_total(data, _flow_attr, _flow_name, _phase_names)
             if power_to_load_addr:
                 self._set_from_register(data, 'power_to_load', power_to_load_addr)
+
+            # SPH-HU split-phase CT/local-load legs. These names exist only on the HU
+            # profile, so this loop is a no-op for every other inverter family.
+            for _leg_attr in (
+                'ct_grid_import_l1', 'ct_grid_import_l2',
+                'ct_grid_export_l1', 'ct_grid_export_l2',
+                'inverter_to_load_l1', 'inverter_to_load_l2',
+            ):
+                _leg_addr = self._find_register_by_name(f'{_leg_attr}_low')
+                if _leg_addr is not None:
+                    self._set_from_register(data, _leg_attr, _leg_addr)
             
             # Energy Today
             # For hybrid inverters (WIT/SPH-TL3 etc.), the AC energy_today register (e.g. reg 53/54)
@@ -3066,8 +4010,27 @@ class GrowattModbus:
             # Battery Data (if available - storage/hybrid models)
             self._read_battery_data(data)
 
-            # Backup Box Data (Growatt ARK transfer switch, regs 3281-3342)
+            # Backup Box Data (Growatt SYN backup box, regs 3281-3342)
             self._read_backup_box_data(data)
+
+            # Live priority mode, where the profile maps an input register for it (MOD/MID-XH
+            # input 3144: 0 Load, 1 Battery, 2 Grid). Mapped since the profile was written and
+            # never read, so Priority Mode fell back to a holding register instead (#475).
+            _pm_addr = self._find_register_by_name('priority_mode')
+            if _pm_addr is not None:
+                _pm = self._get_register_value(_pm_addr)
+                if _pm is None:
+                    data.unread_fields.add('priority_mode')
+                else:
+                    data.priority_mode = int(_pm)
+
+            # Battery working status (VPP 31001) and pack description (31225-31228), #460
+            for _pack_field in ('battery_working_status',
+                                'battery_cluster_sum', 'battery_module_number',
+                                'battery_module_rated_voltage', 'battery_module_rated_capacity'):
+                _pack_addr = self._find_register_by_name(_pack_field)
+                if _pack_addr:
+                    self._set_from_register(data, _pack_field, _pack_addr)
 
             # Temperatures
             inverter_temp_addr = self._find_register_by_name('inverter_temp')
@@ -3123,10 +4086,26 @@ class GrowattModbus:
                 ('gfci',   'gfci'),
             ):
                 _a = self._find_register_by_name(_reg)
-                if _a is not None:
-                    _v = self._get_register_value(_a)
-                    if _v is not None:
-                        setattr(data, _attr, float(_v))
+                if _a is None:
+                    continue
+                _v = self._get_register_value(_a)
+                if _v is None:
+                    data.unread_fields.add(_attr)
+                    continue
+                if _attr == 'pv_iso' and _v >= self.PV_ISO_NOT_MEASURED_MIN:
+                    # See PV_ISO_NOT_MEASURED_MIN. Reported as unknown rather than as a
+                    # 65 MOhm array in perfect health.
+                    data.unread_fields.add(_attr)
+                    if not self._pv_iso_sentinel_logged:
+                        self._pv_iso_sentinel_logged = True
+                        logger.info(
+                            "[%s] PV insulation resistance reads %.0f, which this inverter "
+                            "uses to mean 'not measured' - reporting unknown rather than a "
+                            "healthy-looking value. Not logged again this session (#404).",
+                            self.register_map.get('name', '?'), _v,
+                        )
+                    continue
+                setattr(data, _attr, float(_v))
 
             # Dry Contact State (input reg 3119 — SPH/MIN TL-X/TL-XH)
             dry_contact_state_addr = self._find_register_by_name('dry_contact_state')
@@ -3134,6 +4113,7 @@ class GrowattModbus:
                 data.dry_contact_state = int(self._get_register_value(dry_contact_state_addr) or 0)
 
             self._suppress_impossible_pv_zero(data)
+            self._withhold_impossible_ac_charge(data)
 
             logger.debug(f"Read data: PV={data.pv_total_power}W, AC={data.ac_power}W, Battery={getattr(data, 'battery_soc', 'N/A')}%, Temp={data.inverter_temp}°C")
             
@@ -3209,7 +4189,8 @@ class GrowattModbus:
         )
         if not lock.acquire(timeout=wait):
             raise ModbusWriteError(
-                0, [], f"Modbus bus busy (lock timeout after {wait}s on {what})"
+                0, [], f"Modbus bus busy (lock timeout after {wait}s)",
+                operation=what,
             )
         try:
             yield
@@ -3278,12 +4259,14 @@ class GrowattModbus:
             lock.release()
             logger.debug("[BATCH] Released %s bus after %s", scope, what)
 
-    def write_register(self, register: int, value: int) -> bool:
+    def write_register(self, register: int, value: int,
+                       bypass_rate_limit: bool = False) -> bool:
         """Write, holding the bus for the transaction (#398)."""
         with self._bus("write"):
-            return self._write_register_locked(register, value)
+            return self._write_register_locked(register, value, bypass_rate_limit)
 
-    def _write_register_locked(self, register: int, value: int) -> bool:
+    def _write_register_locked(self, register: int, value: int,
+                               bypass_rate_limit: bool = False) -> bool:
         """
         Write a single holding register.
 
@@ -3293,6 +4276,7 @@ class GrowattModbus:
 
         Returns:
             bool: True if write successful, False only for WIT rate limiting
+                  (which `bypass_rate_limit=True` skips - see below)
 
         Raises:
             ModbusWriteError: If the write fails, with detailed error information
@@ -3301,8 +4285,34 @@ class GrowattModbus:
             logger.debug(f"[WRITE] Request to write register {register} with value {value}")
 
             # WIT control rate limiting (v0.4.6) - prevent oscillation
-            if register in self._wit_control_registers:
-                import time
+            #
+            # `bypass_rate_limit` is for a write that is one step of a larger command, where
+            # skipping it leaves the inverter in a state no user asked for. The limit exists
+            # to stop the same control being driven back and forth; it was never meant to
+            # veto part of a mode change (#400).
+            #
+            # The case that found it: 30407 selects between the direct setpoint and the TOU
+            # roster, and Charge sets it to 1. Hold clears it before writing its roster - but
+            # Charge had just stamped 30407's cooldown, so a Hold chosen within 30 s had the
+            # clear refused, logged a warning, and then wrote the hold period into the branch
+            # that was not selected, leaving the battery charging at 100 %. A fast
+            # Charge -> Hold is exactly how someone tries it.
+            #
+            # Only ever pass this for a write whose absence is worse than its cost. The
+            # timestamp below is still updated on success, so a bypassed write does not
+            # blind the limiter afterwards.
+            # A release - control authority or remote control set back to 0 - is never held
+            # back. The limiter stops a control being driven back and forth; refusing the
+            # "off" half of that leaves the inverter under remote command, which is the
+            # state the user was trying to leave. A WIT owner's disarm 22 s after arming was
+            # refused, 30100 stayed 1, and the inverter sat in VPP self-consumption while
+            # every automation believed it had been released (#481).
+            is_release = register in VPP_RELEASE_REGISTERS and value == 0
+            if register in self._wit_control_registers and not bypass_rate_limit and not is_release:
+                # NO local `import time` here. It would bind `time` as a local name for the
+                # whole function, and this branch is skipped when the write bypasses the
+                # limiter - leaving the stamp further down raising UnboundLocalError AFTER
+                # the register had been written (#400). `time` is imported at module scope.
                 current_time = time.time()
                 last_write_time = self._wit_control_last_write.get(register, 0)
                 time_since_last_write = current_time - last_write_time
@@ -3326,7 +4336,9 @@ class GrowattModbus:
                     raise ModbusWriteError(register, [value], "Shared connection busy (lock timeout on write)")
                 try:
                     if not self._shared_conn.ensure_connected():
-                        raise ModbusWriteError(register, [value], "Could not connect to shared Modbus gateway")
+                        raise ModbusWriteError(
+                            register, [value],
+                            self._shared_conn.connect_refusal_reason())
                     success = self._shared_conn.write_register(register, value, self.slave_id)
                 finally:
                     self._shared_conn._lock.release()
@@ -3378,7 +4390,6 @@ class GrowattModbus:
 
             # Update WIT cooldown timestamp only after confirmed successful write (F-005)
             if register in self._wit_control_registers:
-                import time
                 self._wit_control_last_write[register] = time.time()
                 self._check_wit_control_conflicts(register, value)
 
@@ -3483,10 +4494,12 @@ class GrowattModbus:
         #
         # So the read-back is now purely diagnostic: write once, then poll the register
         # with a growing delay until it either matches or the budget runs out.
-        try:
-            self.write_register(register, value)
-        except ModbusWriteError:
-            raise
+        # write_register returns False for exactly one reason: the WIT control cooldown
+        # refused it, and nothing was sent. Verifying that would read back the old value and
+        # report it as a reversion - which is what happened, and the coordinator then raised
+        # a write-reversion notice blaming the cloud for a write that never left (#481).
+        if not self.write_register(register, value):
+            return (False, False)
 
         expected = value & 0xFFFF
         delay = WRITE_VERIFY_DELAY
@@ -3570,7 +4583,9 @@ class GrowattModbus:
                     raise ModbusWriteError(register, values, "Shared connection busy (lock timeout on write_registers)")
                 try:
                     if not self._shared_conn.ensure_connected():
-                        raise ModbusWriteError(register, values, "Could not connect to shared Modbus gateway")
+                        raise ModbusWriteError(
+                            register, values,
+                            self._shared_conn.connect_refusal_reason())
                     success = self._shared_conn.write_registers(register, values, self.slave_id)
                 finally:
                     self._shared_conn._lock.release()
@@ -3633,11 +4648,44 @@ class GrowattModbus:
     # 2026/8/22 09:42:17 in the same registers. The year is the full four digits, not an
     # offset.
     #
-    # NOT off-grid. The off-grid protocol puts the clock at the same addresses but records
-    # "Year offset is 2000" and gives register 51 to Chip Select rather than a weekday, so
-    # writing this block unchanged to an SPF would set the year wrong and overwrite an
-    # unrelated register. No SPF scan has been offered to confirm the encoding, and guessing
-    # at a clock write is not worth the risk — see is_clock_supported().
+    # Off-grid reads the same, and writes are still withheld — but for a narrower reason
+    # than this note used to give (#444).
+    #
+    # An SPF 5000 ES on firmware 067.02 has now been read against a known-good clock:
+    #
+    #   host  2026-09-14 08:19:35 .. 08:19:38
+    #   45: 2026  46: 9  47: 14  48: 8  49: 20  50: 29  51: 0
+    #
+    # So register 45 reads back the **full four-digit year**, not the offset from 2000 that
+    # the off-grid document records, and 46-50 are month/day/hour/minute/second in the same
+    # order as V1.39. Reading the off-grid clock is therefore the same operation as reading
+    # any other, and is no longer refused. (Register 51 read 0, consistent with the
+    # document's Chip Select rather than a weekday; the off-grid weekday is at 72.)
+    #
+    # Writing was withheld for the same reason a four-digit read could not settle it: V1.39
+    # accepts the year as an offset (write 26, read back 2026), an asymmetry in neither
+    # protocol document, and there was no way to know which form off-grid wanted without
+    # actually writing to one.
+    #
+    # That measurement now exists. On an SPF 3000-6000 ES PLUS (#443), with a friend at the
+    # inverter to watch the front panel:
+    #
+    #   holding 49 (minute) written 55 -> read back 55, panel showed 55 -> single-register
+    #   writes into this block work on off-grid, same as every other family.
+    #
+    #   holding 45 (year) written 26 -> panel briefly showed 26, then reverted to 2026 on
+    #   its own. Written 2027 -> panel showed 2027, read back 2027, held.
+    #
+    # So off-grid takes the opposite form from V1.39: the full four digits, not an offset.
+    # Writing 26 is not refused - it is accepted, displayed, and then quietly discarded,
+    # which is a worse failure than an error would have been. write_inverter_time() now
+    # writes register 45 as when.year on an off-grid profile and when.year - 2000
+    # everywhere else. Confirmed on this one device; SPE shares offgrid_protocol and the
+    # same clock block with no reason yet to expect it differs, but has not been tested
+    # directly - if it turns out to disagree, that is a real report to want on #443.
+    #
+    # Note for anyone tempted to cite the old reason: write_inverter_time() writes 45-50
+    # only. It has never touched register 51.
     CLOCK_REGISTER_START = 45
     CLOCK_REGISTER_COUNT = 7  # 45-51 inclusive
 
@@ -3657,19 +4705,52 @@ class GrowattModbus:
     CLOCK_WRITE_BUDGET = 6.0
 
     @property
-    def is_clock_supported(self) -> bool:
-        """Whether this profile's clock encoding is confirmed."""
-        return not self.register_map.get('offgrid_protocol', False)
+    def clock_register_start(self) -> int:
+        """First register of this profile's clock block.
+
+        45 everywhere except a VPP-only profile, which names 30104 with 'clock_register'.
+        The MIN TL-XH2 answers Illegal Function across 0-124, so a read of 45 there always
+        failed and the Inverter Clock sensor sat unavailable, while 30104-30109 held the
+        right time: a reporter read 26/9/30/20/13/33 against his own clock (#461).
+        """
+        return self.register_map.get('clock_register', self.CLOCK_REGISTER_START)
+
+    @property
+    def is_clock_readable(self) -> bool:
+        """Whether this profile's clock can be decoded.
+
+        Every profile, now that the off-grid layout has been read against a known-good
+        clock (#444). read_inverter_time() already accepted both year encodings, so the
+        only thing that was missing was a device to confirm which one off-grid uses.
+        """
+        return True
+
+    @property
+    def is_clock_writable(self) -> bool:
+        """Whether this profile's clock can be *set*.
+
+        True everywhere now. Off-grid used to be excluded because a four-digit read said
+        nothing about which form register 45 accepts to write - that was settled on an
+        SPF 3000-6000 ES PLUS with a controlled single-register test (#443), and it takes
+        the opposite form from V1.39: the full year, not an offset. See the note above
+        CLOCK_REGISTER_START, and write_inverter_time() for where the two forms diverge.
+
+        The VPP clock block (MIN TL-XH2) is writable too, in a different way: see
+        write_inverter_time() for the single FC16 transaction it needs (#461).
+        """
+        return True
 
     def read_inverter_time(self) -> Optional[datetime]:
         """Read the inverter's real-time clock, or None if it cannot be decoded."""
-        if not self.is_clock_supported:
+        if not self.is_clock_readable:
             return None
 
-        regs = self.read_holding_registers(self.CLOCK_REGISTER_START, self.CLOCK_REGISTER_COUNT)
+        start = self.clock_register_start
+        # 45-51 on V1.39. The VPP block has only the six fields; 30110 is a reserved UINT32.
+        count = self.CLOCK_REGISTER_COUNT if start == self.CLOCK_REGISTER_START else 6
+        regs = self.read_holding_registers(start, count)
         if not regs or len(regs) < 6:
-            logger.debug("[CLOCK] Could not read registers %d-%d",
-                         self.CLOCK_REGISTER_START, self.CLOCK_REGISTER_START + 5)
+            logger.debug("[CLOCK] Could not read registers %d-%d", start, start + 5)
             return None
 
         year, month, day, hour, minute, second = (int(v) for v in regs[:6])
@@ -3688,7 +4769,7 @@ class GrowattModbus:
             # Returning None rather than raising lets the caller still set the clock.
             logger.debug(
                 "[CLOCK] Registers %d-%d do not form a valid date (%s): %s",
-                self.CLOCK_REGISTER_START, self.CLOCK_REGISTER_START + 5, list(regs[:6]), err,
+                start, start + 5, list(regs[:6]), err,
             )
             return None
 
@@ -3705,23 +4786,24 @@ class GrowattModbus:
         detected the format by reading the register, which can only ever produce the
         four-digit form and therefore always wrote a value the inverter rejects (#393).
 
+        **Off-grid takes the opposite form: the full year, not an offset.** Confirmed on an
+        SPF 3000-6000 ES PLUS by writing register 45 directly and watching the front panel
+        (#443) — `26` is accepted, displayed, and then quietly reverted to what was already
+        there; `2027` is accepted and held. Guessing the V1.39 form on an off-grid inverter
+        would not have errored, and the front panel would have shown it working, right up
+        until the write silently discarded itself.
+
         Each field is written on its own with FC 0x06, spaced apart, in the reference's
         order. Its author notes that settings registers on that hardware generally need
         FC 0x10 and answer FC 0x06 with Illegal Function, but that the RTC block at 45-50
-        is an exception and does take single writes.
+        is an exception and does take single writes. The same SPF confirmed single writes
+        into this block work at all, by writing its minute register and reading it back
+        before the year was ever touched.
 
         The year goes first on purpose. It is the field observed to fail, so a refusal
         leaves the clock untouched rather than half-written — a MIN TL-X reset its RTC to
         the year 2000 when five fields landed and the year did not.
         """
-        if not self.is_clock_supported:
-            raise ModbusWriteError(
-                self.CLOCK_REGISTER_START, [],
-                "clock sync is not supported on off-grid profiles — register 51 carries "
-                "Chip Select there rather than a weekday, and no scan has confirmed the "
-                "rest of the block (#393)",
-            )
-
         # Seconds is written last, roughly 1.2-1.5 s after the first field on TCP and
         # longer on a slow gateway. Writing `when.second` therefore lands the clock that
         # far behind: a reporter measured a consistent 1.4-1.6 s residual immediately
@@ -3740,9 +4822,13 @@ class GrowattModbus:
             time.sleep(wait)
             when = when + timedelta(seconds=wait)
 
-        # Year first, and as an offset. Seconds is a placeholder - see below.
+        # Year first, in whichever form this hardware family takes. Off-grid wants the
+        # full four digits; everything else wants the offset from 2000 (#443). Seconds is
+        # a placeholder - see below.
+        is_offgrid = self.register_map.get('offgrid_protocol', False)
+        year_value = when.year if is_offgrid else when.year - 2000
         fields = [
-            (self.CLOCK_REGISTER_START,     when.year - 2000, "year"),
+            (self.CLOCK_REGISTER_START,     year_value,       "year"),
             (self.CLOCK_REGISTER_START + 1, when.month,       "month"),
             (self.CLOCK_REGISTER_START + 2, when.day,         "day"),
             (self.CLOCK_REGISTER_START + 3, when.hour,        "hour"),
@@ -3751,9 +4837,27 @@ class GrowattModbus:
         ]
 
         logger.info(
-            "[CLOCK] Setting inverter clock to %s (year written as %d)",
-            when.strftime("%Y-%m-%d %H:%M:%S"), when.year - 2000,
+            "[CLOCK] Setting inverter clock to %s (year written as %d, %s form)",
+            when.strftime("%Y-%m-%d %H:%M:%S"), year_value,
+            "off-grid" if is_offgrid else "offset",
         )
+
+        # The VPP clock block (30104-30109, MIN TL-XH2) takes all six fields as ONE FC16
+        # write. Measured on a MIN 3000TL-XH2 (#461): single-register writes into the block
+        # were acknowledged and silently discarded, while one six-register write with the
+        # year as 27 set the clock and read back 27/10/2/15/34/22. A single transaction also
+        # needs no seconds compensation and cannot leave the clock part-written.
+        start = self.clock_register_start
+        if start != self.CLOCK_REGISTER_START:
+            values = [year_value, when.month, when.day, when.hour, when.minute, when.second]
+            if not self.write_registers(start, values):
+                raise ModbusWriteError(
+                    start, values,
+                    f"the inverter refused the clock write to registers {start}-{start + 5}. "
+                    f"Nothing was written, so the clock is exactly as it was.",
+                )
+            self._verify_clock_write(when)
+            return True
 
         started = time.monotonic()
 
@@ -3900,6 +5004,108 @@ class GrowattModbus:
             if reg_info.get('maps_to') == name:
                 return addr
         return None
+
+    def _resolve_phase_total(self, data, attr: str, total_name: str,
+                             phase_names: tuple = ()) -> None:
+        """Whole-service value for a quantity the inverter also reports per phase.
+
+        V1.39 lays the storage power-flow range out as R / S / T / Total. Grid import was
+        read from `PactouserR` - **one phase** - because on the single-phase hardware it was
+        first mapped against, R and Total are the same measurement and the choice was
+        invisible. On a three-phase SPH it reports a third of the truth, and on a US
+        split-phase HU, half (#419).
+
+        The total is now the primary source. It is not blindly trusted, because we have
+        never confirmed 1021 populates on every firmware while we know 1015 does on at
+        least one device - so a swap alone could take working users to zero:
+
+            total > 0            -> total          the firmware fills it; authoritative
+            sum(phases) > 0      -> sum(phases)    the firmware fills only per-phase
+            otherwise            -> 0              genuinely nothing flowing
+
+        **A zero total is never accepted while the phases carry real values.** A zero there
+        is a register the firmware does not populate, not a measurement, and publishing it
+        would repeat #228 - a plausible number that means nothing.
+
+        Summing rather than preferring R costs nothing and needs no knowledge of the phase
+        count: on single-phase, S and T read zero and the sum *is* R.
+
+        Three states, not two. A phase that failed to read is not a phase reading zero, so
+        a partial sum is withheld rather than published as a confidently wrong number.
+        Quantities with no phase registers mapped degrade to total-only, which is what
+        export and load do today.
+        """
+        addresses = self._find_all_registers_by_name(total_name)
+        if not addresses:
+            return
+
+        total = None
+        for addr in addresses:
+            candidate = self._get_register_value(addr)
+            if candidate is None:
+                continue
+            if total is None:
+                total = candidate
+            if candidate != 0.0:
+                total = candidate
+                break
+
+        if total:
+            self._phase_total_populated.add(attr)
+            setattr(data, attr, total)
+            return
+
+        # Once the total has read non-zero this session, the firmware fills it, and a zero is
+        # a measurement - nothing flowing - not an unpopulated register. The legs exist for
+        # firmware that never fills the total; consulting them anyway cost twice on an SPH
+        # 10000 TL3 BH-UP whose S/T legs often read garbage. With no import the sum went
+        # unknown whenever a leg was withheld, and a leg that got past the guard reached
+        # grid import as a multi-megawatt spike (@acsel91, @AzraelsDisk, #446).
+        if total is not None and attr in self._phase_total_populated:
+            setattr(data, attr, total)
+            return
+
+        phase_sum = 0.0
+        any_phase_mapped = False
+        for phase_name in phase_names:
+            phase_addr = self._find_register_by_name(phase_name)
+            if phase_addr is None:
+                continue
+            any_phase_mapped = True
+            value = self._get_register_value(phase_addr)
+            if value is None:
+                # Unread, not zero. Summing what did arrive would understate the total.
+                data.unread_fields.add(attr)
+                logger.debug(
+                    "%s: %s did not read this poll and the total is %s - reporting nothing "
+                    "rather than a partial sum", attr, phase_name,
+                    "zero" if total is not None else "unavailable",
+                )
+                return
+            phase_sum += value
+
+        if any_phase_mapped and phase_sum:
+            logger.debug(
+                "%s: total register read %s but the phases sum to %.1f W - the firmware "
+                "does not populate the total on this device, using the sum",
+                attr, "0" if total is not None else "nothing", phase_sum,
+            )
+            setattr(data, attr, phase_sum)
+            return
+
+        if total is None:
+            # Mapped, but no address answered this poll and there are no phase registers to
+            # fall back on. This is #384 in the place it costs most: on a metered profile a
+            # zero is a balanced site, so a failed read published as 0.0 is indistinguishable
+            # from a measurement, and _signed_grid_power() would believe it.
+            data.unread_fields.add(attr)
+            logger.debug(
+                "%s: %s did not read this poll and no phase registers are mapped - "
+                "reporting unknown rather than 0", attr, total_name,
+            )
+            return
+
+        setattr(data, attr, total)
 
     def _find_all_registers_by_name(self, name: str) -> list[int]:
         """Find ALL register addresses matching a name, alias, or maps_to attribute.
@@ -4347,6 +5553,29 @@ class GrowattModbus:
                 if battery_appears_disconnected:
                     battery_power = 0.0
                     logger.debug(f"Battery power set to 0W (voltage {data.battery_voltage}V < {BATTERY_VOLTAGE_THRESHOLD}V AND SOC {data.battery_soc}% < {BATTERY_SOC_THRESHOLD}% — battery appears disconnected, ignoring registers HIGH={raw_high} LOW={raw_low})")
+                elif self._battery_power_scale_disputed:
+                    # This poll's voltage x current has just contradicted the scale about to
+                    # be applied, and the override has not committed yet. Publishing anyway
+                    # means writing a figure we have measured to be ten times out into a
+                    # sensor and its statistics (#434).
+                    data.unread_fields.update(
+                        ('battery_power', 'charge_power', 'discharge_power')
+                    )
+                    battery_power = 0.0
+                    if not self._battery_power_scale_disputed_warned:
+                        self._battery_power_scale_disputed_warned = True
+                        logger.warning(
+                            "[SCALE] Withholding battery power: voltage x current says the "
+                            "profile's documented scale is wrong for this inverter, and the "
+                            "corrected scale has not been confirmed yet. It needs three "
+                            "consistent readings above %.0f W. The sensor will be unknown "
+                            "until then (#434).", _BATTERY_SCALE_MIN_POWER_W,
+                        )
+                    else:
+                        logger.debug(
+                            "[SCALE] Battery power withheld again: scale still disputed "
+                            "(HIGH=%s LOW=%s)", raw_high, raw_low,
+                        )
                 else:
                     _bp = self._get_register_value(addr)
                     if _bp is None:
@@ -4540,6 +5769,7 @@ class GrowattModbus:
                     f"{_pfx}_charge_energy_total",
                     f"{_pfx}_discharge_energy_today",
                     f"{_pfx}_discharge_energy_total",
+                    f"{_pfx}_full_charge_capacity",
                 ):
                     _addr = self._find_register_by_name(_reg)
                     if _addr is not None:
@@ -4549,6 +5779,22 @@ class GrowattModbus:
                     f"SOC={getattr(data, f'{_pfx}_soc', 'N/A')}% "
                     f"P={getattr(data, f'{_pfx}_power', 0):.0f}W"
                 )
+
+            # Battery 1's own energy counters (VPP 31202-31209, mapped as *_vpp_*), published
+            # only when a second pack is present. The main Battery Charge/Discharge counters
+            # are inverter-wide - on a MID 25KTL3-XH with two APX packs they equal pack 1 +
+            # pack 2 exactly, on all four - so with two packs there was no per-pack figure for
+            # pack 1 (#451). With one pack these would only duplicate the main counters.
+            if hasattr(data, 'battery2_voltage'):
+                for _field in ('charge_energy_today', 'charge_energy_total',
+                               'discharge_energy_today', 'discharge_energy_total'):
+                    _addr = self._find_register_by_name(f"{_field}_vpp_low")
+                    if _addr is None:
+                        continue
+                    _value = self._get_register_value(_addr)
+                    if _value is None:
+                        data.unread_fields.add(f"battery1_{_field}")
+                    setattr(data, f"battery1_{_field}", _value or 0.0)
 
             # BMS Information (SPH HU and other models with BMS monitoring)
             # Registers 1082-1120 contain detailed battery management system data
@@ -4656,7 +5902,7 @@ class GrowattModbus:
             logger.debug(f"Could not read peak shaving registers 3307-3312: {e}")
 
     def _read_backup_box_data(self, data: GrowattData) -> None:
-        """Populate backup box (Growatt ARK) fields from cached 3000-range registers."""
+        """Populate backup box (Growatt SYN) fields from cached 3000-range registers."""
         try:
             # Connection flag — must be read first so sensors.py deferred mechanism
             # can gate the remaining 8 conditional sensors on box_connect_flag == 1.
@@ -4667,6 +5913,13 @@ class GrowattModbus:
             if value is not None:
                 data.box_connect_flag = int(value)
 
+            # A register that did not read this poll must not be reported as its default
+            # (#450). box_connect_flag lives at 3320, outside the 3281-3298 sub-range these
+            # fields share, so a block timeout on that sub-range leaves connect=1 (read fine)
+            # sitting next to mode/temp/grid/load silently falling back to their dataclass
+            # defaults - 0, which decodes as "Off-Grid" indistinguishably from a genuine
+            # reading. Marking the field unread instead makes the sensor unknown for that
+            # poll, matching the pattern _set_from_register already uses elsewhere (#384).
             for attr, reg_name in (
                 ('box_bypass_status', 'box_bypass_status'),
                 ('box_work_mode',     'box_work_mode'),
@@ -4679,6 +5932,8 @@ class GrowattModbus:
                     v = self._get_register_value(a)
                     if v is not None:
                         setattr(data, attr, int(v))
+                    else:
+                        data.unread_fields.add(attr)
 
             for attr, reg_name in (
                 ('box_temperature',   'box_temperature'),
@@ -4689,6 +5944,8 @@ class GrowattModbus:
                     v = self._get_register_value(a)
                     if v is not None:
                         setattr(data, attr, float(v))
+                    else:
+                        data.unread_fields.add(attr)
 
             # 32-bit paired: call _get_register_value on the _low address
             for attr, low_name in (
@@ -4700,6 +5957,8 @@ class GrowattModbus:
                     v = self._get_register_value(a)
                     if v is not None:
                         setattr(data, attr, float(v))
+                    else:
+                        data.unread_fields.add(attr)
 
             if data.box_connect_flag:
                 logger.debug(
@@ -4769,6 +6028,24 @@ class GrowattModbus:
             except Exception as e:
                 logger.debug("[DEVICE INFO] VPP serial read failed, keeping legacy: %s", e)
 
+        # --- BLU / LBU energy priority (116) --- SPF only, gated on the profile (#437)
+        #
+        # Read rather than left write-only so the select shows what the inverter is
+        # actually set to. Gated on the register being in the profile, because it is a
+        # documented off-grid register that only SPF maps - nothing else should pay for
+        # the read, and firmware older than 100.08/101.07 does not have the setting.
+        if 116 in holding_map:
+            try:
+                blu_lbu = self.read_holding_registers(116, 1)
+                if blu_lbu is not None and len(blu_lbu) >= 1:
+                    data.spf_blu_lbu_mode = int(blu_lbu[0])
+                    logger.debug("[SPF] BLU/LBU mode (116): %s", data.spf_blu_lbu_mode)
+                else:
+                    data.unread_fields.add('spf_blu_lbu_mode')
+            except Exception as e:
+                data.unread_fields.add('spf_blu_lbu_mode')
+                logger.debug("Could not read BLU/LBU mode register 116: %s", e)
+
         # --- Export control (122–123) --- ALWAYS ATTEMPTED
         if 122 in holding_map or 123 in holding_map:
             try:
@@ -4798,6 +6075,23 @@ class GrowattModbus:
                     logger.debug("[POWER CTRL] Read active_power_rate: %s%%", data.active_power_rate)
             except Exception as e:
                 logger.debug(f"Could not read active_power_rate register: {e}")
+
+        # --- PV Startup Voltage (holding 17, MIC MIN-range) --- Read if present in profile
+        # Confirmed on a MIC 2000TL-X: reg 17 holds the PV connect voltage as x0.1 V.
+        # Left undeclared on GrowattData (like max_output_power_rate) so it reads
+        # 'unknown' until a poll populates it, rather than a misleading 0.
+        if 17 in holding_map:
+            try:
+                start_v_regs = self.read_holding_registers(17, 1)
+                if start_v_regs is not None and len(start_v_regs) >= 1:
+                    data.pv_start_voltage = int(start_v_regs[0])
+                    logger.debug("[PV START] Read pv_start_voltage: raw=%d (%.1f V)",
+                                 data.pv_start_voltage, data.pv_start_voltage * 0.1)
+                else:
+                    data.unread_fields.add('pv_start_voltage')
+            except Exception as e:
+                data.unread_fields.add('pv_start_voltage')
+                logger.debug(f"Could not read pv_start_voltage register 17: {e}")
 
         # --- WIT Export Limit W (holding 203) ---
         if 203 in holding_map:
@@ -4890,17 +6184,34 @@ class GrowattModbus:
             except Exception as e:
                 logger.debug(f"Could not read battery control registers 34-39: {e}")
 
-        # Read generator charge current (83) and AC to battery voltage (95)
-        if 83 in holding_map:
+        # Read battery cut-off (82) and generator charge current (83), then AC to battery
+        # voltage (95). 82 and 83 are adjacent, so the pair costs the round trip that 83
+        # alone used to.
+        if 82 in holding_map or 83 in holding_map:
             try:
-                gen_charge_regs = self.read_holding_registers(83, 1)
-                logger.debug("[SPF CTRL] Raw gen_charge_current from reg 83: %r", gen_charge_regs)
+                cutoff_gen_regs = self.read_holding_registers(82, 2)
+                logger.debug("[SPF CTRL] Raw regs 82-83: %r", cutoff_gen_regs)
 
-                if gen_charge_regs is not None and len(gen_charge_regs) >= 1:
-                    data.gen_charge_current = int(gen_charge_regs[0])
-                    logger.debug("[SPF CTRL] gen_charge_current=%s A", data.gen_charge_current)
+                if cutoff_gen_regs is not None and len(cutoff_gen_regs) >= 2:
+                    if 82 in holding_map:
+                        data.bat_low_cutoff = int(cutoff_gen_regs[0])
+                        logger.debug("[SPF CTRL] bat_low_cutoff=%s", data.bat_low_cutoff)
+                    if 83 in holding_map:
+                        gen_raw = int(cutoff_gen_regs[1])
+                        if gen_raw >= self.GEN_CHARGE_CURRENT_NOT_SUPPORTED:
+                            # 0xFFFF, not a charge limit. Leave the field unset and mark it
+                            # unread so the entity goes unknown rather than publishing
+                            # 65535 A into a control the user can then try to write back.
+                            data.unread_fields.add('gen_charge_current')
+                            logger.debug(
+                                "[SPF CTRL] gen_charge_current raw %d is the all-ones "
+                                "not-supported pattern; withholding it (#444)", gen_raw,
+                            )
+                        else:
+                            data.gen_charge_current = gen_raw
+                            logger.debug("[SPF CTRL] gen_charge_current=%s A", data.gen_charge_current)
             except Exception as e:
-                logger.debug(f"Could not read gen_charge_current register: {e}")
+                logger.debug(f"Could not read battery cut-off / gen charge registers 82-83: {e}")
 
         if 95 in holding_map:
             try:
@@ -4915,7 +6226,15 @@ class GrowattModbus:
 
         # --- SPH/SPM Battery Control registers (1000+ range) ---
         # Priority Mode (1044 for SPH/SPH-TL3, 30476 for WIT)
+        #
+        # Only where the profile has no live input register for it. MOD/MID-XH maps both
+        # input 3144 (the mode in force) and holding 30476, which there is the VPP *default*
+        # mode and read 0 on a MID 25KTL3-XH in Load, Grid and Battery First alike. Read
+        # here, it overwrote 3144 on every poll and Priority Mode never left Load First
+        # (#475).
         priority_addr = 1044 if 1044 in holding_map else (30476 if 30476 in holding_map else None)
+        if self._find_register_by_name('priority_mode') is not None:
+            priority_addr = None
         if priority_addr:
             try:
                 priority_regs = self.read_holding_registers(priority_addr, 1)
@@ -4925,6 +6244,46 @@ class GrowattModbus:
                     logger.debug("[%s CTRL] priority_mode=%s", profile_name, data.priority_mode)
             except Exception as e:
                 logger.debug(f"Could not read priority_mode register {priority_addr}: {e}")
+
+        # --- Grid-side measurement link (MeterLink, holding 180) ---
+        #
+        # V1.39 documents 180 as MeterLink, "whether to elect the meter", R/W, 0 = Missed,
+        # 1 = Received. It reports whether the grid-side measurement source is being
+        # received. WHICH source that is - a Growatt meter or an external CT - is chosen by
+        # bCTMode (holding 1037: 0 = WiredCT, 1 = WirelessCT, 2 = METER), and all three
+        # report through the same 8081-8084 registers, so this one flag covers every
+        # grid-side arrangement the manual describes.
+        #
+        # _signed_grid_power() needs it before it can believe a meter reading of zero: on a
+        # profile declaring `grid_flow_from_meter_only`, 0/0 is a balanced site only if
+        # something is actually measuring. A site with neither meter nor CT - the manual's
+        # "Zero export to GRID" arrangement, where output is restricted to the LOAD port
+        # and no meter is required - reads the same 0/0 and means the opposite.
+        #
+        # The INPUT register at 180 is NOT usable for this. On a reference WIT whose meter
+        # was demonstrably live (8.6 kW of export through 8081-8084 earlier the same day),
+        # input 180 read 0 while holding 180 read 1 in the same second. Two registers
+        # claiming one quantity and disagreeing are separate sources (only divergence proves
+        # that), and the holding one is the one tracking reality.
+        #
+        # bCTMode is not read: V1.39 marks it write-only, and it read 0 on the same unit
+        # whose measurement is live, so a read of it proves nothing either way.
+        if self.register_map.get('grid_flow_from_meter_only'):
+            meter_link_addr = next(
+                (addr for addr, info in holding_map.items()
+                 if info.get('name') == 'meter_link_set'), None)
+            if meter_link_addr is not None:
+                try:
+                    meter_link_regs = self.read_holding_registers(meter_link_addr, 1)
+                    if meter_link_regs is not None and len(meter_link_regs) >= 1:
+                        data.meter_link = int(meter_link_regs[0])
+                        logger.debug("[METER] meter_link=%s (0=Missed, 1=Received)",
+                                     data.meter_link)
+                except Exception as e:
+                    # Left as None, which keeps the profile-level rule. One dropped read
+                    # must not turn into "this site has no meter".
+                    logger.debug("Could not read meter_link register %s: %s",
+                                 meter_link_addr, e)
 
         # Load First Battery Minimum SOC (register 608 — undocumented, SPH hybrid only)
         if 608 in holding_map:
@@ -4997,41 +6356,23 @@ class GrowattModbus:
             except Exception as e:
                 logger.debug(f"Could not read time period control registers: {e}")
 
-        # SPH GEN3 Battery First extended slots 4-6 (registers 1017-1025)
-        if any(reg in holding_map for reg in range(1017, 1026)):
+        # SPH GEN3 Battery First / Grid First extended slots 4-6. 1018-1026 and 1027-1035:
+        # one register later than Protocol V1.39 prints, measured on an SPH3600 (#484).
+        for _base, _kind, _label in ((1018, 'batt', 'Battery'), (1027, 'grid', 'Grid')):
+            if not any(reg in holding_map for reg in range(_base, _base + 9)):
+                continue
             try:
-                bf_regs = self.read_holding_registers(1017, 9)
-                if bf_regs is not None and len(bf_regs) >= 9:
-                    if 1017 in holding_map: data.batt_first_time_period_4_start  = int(bf_regs[0])
-                    if 1018 in holding_map: data.batt_first_time_period_4_end    = int(bf_regs[1])
-                    if 1019 in holding_map: data.batt_first_time_period_4_enable = int(bf_regs[2])
-                    if 1020 in holding_map: data.batt_first_time_period_5_start  = int(bf_regs[3])
-                    if 1021 in holding_map: data.batt_first_time_period_5_end    = int(bf_regs[4])
-                    if 1022 in holding_map: data.batt_first_time_period_5_enable = int(bf_regs[5])
-                    if 1023 in holding_map: data.batt_first_time_period_6_start  = int(bf_regs[6])
-                    if 1024 in holding_map: data.batt_first_time_period_6_end    = int(bf_regs[7])
-                    if 1025 in holding_map: data.batt_first_time_period_6_enable = int(bf_regs[8])
-                    logger.debug("[SPH CTRL] Battery First periods 4-6 loaded")
+                _slot_regs = self.read_holding_registers(_base, 9)
+                if _slot_regs is not None and len(_slot_regs) >= 9:
+                    for _i, (_period, _part) in enumerate(
+                            (p, part) for p in (4, 5, 6) for part in ('start', 'end', 'enable')):
+                        if _base + _i in holding_map:
+                            setattr(data, f"{_kind}_first_time_period_{_period}_{_part}",
+                                    int(_slot_regs[_i]))
+                    logger.debug("[SPH CTRL] %s First periods 4-6 loaded", _label)
             except Exception as e:
-                logger.debug(f"Could not read Battery First extended time period registers 1017-1025: {e}")
-
-        # SPH GEN3 Grid First extended slots 4-6 (registers 1026-1034)
-        if any(reg in holding_map for reg in range(1026, 1035)):
-            try:
-                gf46_regs = self.read_holding_registers(1026, 9)
-                if gf46_regs is not None and len(gf46_regs) >= 9:
-                    if 1026 in holding_map: data.grid_first_time_period_4_start  = int(gf46_regs[0])
-                    if 1027 in holding_map: data.grid_first_time_period_4_end    = int(gf46_regs[1])
-                    if 1028 in holding_map: data.grid_first_time_period_4_enable = int(gf46_regs[2])
-                    if 1029 in holding_map: data.grid_first_time_period_5_start  = int(gf46_regs[3])
-                    if 1030 in holding_map: data.grid_first_time_period_5_end    = int(gf46_regs[4])
-                    if 1031 in holding_map: data.grid_first_time_period_5_enable = int(gf46_regs[5])
-                    if 1032 in holding_map: data.grid_first_time_period_6_start  = int(gf46_regs[6])
-                    if 1033 in holding_map: data.grid_first_time_period_6_end    = int(gf46_regs[7])
-                    if 1034 in holding_map: data.grid_first_time_period_6_enable = int(gf46_regs[8])
-                    logger.debug("[SPH CTRL] Grid First periods 4-6 loaded")
-            except Exception as e:
-                logger.debug(f"Could not read Grid First extended time period registers 1026-1034: {e}")
+                logger.debug(f"Could not read {_label} First extended time period registers "
+                             f"{_base}-{_base + 8}: {e}")
 
         # SPH GEN3 Grid First extended slots 7-9 (registers 1080-1088)
         if any(reg in holding_map for reg in range(1080, 1089)):
@@ -5101,11 +6442,29 @@ class GrowattModbus:
                 logger.debug(f"Could not read batt_first_charge_power_rate register 3047: {e}")
 
         # MIN TL-XH Priority Mode (register 3018: 0=Load First, 2=Battery First, 3=Grid First)
+        #
+        # The generic "Priority Mode" sensor reads data.priority_mode, a plain dataclass
+        # field with no gate at all - not even the decorative hasattr() kind (rule 6). This
+        # profile has never had a register named 'priority_mode', so that field sat at its
+        # default (0, "Load First") on every poll, forever, regardless of the inverter's
+        # actual state - which was being read correctly all along, just into a different
+        # field (tl_xh_priority_mode) that only the writable select uses.
+        #
+        # A reporter selected Battery First, confirmed it on hardware (solar charged the
+        # battery while the house imported its full load from the grid - Battery First
+        # behaviour, unambiguously), while the diagnostic sensor kept reporting Load First
+        # throughout. Translating into the shared field as well, not instead, keeps both
+        # readings correct: the select still shows the raw hardware value, the generic
+        # sensor now shows the same state in its own encoding (#400).
         if 3018 in holding_map:
             try:
                 pm_regs = self.read_holding_registers(3018, 1)
                 if pm_regs is not None and len(pm_regs) >= 1:
-                    data.tl_xh_priority_mode = int(pm_regs[0])
+                    raw_priority_mode = int(pm_regs[0])
+                    data.tl_xh_priority_mode = raw_priority_mode
+                    standard_priority_mode = TL_XH_PRIORITY_MODE_TO_STANDARD.get(raw_priority_mode)
+                    if standard_priority_mode is not None:
+                        data.priority_mode = standard_priority_mode
                     logger.debug("[TL-XH CTRL] tl_xh_priority_mode=%s", data.tl_xh_priority_mode)
             except Exception as e:
                 logger.debug(f"Could not read tl_xh_priority_mode register 3018: {e}")
@@ -5129,6 +6488,37 @@ class GrowattModbus:
                     logger.debug("[TL-XH CTRL] grid_first_discharge_stopped_soc=%s%%", data.grid_first_discharge_stopped_soc)
             except Exception as e:
                 logger.debug(f"Could not read grid_first_discharge_stopped_soc register 3067: {e}")
+
+        # VPP V2.01 off-grid discharge floor (register 30475).
+        if 30475 in holding_map:
+            try:
+                offgrid_soc_regs = self.read_holding_registers(30475, 1)
+                if offgrid_soc_regs is not None and len(offgrid_soc_regs) >= 1:
+                    data.vpp_offgrid_discharge_soc = int(offgrid_soc_regs[0])
+                    logger.debug(
+                        "[TL-XH CTRL] vpp_offgrid_discharge_soc=%s%%",
+                        data.vpp_offgrid_discharge_soc,
+                    )
+            except Exception as e:
+                logger.debug(f"Could not read vpp_offgrid_discharge_soc register 30475: {e}")
+
+        # VPP V2.01 SOC limits: charge cut-off (30404) and on-grid discharge floor (30405).
+        # A missed read is reported as unread, not as the dataclass default: 100 % and 10 %
+        # are both plausible settings to show.
+        for _soc_addr, _soc_field in ((30404, 'vpp_charge_stop_soc'),
+                                      (30405, 'vpp_ongrid_discharge_soc')):
+            if _soc_addr not in holding_map:
+                continue
+            soc_regs = None
+            try:
+                soc_regs = self.read_holding_registers(_soc_addr, 1)
+            except Exception as e:
+                logger.debug(f"Could not read {_soc_field} register {_soc_addr}: {e}")
+            if soc_regs is not None and len(soc_regs) >= 1:
+                setattr(data, _soc_field, int(soc_regs[0]))
+                logger.debug("[VPP CTRL] %s=%s%%", _soc_field, soc_regs[0])
+            else:
+                data.unread_fields.add(_soc_field)
 
         # MOD TL3-XH peak shaving / demand management (3307-3312, #372).
         #
@@ -5213,30 +6603,30 @@ class GrowattModbus:
         # with exactly this retry. This set never received the same treatment — the two
         # mechanisms sit a few hundred lines apart and only one of them was corrected.
         #
-        # #370's remaining limitation — "a transport error and a genuine illegal data
-        # address are still conflated, because read_holding_registers returns None for
-        # both" — is what the helpers below close. There is exactly ONE mechanism here:
-        # _vpp_block_skipped/_vpp_block_failed keep upstream's names and are thin
-        # wrappers over _optional_holding_blocked/_record_optional_holding_failure, which
-        # add three things on top of the flat 300 s window:
+        # #370 left one limitation stated openly: "a transport error and a genuine
+        # illegal data address are still conflated here, because read_holding_registers
+        # returns None for both". That is what the helpers below close, and it matters
+        # because the retry window alone still lets ONE dropped frame blank a control
+        # block for five minutes, over and over, on an inverter that answers perfectly.
+        # Three things sit on top of the flat window now:
         #
-        #   * a block is skipped only after _OPTIONAL_HOLDING_FAIL_THRESHOLD
-        #     *consecutive* failures, so one dropped frame suppresses nothing at all;
-        #   * the failure is classified (ERROR_KIND_LINK vs ERROR_KIND_NO_RESPONSE), so a
-        #     reconnect re-arms the blocks that only ever failed because the socket was
-        #     dead while leaving genuinely unimplemented registers backed off;
-        #   * each block sets a *_available flag on success. Consumers (the coordinator's
-        #     derived mode status, select/number control entities) must use it instead of
-        #     trusting the GrowattData defaults, which would otherwise read as a real
-        #     "Disabled". Publishing that default is what froze
-        #     sensor.growatt_inverter_mode at "Passthrough" for 30 hours on 2026-09-01.
+        #   * a block is skipped only after _VPP_HOLDING_FAIL_THRESHOLD *consecutive*
+        #     failures, so a single transient error suppresses nothing at all;
+        #   * the failure is classified (ERROR_KIND_LINK / ERROR_KIND_NO_RESPONSE), so a
+        #     reconnect re-arms the blocks that only failed because the socket was dead
+        #     while leaving genuinely unimplemented registers backed off;
+        #   * each block sets an *_available flag on success, and the control entities
+        #     report unavailable rather than publishing the GrowattData default, which is
+        #     indistinguishable from a real "Disabled"/0 reading.
+        #
+        # The two names below are #370's and are kept: this is one mechanism, not two.
 
         def _vpp_block_skipped(anchor: int) -> bool:
-            """True while this anchor is inside its retry window (upstream's #370 name)."""
+            """True while this anchor is inside its retry window."""
             return self._optional_holding_blocked(anchor)
 
         def _vpp_block_failed(anchor: int, what: str) -> None:
-            """Record a failed optional block read (upstream's #370 name)."""
+            """Record a failed optional block read."""
             self._record_optional_holding_failure(anchor, what)
 
         # Control Authority (30100)
@@ -5246,8 +6636,8 @@ class GrowattModbus:
                 if vpp_ctrl_regs is not None and len(vpp_ctrl_regs) >= 1:
                     data.control_authority = int(vpp_ctrl_regs[0])
                     data.vpp_control_authority_available = True
-                    # A good read re-arms the block at once: drop the failure record and
-                    # the remembered error kind together, or clear_optional_blacklists()
+                    # A good read re-arms the block at once: the failure record and the
+                    # remembered error kind go together, or clear_optional_blacklists()
                     # would keep reasoning about a failure that no longer exists.
                     self._failed_optional_holding_addrs.pop(30100, None)
                     self._optional_failure_kinds.pop(('holding', 30100), None)
@@ -5255,6 +6645,8 @@ class GrowattModbus:
                 else:
                     _vpp_block_failed(30100, "Register 30100 (control authority)")
             except Exception as e:
+                # An exception is a failure like any other. Not counting it here is how a
+                # block could fail every poll forever without the backoff ever engaging.
                 _vpp_block_failed(30100, "Register 30100 (control authority)")
                 logger.debug(f"Could not read VPP control_authority register 30100: {e}")
 
@@ -5286,7 +6678,17 @@ class GrowattModbus:
         if any(reg in holding_map for reg in [30407, 30408, 30409, 30410]) and not _vpp_block_skipped(30407):
             try:
                 vpp_power_regs = self.read_holding_registers(30407, 4)
-                if vpp_power_regs is not None and len(vpp_power_regs) >= 3:
+                # Four, not three. The read asks for four registers and the availability
+                # flag below vouches for all four, including 30410 - which was only
+                # assigned under `>= 4`. A three-register response would therefore have
+                # asserted availability for a value that was never written this poll,
+                # which is the fabricated reading this block exists to prevent.
+                #
+                # In practice the response-length guard discards any frame whose length
+                # does not match the request, so a short read arrives here as None rather
+                # than as a truncated list. Requiring 4 is what the code means regardless,
+                # and it stops the intent depending on a check made somewhere else.
+                if vpp_power_regs is not None and len(vpp_power_regs) >= 4:
                     if 30407 in holding_map:
                         data.remote_power_control_enable = int(vpp_power_regs[0])
                     if 30408 in holding_map:
@@ -5297,24 +6699,18 @@ class GrowattModbus:
                         if raw_val > 32767:  # Handle signed 16-bit
                             raw_val = raw_val - 65536
                         data.remote_charge_and_discharge_power = int(raw_val)
-                    if 30410 in holding_map and len(vpp_power_regs) >= 4:
-                        # 30410 arrives in this same count-4 read and is deliberately NOT
-                        # re-read on its own afterwards: that second, ungated round trip
-                        # cost one extra transaction per poll on the very bus whose
-                        # contention caused the 2026-09-01 incident, and it bypassed the
-                        # backoff entirely.
+                    if 30410 in holding_map:
                         data.vpp_ac_charge_enable = int(vpp_power_regs[3])
-                    # Fork-only flag: upstream has vpp_export_limit_available and
-                    # vpp_control_authority_available but nothing for this block, and it
-                    # is the one the coordinator's derived mode status needs in order to
-                    # answer "Unknown" instead of guessing "Passthrough" from the
-                    # dataclass default.
-                    data.vpp_remote_power_available = True
-                    self._failed_optional_holding_addrs.pop(30407, None)
-                    self._optional_failure_kinds.pop(('holding', 30407), None)
                     logger.debug("[VPP] remote_power_control_enable=%s, charging_time=%s min, charge_discharge_power=%s%%, ac_charge_enable=%s",
                                data.remote_power_control_enable, data.remote_power_control_charging_time,
                                data.remote_charge_and_discharge_power, data.vpp_ac_charge_enable)
+                    # The block responded. Without this flag the controls behind
+                    # 30407-30410 cannot tell "the inverter says Disabled" from "the block
+                    # was not read this poll", and publish the dataclass default as if it
+                    # had been measured.
+                    data.vpp_remote_power_available = True
+                    self._failed_optional_holding_addrs.pop(30407, None)
+                    self._optional_failure_kinds.pop(('holding', 30407), None)
                 else:
                     _vpp_block_failed(30407, "Registers 30407-30410 (remote power control)")
             except Exception as e:

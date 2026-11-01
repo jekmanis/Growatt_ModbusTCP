@@ -542,7 +542,24 @@ EXPECTED_REMOVALS = {
         "this row is never reached. The blanket control rule cannot see it - register 201 "
         "is present and writable - so __init__ removes it by name."
     ),
+    ("sensor", "dry_contact_state"): (
+        "upstream v2.0.6 limited Dry Contact State to MIN TL-X, the only profiles with its "
+        "register; on WIT it never had a source. Not one of the seven optimizer sensors. "
+        "Documented in the fork section of RELEASENOTES.md."
+    ),
 }
+
+# Rows setup renames on purpose, (domain, key) -> (current id, new id). Same reasoning as
+# EXPECTED_REMOVALS: a rename breaks every reference to the old id, so it has to be chosen.
+EXPECTED_RENAMES = {
+    ("sensor", "battery_soh"): (
+        "sensor.growatt_battery_battery_state_of_health",
+        "sensor.growatt_battery_battery_state_of_health_vpp",
+    ),
+}
+# upstream v2.0.0 renamed the VPP SOH sensor to "Battery State of Health (VPP)" so the
+# plain name is left for the BMS register; _migrate_entity_ids follows the display name.
+# Not one of the seven optimizer sensors. Documented in the fork section of RELEASENOTES.md.
 
 # Rows nothing in the code can build, and nothing in the code can remove either: they
 # have no SENSOR_DEFINITIONS entry, so the blanket sensor rule (which iterates that dict)
@@ -629,6 +646,10 @@ class _LiveCoordinator:
             (),
             {
                 "is_clock_supported": True,
+                # Upstream v2.0.x split the gate sensor.py / button.py read in two;
+                # both are True on every profile (GrowattModbus.is_clock_readable/_writable).
+                "is_clock_readable": True,
+                "is_clock_writable": True,
                 "register_map": _const.REGISTER_MAPS[REGISTER_MAP],
             },
         )()
@@ -879,9 +900,16 @@ def test_no_live_row_is_renamed() -> None:
     IDs configured in battery_optimizer, plus dashboards, automations and statistics.
     """
     renamed = _simulate_renames()
-    assert not renamed, "setup would rename live entities: " + "; ".join(
-        f"{old} -> {new}" for old, new in sorted(renamed.values())
+    unexpected = {k: v for k, v in renamed.items() if EXPECTED_RENAMES.get(k) != v}
+    assert not unexpected, "setup would rename live entities: " + "; ".join(
+        f"{old} -> {new}" for old, new in sorted(unexpected.values())
     )
+    missing = set(EXPECTED_RENAMES) - set(renamed)
+    assert not missing, (
+        f"EXPECTED_RENAMES lists rows that are no longer renamed: {sorted(missing)}"
+    )
+    optimizer_keys = {("sensor", key) for key in OPTIMIZER_SENSORS}
+    assert not optimizer_keys & set(renamed), "an optimizer entity would be renamed"
 
 
 def test_no_unique_id_is_produced_twice() -> None:

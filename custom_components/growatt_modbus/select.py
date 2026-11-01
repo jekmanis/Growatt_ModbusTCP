@@ -9,13 +9,21 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.entity import EntityCategory
+from homeassistant.exceptions import HomeAssistantError
 
+from .tou_packing import (
+    current_pair as tou_current_pair,
+    publish as tou_publish,
+    with_enable as tou_with_enable,
+    with_priority as tou_with_priority,
+)
 from .const import (
     DOMAIN,
     WRITABLE_REGISTERS,
     CONF_REGISTER_MAP,
     DEVICE_TYPE_INVERTER,
     get_device_type_for_control,
+    hold_tou_periods,
     is_read_only_register,
     DEVICE_TYPE_BATTERY,
     MOD_TOU_PERIODS,
@@ -24,7 +32,7 @@ from .const import (
 )
 from .coordinator import GrowattModbusCoordinator
 from .entity import GrowattEntity
-from .growatt_modbus import ModbusWriteError
+from .growatt_modbus import ModbusWriteError, RATE_LIMITED_MESSAGE
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -155,7 +163,7 @@ async def async_setup_entry(
         if _not and register_map_name in _not:
             continue
 
-        # allow_grid_charge is handled by GrowattModAllowGridChargeSelect below
+        # allow_grid_charge is handled by GrowattAllowGridChargeSelect below
         if control_name == 'allow_grid_charge':
             continue
 
@@ -178,16 +186,27 @@ async def async_setup_entry(
 
     # MOD TL3-XH TOU priority and enable selects (9 periods × 2 = 18 entities)
     if 3038 in holding_registers:
+        # A profile whose TOU writes are unconfirmed creates these disabled (#400).
+        tou_off = REGISTER_MAPS.get(register_map_name, {}).get('tou_disabled_by_default', False)
         for period_def in MOD_TOU_PERIODS:
-            entities.append(GrowattModTouPriority(coordinator, config_entry, period_def))
-            entities.append(GrowattModTouEnable(coordinator, config_entry, period_def))
+            for cls in (GrowattModTouPriority, GrowattModTouEnable):
+                entity = cls(coordinator, config_entry, period_def)
+                if tou_off:
+                    entity._attr_entity_registry_enabled_default = False
+                entities.append(entity)
         _LOGGER.info("MOD TOU priority/enable controls enabled (%d select entities for %d periods)",
                      len(MOD_TOU_PERIODS) * 2, len(MOD_TOU_PERIODS))
 
-    # MOD GEN4 Allow Grid Charge gate (register 3049) — prerequisite for TOU persistence
+    # Allow Grid Charge (register 3049). On MOD this gates TOU persistence; MIN TL-XH
+    # exposes the same address only after its app setting matched a direct read (#400).
     if 3049 in holding_registers:
-        entities.append(GrowattModAllowGridChargeSelect(coordinator, config_entry))
-        _LOGGER.info("MOD Allow Grid Charge control enabled (register 3049)")
+        entity = GrowattAllowGridChargeSelect(coordinator, config_entry)
+        if REGISTER_MAPS.get(register_map_name, {}).get(
+            'allow_grid_charge_disabled_by_default', False
+        ):
+            entity._attr_entity_registry_enabled_default = False
+        entities.append(entity)
+        _LOGGER.info("Allow Grid Charge control enabled (register 3049)")
 
     if entities:
         entry_name = config_entry.data.get("name", config_entry.title)
@@ -286,6 +305,13 @@ class GrowattGenericSelect(GrowattEntity, SelectEntity):
         self._control_name = control_name
         self._control_config = control_config
 
+        # Same mechanism number.py has carried since #384, absent here until #373 needed it.
+        # Three of the five VPP controls are selects, so without this the pair would have
+        # shipped half disabled - and control_authority, the one that matters most, is one
+        # of them.
+        if control_config.get('disabled_by_default'):
+            self._attr_entity_registry_enabled_default = False
+
         # Generate friendly name (e.g., "output_config" -> "Output Config"), unless the
         # control carries an explicit label.
         #
@@ -320,15 +346,11 @@ class GrowattGenericSelect(GrowattEntity, SelectEntity):
     def available(self) -> bool:
         """Unavailable while the backing VPP block was not read this poll.
 
-        Registers 30100 / 30200-30201 / 30407-30410 are optional best-effort reads.
-        When a block is missed, GrowattData carries its dataclass default (0), which
-        would otherwise be published as a real "Disabled"/0 setting. Reporting
-        unavailable keeps a stale-but-honest state in HA instead. Controls not backed
-        by such a block are unaffected.
-
-        This is the control-side counterpart of upstream's `unread_fields` for sensor
-        readings: never publish a default for a register that was not read. It composes
-        with CoordinatorEntity's own availability via super() rather than replacing it.
+        Registers 30100 / 30200-30201 / 30407-30410 are optional best-effort reads. When
+        a block is missed, GrowattData carries its dataclass default (0), which would
+        otherwise be published as a real "Disabled"/0 setting. Reporting unavailable is
+        the same choice the sensor platform makes for a reading that was not taken.
+        Controls not backed by such a block have no entry in the map and are unaffected.
         """
         if not super().available:
             return False
@@ -345,8 +367,10 @@ class GrowattGenericSelect(GrowattEntity, SelectEntity):
         if data is None:
             return None
 
-        # A block that was not read this poll carries dataclass defaults — report
-        # unknown rather than a fabricated option (see available()).
+        # A block that was not read this poll carries dataclass defaults - report unknown
+        # rather than a fabricated value (see available()). Kept in addition to the
+        # availability gate because Home Assistant keeps the last state of an unavailable
+        # entity, and a 0 written there once would linger as a plausible-looking value.
         flag = VPP_CONTROL_AVAILABILITY_FLAG.get(self._control_name)
         if flag is not None and not getattr(data, flag, False):
             return None
@@ -403,6 +427,9 @@ class GrowattGenericSelect(GrowattEntity, SelectEntity):
             _LOGGER.error("Failed to write %s (register %d)", self._control_name, register_addr)
             return
 
+        if not write_ok:
+            raise HomeAssistantError(RATE_LIMITED_MESSAGE.format(name=self._control_name))
+
         if write_ok:
             if verified:
                 _LOGGER.info("Set %s to %s (value=%d, verified)", self._control_name, option, value)
@@ -435,6 +462,7 @@ class GrowattGenericSelect(GrowattEntity, SelectEntity):
                         )
 
             await self.coordinator.async_request_refresh()
+
 
 
 class GrowattWitWorkModeSelect(GrowattEntity, SelectEntity):
@@ -530,9 +558,28 @@ class GrowattWitVppBatteryModeSelect(GrowattEntity, SelectEntity):
     CRITICAL - HOLD Mode Implementation:
     - Simply setting 30407=0 returns to SELF-CONSUMPTION, NOT true HOLD!
     - In self-consumption, battery WILL discharge to supply house load
-    - True HOLD requires TOU workaround: Set +1% charge via TOU period
-    - This firmware quirk creates actual idle state (battery neither charges nor discharges)
+    - HOLD uses a TOU workaround instead: Set +1% charge via TOU period
+    - On WIT this was reported as an idle state; see below for what MOD and MIN measure
     - WARNING: +1% = HOLD, but -1% = FULL DISCHARGE (asymmetric behavior!)
+
+    The asymmetry above is a WIT observation and should not be assumed to generalise.
+    On a MOD 6000-15000TL3-XH (DTC 5400) it did NOT reproduce on the DIRECT branch:
+    over ~950 W of house load with no PV, +1% and -1% both collapsed discharge to
+    ~190 W and handed the load to the grid, differing by 26 W across n=48 and n=52
+    samples - inside the noise of a varying house load, with SoC flat in both. So on
+    that firmware the sign made no difference and -1% did not produce a full discharge.
+
+    That null is on the direct branch (30409 + 30408 + 30407 + 30100). The HOLD path
+    below uses the ROSTER branch (30412-30414 + 30411), which is a different route
+    through the same block - and 30407 selects between them (#349).
+
+    Measured on the roster branch since (#400): the workaround is close to idle but not
+    zero on either non-WIT family tested. A MOD 10KTL3-XH (DTC 5400) under this exact HOLD
+    sequence, at night with no PV, settled at about +140 W (charging) for four minutes; the
+    direct branch at 30409 = 0 with 30410 = 0 sat at about -140 W instead - the same offset
+    on the opposite side. A MIN 4200TL-XH (DTC 5100) charged at roughly 270-310 W under
+    roster +1% with AC charge on. HOLD writes 30410 = 1 on every entry, which is what puts
+    it on the charging side. No metered WIT result has been posted to compare against.
 
     NOTE: Legacy registers 201/202 do NOT work on WIT inverters!
     """
@@ -612,9 +659,9 @@ class GrowattWitVppBatteryModeSelect(GrowattEntity, SelectEntity):
             client.write_register(self.VPP_CONTROL_AUTHORITY, 1)
 
             if option == "Hold":
-                # HOLD: Use TOU +1% charge workaround for TRUE standby
+                # HOLD: Use TOU +1% charge workaround to get close to idle
                 # Simply disabling remote control (30407=0) returns to self-consumption
-                # where battery WILL discharge! This TOU workaround creates true idle.
+                # where battery WILL discharge! Close to idle, not zero - see docstring.
                 # CRITICAL: +1% = HOLD, but -1% = FULL DISCHARGE (asymmetric!)
                 _LOGGER.debug("[WIT-VPP] Setting HOLD mode via TOU +1%% workaround")
 
@@ -628,28 +675,120 @@ class GrowattWitVppBatteryModeSelect(GrowattEntity, SelectEntity):
                         "FC 0x10 - grid charging will not engage"
                     )
 
-                # Get current time for TOU period
-                from datetime import datetime
-                now = datetime.now()
+                # Select the roster branch before writing into it (#400).
+                #
+                # 30407 chooses between the two routes through this block: the direct
+                # setpoint (30409 + 30408) and the roster (30412+ + 30411). Charge and
+                # Discharge both set it to 1 for the direct branch and never clear it, and
+                # Hold did not touch it - so **Charge -> Hold** left the selector on the
+                # direct branch with 30409 still at +100 %, wrote the roster period into the
+                # branch that was not selected, and held nothing. The entity reported Hold
+                # either way, because current_option returns the last commanded mode rather
+                # than device state.
+                #
+                # Found by @KevlarD-67 reading this against the 30407 behaviour measured in
+                # #349, and since **confirmed on hardware** by him: on a MOD 10KTL3-XH at
+                # night, `charge` at 20 % then `hold` left the battery charging at 1.52 kW
+                # with 30407 = 1 and 30409 = 20 still standing, while the hold period sat in
+                # the roster branch that was not selected. Grid import went 469 W -> 2166 W.
+                # An open-ended grid charge that the entity reported as Hold.
+                #
+                # 30407 = 0 on its own returns the inverter to self-consumption, which is
+                # why it is not a hold by itself and why the roster below still matters. The
+                # brief window between this write and the period taking force is a few
+                # seconds of ordinary self-consumption.
+                # bypass_rate_limit, because Charge and Discharge write 30407 themselves
+                # and stamp its 30 s cooldown. Without this, a Hold chosen within 30 s of
+                # either had the clear silently refused and wrote its roster into the branch
+                # that was not selected - the very sequence this clear exists to fix (#400).
+                #
+                # Aborting rather than warning: a hold that cannot deselect the direct branch
+                # is not a hold, and continuing would leave the setpoint from the previous
+                # mode in force - charging at 100 % after Charge - while the entity reported
+                # Hold. Failing visibly is the lesser harm.
+                if not client.write_register(self.VPP_REMOTE_POWER_ENABLE, 0,
+                                             bypass_rate_limit=True):
+                    raise HomeAssistantError(
+                        "Could not clear remote power control (30407) before writing the "
+                        "HOLD schedule, so the inverter is still following the previous "
+                        "mode's power setpoint. Nothing further was written. Try Hold "
+                        "again; if it keeps failing, check the connection to the inverter."
+                    )
+
+                # And clear the setpoint behind it (#400).
+                #
+                # 30409 drives nothing while 30407 is 0, which is why this was left standing
+                # at first. @KevlarD-67's own #349 measurements are the argument against
+                # that: Growatt's scheduler reopened 30407 four times in one evening on his
+                # MOD. A stale +20 % would come back with it, as a grid charge nobody asked
+                # for and nothing in Home Assistant commanded.
+                #
+                # Warned rather than aborted, unlike the clear above: once 30407 is 0 the
+                # hold is already in force, and this is protection against something
+                # reopening it later. Failing it must not throw away a working hold.
+                if not client.write_register(self.VPP_REMOTE_POWER_PERCENT, 0,
+                                             bypass_rate_limit=True):
+                    _LOGGER.warning(
+                        "[WIT-VPP] Could not clear the remote power setpoint (30409=0) "
+                        "after selecting the HOLD roster. The hold is in force, but if "
+                        "anything re-enables 30407 later the old setpoint returns with it"
+                    )
+
+                # The inverter runs this window against its own clock, which the clock sync
+                # sets in Home Assistant's zone - so the window must be in that zone too, not
+                # the host's. On a host in UTC it would otherwise land hours off (#458).
+                import homeassistant.util.dt as dt_util
+                now = dt_util.now()
                 current_minutes = now.hour * 60 + now.minute
 
-                # Create TOU period: (now - 5min) to (now + 2 hours) at +1% charge
-                start_min = max(0, current_minutes - 5)
-                end_min = min(1439, current_minutes + 120)
+                # Create TOU period: (now - 5min) to (now + 2 hours) at +1% charge.
+                #
+                # Period words are minutes since midnight and DO NOT WRAP - 1440 is not
+                # 00:00 tomorrow, it is out of range. This used to clamp the end to 1439,
+                # which silently shortened any Hold selected after 21:59: at 23:50 the user
+                # got nine minutes instead of two hours, the period expired at midnight, the
+                # battery resumed discharging, and the entity went on reporting Hold because
+                # current_option returns the last commanded mode rather than device state.
+                #
+                # Overnight is when a hold is most likely to be wanted, so the window where
+                # the clamp bit hardest was the window it would be used in (#423).
+                #
+                # A window crossing midnight is therefore written as TWO periods - one to
+                # 23:59 and one from 00:00 - and 30411 is set to the count. The roster holds
+                # 20 periods at 3 registers each (30412-30471), so period 2 at 30415 is well
+                # inside it.
+                periods = hold_tou_periods(current_minutes)
+                if len(periods) > 1:
+                    _LOGGER.debug(
+                        "[WIT-VPP] HOLD window crosses midnight - writing %d periods",
+                        len(periods),
+                    )
 
-                # Write TOU period using function 0x10 (write multiple registers)
-                _LOGGER.debug("[WIT-VPP] Writing TOU period %02d:%02d-%02d:%02d @ +1%%",
-                             start_min // 60, start_min % 60, end_min // 60, end_min % 60)
-                success = client.write_registers(
-                    self.VPP_TOU_PERIOD1_BASE,
-                    [start_min, end_min, 1],  # +1% = HOLD (NOT -1% which = full discharge!)
-                )
-                if not success:
-                    _LOGGER.error("[WIT-VPP] Failed to write TOU period for HOLD mode")
-                    return False
+                # Write TOU periods using function 0x10 (write multiple registers)
+                for index, (period_start, period_end) in enumerate(periods):
+                    base = self.VPP_TOU_PERIOD1_BASE + (index * 3)
+                    _LOGGER.debug(
+                        "[WIT-VPP] Writing TOU period %d at %d: %02d:%02d-%02d:%02d @ +1%%",
+                        index + 1, base,
+                        period_start // 60, period_start % 60,
+                        period_end // 60, period_end % 60,
+                    )
+                    success = client.write_registers(
+                        base,
+                        # +1% = HOLD (NOT -1% which = full discharge on WIT!)
+                        [period_start, period_end, 1],
+                    )
+                    if not success:
+                        _LOGGER.error(
+                            "[WIT-VPP] Failed to write TOU period %d for HOLD mode",
+                            index + 1,
+                        )
+                        return False
 
-                # Enable 1 TOU period
-                success = client.write_register(self.VPP_TOU_NUM_PERIODS, 1)
+                # Enable exactly the periods just written. Setting the count is what brings
+                # them into force, so a stale period 2 left over from an earlier midnight
+                # crossing is ignored once this reads 1 again.
+                success = client.write_register(self.VPP_TOU_NUM_PERIODS, len(periods))
                 if not success:
                     _LOGGER.error("[WIT-VPP] Failed to enable TOU period for HOLD mode")
                     return False
@@ -817,10 +956,16 @@ class GrowattModTouPriority(GrowattEntity, SelectEntity):
         priority = self._PRIORITY_REVERSE.get(option)
         if priority is None:
             return
-        data = self.coordinator.data
-        current_raw = getattr(data, self._start_field, 0) if data else 0
-        new_raw = (int(current_raw) & 0x9FFF) | (priority << 13)
-        current_end = int(getattr(data, self._end_field, 0) if data else 0)
+        # Read the pair fresh: the last poll may predate a write made seconds ago to this
+        # same start word (time, priority and enable share it), and rebuilding from that
+        # copy would undo it (#475).
+        fresh = await self.hass.async_add_executor_job(
+            self.coordinator.modbus_client.read_holding_registers, self._start_reg, 2
+        )
+        current_raw, current_end, _ = tou_current_pair(
+            fresh, self.coordinator.data, self._start_field, self._end_field
+        )
+        new_raw = tou_with_priority(current_raw, priority)
         try:
             success = await self.hass.async_add_executor_job(
                 self.coordinator.modbus_client.write_registers,
@@ -834,6 +979,10 @@ class GrowattModTouPriority(GrowattEntity, SelectEntity):
             _LOGGER.info("Set MOD TOU period %d priority to %s (start=0x%04X, end=0x%04X, atomic FC16)", self._period, option, new_raw, current_end)
             self.coordinator.track_write(self._start_reg, new_raw, self._start_field)
             self.coordinator.track_write(self._end_reg, current_end, self._end_field)
+            # Show it on every entity of this period now, not after the next poll (#475).
+            tou_publish(self.coordinator.data, self._start_field, self._end_field,
+                        new_raw, current_end)
+            self.coordinator.async_update_listeners()
             await self.coordinator.async_request_refresh()
 
 
@@ -878,10 +1027,16 @@ class GrowattModTouEnable(GrowattEntity, SelectEntity):
     async def async_select_option(self, option: str) -> None:
         """Write new enable state atomically — always write start+end together as a single FC16 transaction."""
         enable = 1 if option == "Enabled" else 0
-        data = self.coordinator.data
-        current_raw = getattr(data, self._start_field, 0) if data else 0
-        new_raw = (int(current_raw) & 0x7FFF) | (enable << 15)
-        current_end = int(getattr(data, self._end_field, 0) if data else 0)
+        # Read the pair fresh: the last poll may predate a write made seconds ago to this
+        # same start word (time, priority and enable share it), and rebuilding from that
+        # copy would undo it (#475).
+        fresh = await self.hass.async_add_executor_job(
+            self.coordinator.modbus_client.read_holding_registers, self._start_reg, 2
+        )
+        current_raw, current_end, _ = tou_current_pair(
+            fresh, self.coordinator.data, self._start_field, self._end_field
+        )
+        new_raw = tou_with_enable(current_raw, bool(enable))
         try:
             success = await self.hass.async_add_executor_job(
                 self.coordinator.modbus_client.write_registers,
@@ -895,14 +1050,18 @@ class GrowattModTouEnable(GrowattEntity, SelectEntity):
             _LOGGER.info("Set MOD TOU period %d enable to %s (start=0x%04X, end=0x%04X, atomic FC16)", self._period, option, new_raw, current_end)
             self.coordinator.track_write(self._start_reg, new_raw, self._start_field)
             self.coordinator.track_write(self._end_reg, current_end, self._end_field)
+            # Show it on every entity of this period now, not after the next poll (#475).
+            tou_publish(self.coordinator.data, self._start_field, self._end_field,
+                        new_raw, current_end)
+            self.coordinator.async_update_listeners()
             await self.coordinator.async_request_refresh()
 
 
-class GrowattModAllowGridChargeSelect(GrowattEntity, SelectEntity):
-    """Select entity for the MOD GEN4 'Allow Grid Charge' gate (register 3049).
+class GrowattAllowGridChargeSelect(GrowattEntity, SelectEntity):
+    """Select entity for 'Allow Grid Charge' (register 3049).
 
-    This register must be set to Enabled (1) before TOU time slot registers
-    (3038-3059) will persist on GEN4 hardware.  Plain 0/1 register — no bit masking.
+    On MOD GEN4 this must be Enabled before TOU slots persist. On MIN TL-XH it
+    corresponds to ShinePhone's grid-charge permission. Plain 0/1 register.
     """
 
     _REGISTER = 3049
@@ -942,6 +1101,8 @@ class GrowattModAllowGridChargeSelect(GrowattEntity, SelectEntity):
         except ModbusWriteError:
             _LOGGER.error("Failed to write allow_grid_charge (register %d)", self._REGISTER)
             return
+        if not write_ok:
+            raise HomeAssistantError(RATE_LIMITED_MESSAGE.format(name='allow_grid_charge'))
         if write_ok:
             if verified:
                 _LOGGER.info("Set allow_grid_charge to %s (value=%d, verified)", option, value)

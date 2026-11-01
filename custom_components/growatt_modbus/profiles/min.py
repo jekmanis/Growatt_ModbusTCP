@@ -1,6 +1,6 @@
 from .vpp_v201 import (
     VPP_V201_STATUS, VPP_V201_PV2_INPUT, VPP_V201_PV2_TOTAL,
-    VPP_V201_PV3_AND_TOTAL, VPP_V201_ENERGY_1P, VPP_V201_TEMPERATURE_1P,
+    VPP_V201_PV3_AND_TOTAL, VPP_V201_ENERGY_1P,
     VPP_V201_HOLDING_1P,
 )
 
@@ -116,7 +116,10 @@ MIN_3000_6000TL_X = {
         3119: {'name': 'dry_contact_state', 'scale': 1, 'unit': '', 'desc': 'Dry contact relay current state: 0=Off, 1=On'},
     },
     'holding_registers': {
-        0: {'name': 'on_off', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': '0=Off, 1=On'},
+        # Reads back the real state despite V1.39 marking it write-only: 0 while switched
+        # off, 1 while on, on the maintainer's MIN TL-X (2026-09-26).
+        0: {'name': 'on_off', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': '0=Off, 1=On',
+            'onoff_readback': True},
         3: {'name': 'active_power_rate', 'scale': 1, 'unit': '%', 'access': 'RW', 'desc': 'Max output power %'},
         30: {'name': 'modbus_address', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': 'Modbus address 1-254'},
 
@@ -247,9 +250,36 @@ MIN_7000_10000TL_X = {
         
         # Diagnostics
         3086: {'name': 'derating_mode', 'scale': 1, 'unit': '', 'desc': 'Derating status'},
-        3087: {'name': 'pv_iso', 'scale': 1, 'unit': 'kΩ', 'desc': 'PV isolation resistance'},
-        3088: {'name': 'dci_r', 'scale': 0.1, 'unit': 'mA', 'desc': 'DC injection R phase'},
-        3091: {'name': 'gfci', 'scale': 1, 'unit': 'mA', 'desc': 'Ground fault current'},
+        # Safety measurements: PV insulation resistance, DC injection and leakage current.
+        # INPUT 200-205 (FC04). Holding 201/202/203 at the same addresses are PID working
+        # mode, PID on/off and PID voltage - WRITE registers for a completely different
+        # subsystem.
+        #
+        # These were read from input 3087-3091 until #404, and that mapping was NOT a
+        # guess: V1.39 documents input 3087-3091 as ISO/DCI_R/DCI_S/DCI_T/GFCI with the
+        # same scales. Whether a device honours it depends on the firmware.
+        #
+        # Four scans show that block echoing SERIAL-NUMBER text instead: 22616 is 0x5858,
+        # ASCII "XX", three different quantities reading the same value, and the same values
+        # coming back from the holding space, where V1.39 documents 3087-3092 as Serial
+        # Number 1-6. So an insulation resistance of 2261.6 kOhm was being published from
+        # serial-number characters.
+        #
+        # But a MOD 10KTL3-XH on DTC 5400 / DN1.0 / V2.02 returns LIVE measurements from
+        # 3087-3091 - the same values as 200-205, DCI drifting together across paired reads.
+        # An earlier version of this note claimed no device honoured the block; that was four
+        # devices, not the family, and it was wrong.
+        #
+        # 200-205 is mapped because it works on both kinds of firmware. Note the two blocks
+        # are NOT one offset by a constant: GFCI is the fifth word of the old block (3091)
+        # and the sixth of the new (205), with 204 constant at 0 in between (#404).
+        #
+        # 200-205 move between scans the way a measurement does, and the mapping is
+        # confirmed from outside this project: Growatt's own app shows `Gfci(mA)` and
+        # `Iso(KOhm)` beside the values our scan reads from 205 and 200 (#404).
+        200: {'name': 'pv_iso', 'scale': 1, 'unit': 'kΩ', 'desc': 'PVISO - PV insulation resistance'},
+        201: {'name': 'dci_r', 'scale': 0.1, 'unit': 'mA', 'desc': 'R_DCI - DC injection, R phase'},
+        205: {'name': 'gfci', 'scale': 1, 'unit': 'mA', 'desc': 'GFCI - residual/leakage current'},
         3092: {'name': 'bus_voltage', 'scale': 0.1, 'unit': 'V', 'desc': 'DC bus voltage'},
         
         # Temperatures
@@ -285,7 +315,10 @@ MIN_7000_10000TL_X = {
         3119: {'name': 'dry_contact_state', 'scale': 1, 'unit': '', 'desc': 'Dry contact relay current state: 0=Off, 1=On'},
     },
     'holding_registers': {
-        0: {'name': 'on_off', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': '0=Off, 1=On'},
+        # Reads back the real state despite V1.39 marking it write-only: 0 while switched
+        # off, 1 while on, on the maintainer's MIN TL-X (2026-09-26).
+        0: {'name': 'on_off', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': '0=Off, 1=On',
+            'onoff_readback': True},
         3: {'name': 'active_power_rate', 'scale': 1, 'unit': '%', 'access': 'RW', 'desc': 'Max output power %'},
         15: {'name': 'lcd_language', 'scale': 1, 'unit': '', 'access': 'RW'},
         22: {'name': 'baud_rate', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': '0=9600, 1=38400'},
@@ -341,7 +374,7 @@ MIN_SERIES_BASE_RANGE = {
         13: {'name': 'pv3_power_high', 'scale': 1, 'unit': '', 'pair': 14},
         14: {'name': 'pv3_power_low', 'scale': 1, 'unit': '', 'pair': 13, 'combined_scale': 0.1, 'combined_unit': 'W'},
         35: {'name': 'output_power_high', 'scale': 1, 'unit': '', 'pair': 36},
-        36: {'name': 'output_power_low', 'scale': 1, 'unit': '', 'pair': 35, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        36: {'name': 'output_power_low', 'scale': 1, 'unit': '', 'pair': 35, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
         37: {'name': 'grid_frequency', 'scale': 0.01, 'unit': 'Hz'},
         38: {'name': 'grid_voltage', 'scale': 0.1, 'unit': 'V'},
         39: {'name': 'grid_current', 'scale': 0.1, 'unit': 'A'},
@@ -410,12 +443,11 @@ MIN_3000_6000TL_X_V201 = {
         31112: {'name': 'meter_power_high', 'scale': 1, 'unit': '', 'pair': 31113, 'maps_to': 'power_to_grid'},
         31113: {'name': 'meter_power_low',  'scale': 1, 'unit': '', 'pair': 31112, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
 
-        # Load Power (same as PtoLoad - 3045/3046)
-        31118: {'name': 'load_power_high_vpp', 'scale': 1, 'unit': '', 'pair': 31119, 'maps_to': 'power_to_load'},
-        31119: {'name': 'load_power_low_vpp',  'scale': 1, 'unit': '', 'pair': 31118, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        # Energy to user today (V2.01-V2.05). Was labelled load power; see vpp_v201.py.
+        31118: {'name': 'energy_to_user_today_vpp_high', 'scale': 1, 'unit': '', 'pair': 31119},
+        31119: {'name': 'energy_to_user_today_vpp_low',  'scale': 1, 'unit': '', 'pair': 31118, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
         **VPP_V201_ENERGY_1P,
-        **VPP_V201_TEMPERATURE_1P,
     },
     'holding_registers': {
         # === V1.39 REGISTERS ===
@@ -459,12 +491,11 @@ MIN_7000_10000TL_X_V201 = {
         31112: {'name': 'meter_power_high', 'scale': 1, 'unit': '', 'pair': 31113, 'maps_to': 'power_to_grid'},
         31113: {'name': 'meter_power_low',  'scale': 1, 'unit': '', 'pair': 31112, 'combined_scale': 0.1, 'combined_unit': 'W', 'signed': True},
 
-        # Load Power
-        31118: {'name': 'load_power_high_vpp', 'scale': 1, 'unit': '', 'pair': 31119, 'maps_to': 'power_to_load'},
-        31119: {'name': 'load_power_low_vpp',  'scale': 1, 'unit': '', 'pair': 31118, 'combined_scale': 0.1, 'combined_unit': 'W'},
+        # Energy to user today (V2.01-V2.05). Was labelled load power; see vpp_v201.py.
+        31118: {'name': 'energy_to_user_today_vpp_high', 'scale': 1, 'unit': '', 'pair': 31119},
+        31119: {'name': 'energy_to_user_today_vpp_low',  'scale': 1, 'unit': '', 'pair': 31118, 'combined_scale': 0.1, 'combined_unit': 'kWh'},
 
         **VPP_V201_ENERGY_1P,
-        **VPP_V201_TEMPERATURE_1P,
     },
     'holding_registers': {
         # === V1.39 REGISTERS ===

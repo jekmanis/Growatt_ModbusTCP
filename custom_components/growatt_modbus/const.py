@@ -46,6 +46,9 @@ CONF_BAUDRATE = "baudrate"
 CONF_REGISTER_MAP = "register_map"
 CONF_INVERTER_SERIES = "inverter_series"
 CONF_INVERT_GRID_POWER = "invert_grid_power"  # For reversed CT clamps (AC side)
+# Setup-time only: offered after a failed connection test so an unreachable or
+# not-yet-supported inverter can still be added (#389). Never stored on the entry.
+CONF_ADD_ANYWAY = "add_anyway"
 CONF_INVERT_BATTERY_POWER = "invert_battery_power"  # For inverters with opposite battery power sign
 CONF_DEVICE_STRUCTURE_VERSION = "device_structure_version"
 
@@ -143,6 +146,9 @@ SENSOR_TYPES = {
         'pv1_power', 'pv2_power', 'pv3_power', 'pv_total_power',
         'ac_power', 'grid_power', 'grid_export_power', 'grid_import_power',
         'power_to_grid', 'power_to_load', 'power_to_user',
+        'ct_grid_import_l1', 'ct_grid_import_l2',
+        'ct_grid_export_l1', 'ct_grid_export_l2',
+        'inverter_to_load_l1', 'inverter_to_load_l2',
         'self_consumption', 'house_consumption',
         # Battery power sensors
         'battery_power', 'battery_charge_power', 'battery_discharge_power',
@@ -200,6 +206,27 @@ SENSOR_TYPES = {
 
 # WRITABLE REGISTERS - Control Entities
 WRITABLE_REGISTERS = {
+    # PV startup (connect) voltage — reg 17, x0.1 V. Scoped to the MIC MIN-range
+    # profile: reg 17 was field-confirmed writable on a MIC 2000TL-X (DTC 5200,
+    # firmware "PV 200"), reading 500 (=50.0 V) at factory default and accepting an
+    # FC06 write. Raising it delays grid-connect until the string can sustain voltage,
+    # which stops dawn/dusk on/off hunting on a single high-voltage panel. Its meaning
+    # is not verified on other families, so it is not exposed generally.
+    # The protocol gives no range. 50.0–550.0 V is the MPPT window across the models on
+    # this profile, per Growatt datasheets: MIC 600-2000TL-X start at 50 V (MPPT 50-500 V),
+    # MIC 2500-3300TL-X at 80 V (65-550 V), MIN-class units at 100 V (max DC 550 V). Every
+    # factory value seen (500, 800, 1000 raw) sits inside it, so the control never shows
+    # as unavailable because an installer's setting is out of range.
+    'pv_start_voltage': {
+        'register': 17,
+        'scale': 0.1,                     # raw 500 -> 50.0 V
+        'valid_range': (500, 5500),       # 50.0–550.0 V (raw, clamped on write)
+        'unit': 'V',
+        'label': 'PV Startup Voltage',
+        'only_profiles': ['MIC_2500_6000TL_X_MIN_RANGE'],
+        'desc': 'PV startup/connect voltage. Raise to stop dawn/dusk on/off hunting; keep below panel Voc.',
+    },
+
     # Grid-Tied Inverter Controls
     'export_limit_mode': {
         'register': 122,
@@ -224,7 +251,24 @@ WRITABLE_REGISTERS = {
         'scale': 1,  # Direct percentage: 0-100
         'valid_range': (0, 100),  # 0% to 100%
         'unit': '%',
-        'desc': 'Maximum output power limitation'
+        'desc': 'Maximum output power limitation',
+        # Register 3 is NOT a power rate on the off-grid protocol (#444).
+        #
+        # V1.39 holding 3 is the active power rate and this control is right for every
+        # grid-tied family. The off-grid table says something else entirely:
+        #
+        #     3 | UtiOutStart    | Uti Time             | W | bit0~bit7
+        #     4 | UtiOutEnd      | Uti Output End Time  | W | bit0~bit7
+        #     5 | UtiChargeStart | Uti Time             | W | bit0~bit7
+        #     6 | UtiChargeEnd   | Uti Charge End Time  | W | bit0~bit7
+        #
+        # Hours, 0-23, which ShinePhone shows as the output and charging period times. On an
+        # SPF the entity read 0 % while the inverter was at full output - and being writable,
+        # anyone "setting the limit to 100" would have written **hour 100** into the
+        # inverter's output schedule. Reported by @eugeniodb against the app and the SPF
+        # 3500/5000 ES manual v4.0; his raw dump reads 0/0/0/0, the factory default rather
+        # than a failed read.
+        'not_profiles': ['SPF_3000_6000_ES_PLUS', 'SPE_8000_12000_ES'],
     },
 
     # =========================================================================
@@ -268,6 +312,10 @@ WRITABLE_REGISTERS = {
         'desc': 'Export limit in watts (0 = zero export)'
     },
     'control_authority': {
+        # Off by default: a standing control_authority silently removes the TOU
+        # schedule from circuit, and the loss shows up as cheap-rate charging that
+        # never happened rather than as any error (#373).
+        'disabled_by_default': True,
         'register': 30100,
         'scale': 1,
         'valid_range': (0, 1),
@@ -297,6 +345,10 @@ WRITABLE_REGISTERS = {
         'desc': 'Export limit power rate (0–100%; 0=zero export, 100=full export). Negative values trigger WIT warning 401 fault state.'
     },
     'remote_power_control_enable': {
+        # Off by default: a standing control_authority silently removes the TOU
+        # schedule from circuit, and the loss shows up as cheap-rate charging that
+        # never happened rather than as any error (#373).
+        'disabled_by_default': True,
         'register': 30407,
         'scale': 1,
         'valid_range': (0, 1),
@@ -307,14 +359,25 @@ WRITABLE_REGISTERS = {
         'desc': 'Enable timed charge/discharge power override'
     },
     'remote_power_control_charging_time': {
+        # Off by default: a standing control_authority silently removes the TOU
+        # schedule from circuit, and the loss shows up as cheap-rate charging that
+        # never happened rather than as any error (#373).
+        'disabled_by_default': True,
         'register': 30408,
+        # "Not stored" in VPP V2.05: always written, never skipped as a no-op (#481).
+        'not_stored': True,
         'scale': 1,
         'valid_range': (0, 1440),
         'unit': 'min',
         'desc': 'Duration for remote power control (0-1440 minutes)'
     },
     'remote_charge_and_discharge_power': {
+        # Off by default: a standing control_authority silently removes the TOU
+        # schedule from circuit, and the loss shows up as cheap-rate charging that
+        # never happened rather than as any error (#373).
+        'disabled_by_default': True,
         'register': 30409,
+        'not_stored': True,
         'scale': 1,
         'valid_range': (-100, 100),
         'unit': '%',
@@ -322,6 +385,10 @@ WRITABLE_REGISTERS = {
         'signed': True
     },
     'vpp_ac_charge_enable': {
+        # Off by default: a standing control_authority silently removes the TOU
+        # schedule from circuit, and the loss shows up as cheap-rate charging that
+        # never happened rather than as any error (#373).
+        'disabled_by_default': True,
         'register': 30410,
         'label': 'VPP AC Charge Enable',
         'scale': 1,
@@ -417,11 +484,22 @@ WRITABLE_REGISTERS = {
     'max_charge_current': {
         'register': 34,
         'scale': 1,
-        'valid_range': (10, 100),
+        # Floor from the SPF 6000ES Plus manual, ceiling from the protocol (#376, #444).
+        #
+        # The floor of 10 is load-bearing and stays: that panel accepts an out-of-range save
+        # in its UI and then silently discards it, so offering 0-9 would look like it worked.
+        #
+        # The ceiling of 100 was from the same manual and is one model's limit, not the
+        # family's. The off-grid table gives "34 | MaxChargeCurr | 0~400, step 1A, default
+        # 70", and an SPF 5000 ES answers 120 - which Home Assistant then refused to display,
+        # because it validates an entity's *state* against these bounds and not just what a
+        # user may set. A working register looked like a failed read.
+        'valid_range': (10, 400),
         'unit': 'A',
         'unavailable_when': ('battery_type', 3),
-        'desc': 'Max total charge current, solar + utility (LCD Program 02). 10-100A on '
-                'SPF 6000ES Plus; not settable when battery type is Lithium'
+        'desc': 'Max total charge current, solar + utility (LCD Program 02). Floor 10A from '
+                'the SPF 6000ES Plus manual, ceiling 400A from the off-grid protocol; not '
+                'settable when battery type is Lithium'
     },
     # Bulk and float charging voltage — LCD "Program 19" and "Program 20" (#384).
     #
@@ -441,10 +519,18 @@ WRITABLE_REGISTERS = {
     # available_when: both programs read "If self-defined is selected in program 5, this
     # program can be set up". Program 5 is battery type (register 39), where 2 = User
     # Defined and 4 = User Defined 2.
+    # Bulk and Float constrain each other: the firmware refuses a bulk voltage below the
+    # float voltage, and the refusal is silent - the write is acknowledged and the value
+    # reverts, which surfaced as a "settings are being reverted" repair notice about the
+    # integration rather than as an invalid request (#387).
+    #
+    # Declared per control rather than inferred. This is the only pair known to interact,
+    # and nothing suggests the other SPF controls do.
     'bulk_charge_voltage': {
         'register': 35,
         'scale': 0.1,
         'valid_range': (480, 584),
+        'not_below': 'float_charge_voltage',
         'unit': 'V',
         'available_when': ('battery_type', (2, 4)),
         'disabled_by_default': True,
@@ -455,6 +541,7 @@ WRITABLE_REGISTERS = {
         'register': 36,
         'scale': 0.1,
         'valid_range': (480, 584),
+        'not_above': 'bulk_charge_voltage',
         'unit': 'V',
         'available_when': ('battery_type', (2, 4)),
         'disabled_by_default': True,
@@ -484,6 +571,11 @@ WRITABLE_REGISTERS = {
         'label': 'Battery to Utility Switchover',
         'scale': 0.1,
         'valid_range': (0, 1000),  # Full range: Lithium 0-100%, Non-Lithium 20.0-64.0V
+        # Cannot exceed Utility to Battery Switchover (95). An SPF 6000 ES Plus (firmware
+        # 100.06) acknowledged 21-25 % here and reverted to 20 % while 95 stood at 20 %, and
+        # accepted the same values once 95 was raised first (#471). Same silent refusal as
+        # Bulk/Float (#387). Confirmed in SOC mode; the ordering is the same in volts.
+        'not_above': 'ac_to_bat_volt',
         'unit': 'V/%',  # Unit depends on battery_type
         'desc': 'Battery to Grid: SOC level to switch from battery to utility',
         'battery_dependent': True
@@ -493,8 +585,19 @@ WRITABLE_REGISTERS = {
         'label': 'Utility to Battery Switchover',  # see bat_low_to_uti above
         'scale': 0.1,
         'valid_range': (0, 1000),  # Full range: Lithium 0-100%, Non-Lithium 20.0-64.0V
+        'not_below': 'bat_low_to_uti',  # see bat_low_to_uti (#471)
         'unit': 'V/%',  # Unit depends on battery_type
         'desc': 'Grid to Battery: SOC level to switch back from utility to battery mode',
+        'battery_dependent': True
+    },
+    'bat_low_cutoff': {
+        'register': 82,
+        'label': 'Battery Cut-Off',  # no "Voltage"/"SOC" — see bat_low_to_uti above
+        'scale': 0.1,
+        'valid_range': (0, 1000),  # Full range: Lithium 0-100%, Non-Lithium 20.0-64.0V
+        'unit': 'V/%',  # Unit depends on battery_type
+        'desc': 'Battery undervoltage cut-off point: how deep the battery discharges '
+                'before the inverter stops drawing from it',
         'battery_dependent': True
     },
 
@@ -527,6 +630,27 @@ WRITABLE_REGISTERS = {
         'unit': 'kW',
         'desc': 'Grid export power limit (0-12kW, stored as 0-120 × 0.1 kW)',
     },
+    # SPF 6000 ES Plus and siblings, firmware 100.08/101.07 and later (#437).
+    #
+    # Same register as spe_output_priority below and the same underlying setting - the
+    # protocol calls it uwLoadFirst - but only two of the three orderings exist on SPF, so
+    # this is a separate entry rather than widening that one's `only_profiles`. Offering a
+    # LUB option here would let someone write a mode the hardware does not implement.
+    #
+    # Named for what the inverter's own screen shows rather than for what the register
+    # does, deliberately: SPF already has `output_config` (SBU/SOL/UTI/SUB) called "Output
+    # Priority", and a second control with a similar name would be read as the same thing.
+    'spf_blu_lbu_mode': {
+        'register': 116,
+        'label': 'BLU/LBU Mode',
+        'only_profiles': ['SPF_3000_6000_ES_PLUS'],
+        'scale': 1,
+        'valid_range': (0, 1),
+        'options': {0: 'BLU', 1: 'LBU'},
+        'desc': 'Energy priority (uwLoadFirst): BLU=Battery first, LBU=Load first. '
+                'Added by firmware 100.08/101.07; older firmware does not have it.',
+    },
+
     'spe_output_priority': {
         'register': 116,
         'label': 'SPE Output Priority',
@@ -751,27 +875,28 @@ WRITABLE_REGISTERS = {
         'label': 'Battery First Period 3 Enable', 'desc': 'Enable time period 3'
     },
 
-    # SPH GEN3 Battery First extended time slots 4-6 (registers 1017-1025)
-    'batt_first_time_period_4_start': {'register': 1017, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 4 start (hex-packed: hours*256+minutes)'},
-    'batt_first_time_period_4_end':   {'register': 1018, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 4 end (hex-packed: hours*256+minutes)'},
-    'batt_first_time_period_4_enable': {'register': 1019, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 4'},
-    'batt_first_time_period_5_start': {'register': 1020, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 5 start (hex-packed: hours*256+minutes)'},
-    'batt_first_time_period_5_end':   {'register': 1021, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 5 end (hex-packed: hours*256+minutes)'},
-    'batt_first_time_period_5_enable': {'register': 1022, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 5'},
-    'batt_first_time_period_6_start': {'register': 1023, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 6 start (hex-packed: hours*256+minutes)'},
-    'batt_first_time_period_6_end':   {'register': 1024, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 6 end (hex-packed: hours*256+minutes)'},
-    'batt_first_time_period_6_enable': {'register': 1025, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 6'},
+    # SPH GEN3 Battery First extended time slots 4-6 (registers 1018-1026; one later than
+    # Protocol V1.39 prints - set and read back on an SPH3600, #484)
+    'batt_first_time_period_4_start': {'register': 1018, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 4 start (hex-packed: hours*256+minutes)'},
+    'batt_first_time_period_4_end':   {'register': 1019, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 4 end (hex-packed: hours*256+minutes)'},
+    'batt_first_time_period_4_enable': {'register': 1020, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 4'},
+    'batt_first_time_period_5_start': {'register': 1021, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 5 start (hex-packed: hours*256+minutes)'},
+    'batt_first_time_period_5_end':   {'register': 1022, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 5 end (hex-packed: hours*256+minutes)'},
+    'batt_first_time_period_5_enable': {'register': 1023, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 5'},
+    'batt_first_time_period_6_start': {'register': 1024, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 6 start (hex-packed: hours*256+minutes)'},
+    'batt_first_time_period_6_end':   {'register': 1025, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Battery First period 6 end (hex-packed: hours*256+minutes)'},
+    'batt_first_time_period_6_enable': {'register': 1026, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Battery First period 6'},
 
-    # SPH GEN3 Grid First extended time slots 4-6 (registers 1026-1034)
-    'grid_first_time_period_4_start': {'register': 1026, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 4 start (hex-packed: hours*256+minutes)'},
-    'grid_first_time_period_4_end':   {'register': 1027, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 4 end (hex-packed: hours*256+minutes)'},
-    'grid_first_time_period_4_enable': {'register': 1028, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 4'},
-    'grid_first_time_period_5_start': {'register': 1029, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 5 start (hex-packed: hours*256+minutes)'},
-    'grid_first_time_period_5_end':   {'register': 1030, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 5 end (hex-packed: hours*256+minutes)'},
-    'grid_first_time_period_5_enable': {'register': 1031, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 5'},
-    'grid_first_time_period_6_start': {'register': 1032, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 6 start (hex-packed: hours*256+minutes)'},
-    'grid_first_time_period_6_end':   {'register': 1033, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 6 end (hex-packed: hours*256+minutes)'},
-    'grid_first_time_period_6_enable': {'register': 1034, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 6'},
+    # SPH GEN3 Grid First extended time slots 4-6 (registers 1027-1035, #484)
+    'grid_first_time_period_4_start': {'register': 1027, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 4 start (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_4_end':   {'register': 1028, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 4 end (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_4_enable': {'register': 1029, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 4'},
+    'grid_first_time_period_5_start': {'register': 1030, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 5 start (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_5_end':   {'register': 1031, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 5 end (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_5_enable': {'register': 1032, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 5'},
+    'grid_first_time_period_6_start': {'register': 1033, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 6 start (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_6_end':   {'register': 1034, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'desc': 'Grid First period 6 end (hex-packed: hours*256+minutes)'},
+    'grid_first_time_period_6_enable': {'register': 1035, 'scale': 1, 'valid_range': (0, 1), 'options': {0: 'Disabled', 1: 'Enabled'}, 'desc': 'Enable Grid First period 6'},
 
     # SPH GEN3 Grid First extended time slots 7-9 (registers 1080-1088)
     'grid_first_time_period_7_start': {'register': 1080, 'scale': 1, 'valid_range': (0, 5947), 'unit': '', 'label': 'Grid First Period 1 Start', 'desc': 'Grid First period 1 start (hex-packed: hours*256+minutes)'},
@@ -872,6 +997,36 @@ WRITABLE_REGISTERS = {
                 'as Grid First mode (#362). Note your firmware may enforce a higher minimum '
                 'than 1% and silently ignore lower values (V1.39: US model / firmware ZACA-08+)'
     },
+    'vpp_offgrid_discharge_soc': {
+        'register': 30475,
+        'label': 'Off-Grid Discharge Stop SOC',
+        'scale': 1,
+        'valid_range': (10, 100),
+        'unit': '%',
+        'only_profiles': ['MIN_TL_XH_3000_10000_V201'],
+        'desc': 'SOC at which off-grid battery discharge stops. Defined by VPP V2.01 '
+                'and read/write confirmed on MIN TL-XH after a Growatt firmware update (#400).'
+    },
+    'vpp_charge_stop_soc': {
+        'register': 30404,
+        'label': 'Charge Stop SOC',
+        'scale': 1,
+        'valid_range': (10, 100),
+        'unit': '%',
+        'only_profiles': ['MIN_TL_XH2_3000_10000_V201'],
+        'desc': 'SOC at which battery charging stops. Defined by VPP V2.01 and read/write '
+                'validated on MIN TL-XH2 (#461).'
+    },
+    'vpp_ongrid_discharge_soc': {
+        'register': 30405,
+        'label': 'On-Grid Discharge Stop SOC',
+        'scale': 1,
+        'valid_range': (10, 100),
+        'unit': '%',
+        'only_profiles': ['MIN_TL_XH2_3000_10000_V201'],
+        'desc': 'SOC at which on-grid battery discharge stops. Defined by VPP V2.01 and '
+                'read/write validated on MIN TL-XH2 (#461).'
+    },
     # Grid-charge stop SOC, MOD TL3-XH (#372). Separate from 3048 above: that one is the
     # general charge stop, this one caps charging from the grid specifically. On the
     # reporting system it sat at 55 while the general stop was 100 and silently limited
@@ -893,7 +1048,9 @@ WRITABLE_REGISTERS = {
                 'Charge Stopped SOC (3048), which applies to charging from any source (#372)'
     },
 
-    # MOD GEN4 grid-charge prerequisite gate (must be Enabled for TOU writes to persist)
+    # Grid-charge permission. On MOD GEN4 it is also the prerequisite gate that must be
+    # Enabled for TOU writes to persist; on MIN TL-XH it matches ShinePhone's Allow Grid
+    # Charge setting, confirmed by consecutive Disabled=0 and Enabled=1 reads (#400).
     'allow_grid_charge': {
         'register': 3049,
         'scale': 1,
@@ -902,7 +1059,7 @@ WRITABLE_REGISTERS = {
             0: 'Disabled',
             1: 'Enabled'
         },
-        'desc': 'Allow Grid Charge — prerequisite gate for TOU persistence (MOD GEN4)',
+        'desc': 'Allow charging from the grid; also required for TOU persistence on MOD GEN4',
     },
 }
 
@@ -980,6 +1137,32 @@ DAILY_TOTAL_ATTRS = [
 ]
 
 
+# Optional VPP holding blocks (30100, 30200-30201, 30407-30410) are read best-effort: a
+# Modbus error, or the backoff window that follows repeated errors, makes a whole block
+# miss a poll. GrowattData is rebuilt per poll, so a missed block leaves the dataclass
+# defaults, which look exactly like a real "Disabled"/0 reading. Control entities backed
+# by one of these blocks must therefore report unavailable when its flag is False rather
+# than publishing the default - the control-side counterpart of withholding a sensor
+# reading that was not read.
+#
+# control name -> GrowattData flag that is set only when the block actually responded
+VPP_CONTROL_AVAILABILITY_FLAG = {
+    'control_authority': 'vpp_control_authority_available',               # 30100
+    'vpp_export_limit_enable': 'vpp_export_limit_available',              # 30200
+    'vpp_export_limit_power_rate': 'vpp_export_limit_available',          # 30201
+    'remote_power_control_enable': 'vpp_remote_power_available',          # 30407
+    'remote_power_control_charging_time': 'vpp_remote_power_available',   # 30408
+    'remote_charge_and_discharge_power': 'vpp_remote_power_available',    # 30409
+    # 30410 is read by the same read_holding_registers(30407, 4) call and covered by the
+    # same flag, so leaving it out ungated it on both platforms: on the very failure this
+    # was written for - a WIT that lost 30407-30410 for 30 hours - three controls would
+    # have correctly reported unavailable while this one carried on publishing its
+    # dataclass default of 0, displayed as "Disabled". Of the four it is the worst one to
+    # fabricate: it reads as "grid charging is off" when nobody said so.
+    'vpp_ac_charge_enable': 'vpp_remote_power_available',                 # 30410
+}
+
+
 # ============================================================================
 # DEVICE STRUCTURE - Multi-Device Organization
 # ============================================================================
@@ -994,23 +1177,6 @@ DEVICE_TYPE_BACKUPBOX = "backup_box"
 
 # Sensor to Device Mapping
 # Each sensor is assigned to a logical device for better organization
-# Optional VPP holding blocks (30000+) are read best-effort: a Modbus error, or the
-# backoff window that follows repeated errors, makes a whole block miss a poll.
-# GrowattData is rebuilt per poll, so a missed block leaves dataclass defaults that
-# look exactly like a real "Disabled"/0 reading. Control entities backed by one of
-# these blocks must therefore report unavailable when its flag is False rather than
-# publishing the default.
-#
-# control name -> GrowattData flag set only when the block was actually read
-VPP_CONTROL_AVAILABILITY_FLAG = {
-    'control_authority': 'vpp_control_authority_available',            # 30100
-    'vpp_export_limit_enable': 'vpp_export_limit_available',           # 30200
-    'vpp_export_limit_power_rate': 'vpp_export_limit_available',       # 30201
-    'remote_power_control_enable': 'vpp_remote_power_available',       # 30407
-    'remote_power_control_charging_time': 'vpp_remote_power_available',  # 30408
-    'remote_charge_and_discharge_power': 'vpp_remote_power_available',   # 30409
-}
-
 SENSOR_DEVICE_MAP = {
     # Inverter device - system health and status
     DEVICE_TYPE_INVERTER: {
@@ -1074,6 +1240,9 @@ SENSOR_DEVICE_MAP = {
         'grid_import_energy_today', 'grid_import_energy_total',
         'energy_to_grid_today', 'energy_to_grid_total',
         'power_to_grid',
+        # SPH-HU split-phase CT legs
+        'ct_grid_import_l1', 'ct_grid_import_l2',
+        'ct_grid_export_l1', 'ct_grid_export_l2',
         # SPF Off-Grid: AC input from grid/generator
         'grid_voltage', 'grid_frequency', 'ac_input_power',
         # SPF Off-Grid: Generator sensors
@@ -1091,6 +1260,7 @@ SENSOR_DEVICE_MAP = {
     # Load device - consumption
     DEVICE_TYPE_LOAD: {
         'house_consumption', 'power_to_load', 'power_to_user',
+        'inverter_to_load_l1', 'inverter_to_load_l2',
         'load_energy_today', 'load_energy_total',
         'energy_to_user_today', 'energy_to_user_total',
         'self_consumption',
@@ -1110,6 +1280,12 @@ SENSOR_DEVICE_MAP = {
         'peak_shaving_reserve_soc', 'ac_charge_max_power',
         # WIT: Battery SOH and BMS voltage
         'battery_soh', 'battery_voltage_bms',
+        # Battery working status (VPP 31001) and pack description (31225-31228), #460
+        'battery_working_status',
+        'battery_cluster_sum', 'battery_module_number',
+        'battery_module_rated_voltage', 'battery_module_rated_capacity',
+        # Full-charge capacity per cluster (VPP 31219 / 31319), #482
+        'battery2_full_charge_capacity',
         # SPF Off-Grid AC charge/discharge energy
         'ac_charge_energy_today', 'ac_charge_energy_total',
         'ac_discharge_energy_today', 'ac_discharge_energy_total',
@@ -1122,6 +1298,9 @@ SENSOR_DEVICE_MAP = {
         'bms_module_num', 'bms_battery_count',
         'bms_max_soc', 'bms_min_soc',
         'bms_gauge_rm', 'bms_gauge_fcc', 'bms_fw_version', 'bms_delta_volt',
+        # Battery 1's own energy counters, multi-pack MOD/MID (#451)
+        'battery1_charge_energy_today', 'battery1_charge_energy_total',
+        'battery1_discharge_energy_today', 'battery1_discharge_energy_total',
         # Multi-battery channels (VPP V2.01/V2.03, 31300/31400/31500)
         *(f"battery{n}_{f}" for n in (2, 3, 4) for f in (
             'voltage', 'current', 'power', 'soc', 'soh', 'temp',
@@ -1130,7 +1309,7 @@ SENSOR_DEVICE_MAP = {
         )),
     },
 
-    # Backup Box device — Growatt ARK transfer switch (TL-X/TL-XH only, regs 3281-3342)
+    # Backup Box device — Growatt SYN backup box (TL-X/TL-XH only, regs 3281-3342)
     DEVICE_TYPE_BACKUPBOX: {
         'box_connect_flag',
         'box_bypass_status',
@@ -1216,6 +1395,9 @@ def get_device_type_for_control(control_name: str) -> str:
         'ac_charge_power_rate', 'eod_voltage',
         # SPF off-grid battery controls
         'charge_config', 'charge_current', 'bat_low', 'ac_to_bat',
+        # SPF bulk / float charging voltage (LCD Programs 19/20). Were on the Inverter
+        # device, so an owner looking beside Max Charge Current never found them (#468).
+        'charge_voltage',
         # SPH hybrid battery controls
         'priority_mode', 'time_period', 'ac_charge_enable',
         # MOD GEN4 battery charging gate
@@ -1347,6 +1529,167 @@ SPF_STATUS_CODES = {
     12: {'name': 'PV Charge+Discharge',  'desc': 'PV charging battery while discharging to load'},
 }
 
+# Which off-grid status codes settle whether the utility is carrying the system (#443).
+#
+# Anything with AC in it - charging from the AC input in any combination, or bypassing it
+# straight to the load - proves the utility is present and in use. Discharge, PV Charge and
+# PV Charge+Discharge prove it is not. Standby, No Use, Fault and Flash say nothing either
+# way and defer to the measured AC input voltage.
+SPF_STATUS_AC_INPUT_ACTIVE = frozenset({6, 7, 8, 9, 10, 11})
+SPF_STATUS_AC_INPUT_IDLE = frozenset({2, 5, 12})
+
+# AC input volts above which the supply is considered present. Well clear of a floating
+# input and far below any nominal supply this hardware is sold against.
+SPF_GRID_PRESENT_VOLTS = 50.0
+
+
+# ---------------------------------------------------------------------------
+# Persisting the detected battery power scale (#434)
+#
+# The scale rides the per-entry energy-totals store. Two rules the coordinator got wrong
+# the first time, both of which are one-way failures:
+#
+#   * A save must never drop a scale it is not carrying. The payload is rebuilt from
+#     scratch on every write, so a save in a session that has not restored yet erased the
+#     stored value permanently - and the next restart then had nothing to restore.
+#   * A skip must say why. "Nothing stored" and "stored for a different profile" need
+#     different answers from a reporter, and both used to be silent.
+#
+# Pure, and here rather than in coordinator.py, so the round trip can be tested without
+# Home Assistant - coordinator.py imports it, tests/ cannot.
+# ---------------------------------------------------------------------------
+
+BATTERY_SCALE_STORE_KEY = "battery_power_scale"
+BATTERY_SCALE_PROFILE_KEY = "battery_power_scale_profile"
+
+# The only two values the detector can validate. Anything else in the file is not ours.
+BATTERY_SCALE_VALID = (0.1, 1.0)
+
+
+def profile_register_names(register_map) -> list:
+    """Every field name the selected profile can actually fill, sorted.
+
+    Diagnostics dumps the whole GrowattData dataclass, and a field the profile does not map
+    keeps its declared default - which reads exactly like a measurement. A WIT owner
+    reasonably built a hypothesis on `tl_xh_priority_mode: 3` in his dump; that register
+    (3018) is a MIN TL-XH address his profile has never mapped, and 3 is the default in the
+    dataclass (#448).
+
+    `unread_fields` cannot cover this: it records registers that were *attempted and
+    failed*, and a block the profile does not define is skipped before any attempt.
+
+    So rather than guess which fields are stale - many are legitimately derived, and
+    misclassifying those would mislead in a new way - the dump carries this list and lets
+    the reader check whether a field has any backing register at all.
+    """
+    if not isinstance(register_map, dict):
+        return []
+    names = set()
+    for space in ("input_registers", "holding_registers"):
+        for reg in (register_map.get(space) or {}).values():
+            if not isinstance(reg, dict):
+                continue
+            for key in ("name", "alias", "maps_to"):
+                value = reg.get(key)
+                if value:
+                    names.add(str(value))
+    return sorted(names)
+
+
+def battery_power_scale_from_store(stored, profile_key: str):
+    """(scale, reason) for a stored battery power scale.
+
+    `scale` is None whenever it must not be applied; `reason` is always a short phrase
+    suitable for a log line, including on success.
+    """
+    if not isinstance(stored, dict):
+        return None, "no stored data for this entry"
+
+    scale = stored.get(BATTERY_SCALE_STORE_KEY)
+    if scale is None:
+        return None, "no scale has been stored yet"
+
+    # bool is a subclass of int, and True would otherwise sail through as 1.0.
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+        return None, f"stored value {scale!r} is not a number"
+    if float(scale) not in BATTERY_SCALE_VALID:
+        return None, f"stored value {scale!r} is not a scale this integration writes"
+
+    saved_profile = stored.get(BATTERY_SCALE_PROFILE_KEY)
+    if saved_profile != profile_key:
+        return None, (
+            f"it was validated for profile {saved_profile!r} and this entry now uses "
+            f"{profile_key!r}"
+        )
+    return float(scale), "restored from storage"
+
+
+def battery_power_scale_into_payload(payload: dict, scale, profile_key: str,
+                                     previous=None) -> dict:
+    """Put the scale keys into a payload about to be written.
+
+    With no scale in hand, carry forward whatever the file already held. Rebuilding the
+    payload without these keys is what erased a validated scale between sessions.
+    """
+    if scale is not None:
+        payload[BATTERY_SCALE_STORE_KEY] = float(scale)
+        payload[BATTERY_SCALE_PROFILE_KEY] = profile_key
+        return payload
+
+    if isinstance(previous, dict) and previous.get(BATTERY_SCALE_STORE_KEY) is not None:
+        payload[BATTERY_SCALE_STORE_KEY] = previous[BATTERY_SCALE_STORE_KEY]
+        payload[BATTERY_SCALE_PROFILE_KEY] = previous.get(BATTERY_SCALE_PROFILE_KEY)
+    return payload
+
+
+# Hybrid status table (HYBRID_STATUS_CODES): the same codes as VPP 31000 working state.
+# 5 PV On-Grid and 6 Bat On-Grid are on-grid; 7 PV+Bat Off-Grid and 8 Bat Off-Grid are off.
+# Waiting, Self-Test, Fault, Updating and Bypass do not settle it either way.
+HYBRID_STATUS_ON_GRID = frozenset({5, 6})
+HYBRID_STATUS_OFF_GRID = frozenset({7, 8})
+
+
+def hybrid_grid_connection_status(status: int) -> str:
+    """Grid Connection Status from a hybrid working-state code.
+
+    Used for VPP register 31000 and for the hybrid profiles' own status register alike - the
+    two share one table. The fallback for hybrids without 31000 used to apply the grid-tied
+    reading ("0 = Waiting, 1 = Normal" -> On-grid), so an SPH reported Unknown through the
+    whole of PV On-Grid and Bat On-Grid and On-grid only while Waiting (#474).
+    """
+    if status in HYBRID_STATUS_ON_GRID:
+        return "On-grid"
+    if status in HYBRID_STATUS_OFF_GRID:
+        return "Off-grid"
+    return "Unknown"
+
+
+def offgrid_grid_connection_status(
+    status: int,
+    grid_voltage: float,
+    grid_voltage_unread: bool = False,
+) -> str:
+    """Grid Connection Status for an SPF/SPE, from register 0 and the AC input voltage.
+
+    Register 0 carries `inverter_status` on every family and means different things in
+    each. The grid-tied reading is "0 = Waiting, 1 = Normal", both implying a grid
+    connection - but off-grid 0 is Standby and 1 is No Use, so applying it there returned
+    "On-grid" for the two states that mean the opposite, and "Unknown" for every state an
+    SPF actually runs in. A reporter's sensor had never shown anything but Unknown.
+
+    Lives here rather than in sensor.py so it can be tested against SPF_STATUS_CODES
+    directly instead of through a Home Assistant entity.
+    """
+    if status in SPF_STATUS_AC_INPUT_ACTIVE:
+        return "On-grid"
+    if status in SPF_STATUS_AC_INPUT_IDLE:
+        return "Off-grid"
+    # Nothing in the status code settles it. Fall back to the measurement - but a register
+    # that was not read is not evidence of a mains failure.
+    if grid_voltage_unread:
+        return "Unknown"
+    return "On-grid" if grid_voltage > SPF_GRID_PRESENT_VOLTS else "Off-grid"
+
 # Registers per Modbus request, as offered in the options flow.
 #
 # The keys are what the form stores; the values are what the read path uses, with 0
@@ -1375,6 +1718,78 @@ BLOCK_SIZE_OPTIONS: dict[str, int] = {
     "5 registers": 5,
     "1 register (slowest, most compatible)": 1,
 }
+
+
+# What sits between Home Assistant and the inverter, and the timings that suit it.
+#
+# Every setting here is already adjustable by hand. The problem this solves is that a new
+# user has no way to know which of them matters until something breaks: the defaults are
+# tuned for a dedicated RS485 gateway, and on a Growatt WiFi dongle they produce a specific
+# and confusing failure - transaction IDs that come back exactly one behind, cascading into
+# resets and unavailable entities a minute or two after setup (#433).
+#
+# That cascade is not corruption. pymodbus assigns a transaction ID before its retry loop
+# and reuses it on each resend, so a device slower than the timeout answers both the
+# original request and its retry. One answer satisfies the retry, the second waits in the
+# buffer, and every read after that receives the previous read's answer. Reads then keep
+# timing out, which causes more retries, which leaves more stale answers. Nothing recovers
+# it but restarting the dongle - and it recurs.
+#
+# So the fix is upstream of the mismatches: keep each read short enough to be answered in
+# time, and leave gaps between them. Asking one question at setup does that for the people
+# who would otherwise spend an evening on it.
+#
+# These are STARTING POINTS from field reports, not measured optima, and every value stays
+# editable afterwards. The evidence behind each is in docs/troubleshooting/rs485-gateways.md.
+CONF_GATEWAY_TYPE = "gateway_type"
+
+GATEWAY_TYPE_STANDARD = "Dedicated RS485 gateway or not sure (default timings)"
+GATEWAY_TYPE_GROWATT_DONGLE = "Growatt ShineWiFi-X / ShineLan or PUSR-class bridge (slower)"
+GATEWAY_TYPE_SHINEWILAN_X2 = "Growatt ShineWiLan-X2 dongle"
+
+GATEWAY_PROFILES: dict[str, dict[str, object]] = {
+    # Waveshare, EW11, USR-W630 and similar. The values the integration has always shipped;
+    # these are the adapters they were tuned against and the ones that report clean.
+    GATEWAY_TYPE_STANDARD: {
+        "scan_interval": 60,
+        "timeout": 10,
+        "modbus_delay": 250,
+        "max_block_size": "Auto (recommended)",
+    },
+    # The dongles and bridges that replay stale frames (#360, #367, #433). A 125-register
+    # read is the one least likely to be answered in time, so it is broken into fives of
+    # 25; the delay gives the device time to finish before the next question; the longer
+    # timeout stops a slow-but-alive answer being abandoned and then duplicated. These also
+    # serve Growatt's cloud through the same RS485 master, so the integration is never the
+    # only thing asking.
+    GATEWAY_TYPE_GROWATT_DONGLE: {
+        "scan_interval": 120,
+        "timeout": 15,
+        "modbus_delay": 500,
+        "max_block_size": "25 registers",
+    },
+    # Growatt's own -X2 serves local Modbus TCP alongside its cloud link, which is genuinely
+    # useful, but that server is built for light polling. A WIT owner saw repeated drops
+    # under ordinary polling (#308), and WIT is the most register-hungry profile here. Block
+    # size is left on Auto because nothing has shown it needs lowering - only the rate has.
+    GATEWAY_TYPE_SHINEWILAN_X2: {
+        "scan_interval": 120,
+        "timeout": 10,
+        "modbus_delay": 250,
+        "max_block_size": "Auto (recommended)",
+    },
+}
+
+
+def gateway_tuning(gateway_type: str | None) -> dict[str, object]:
+    """The tuning for a gateway choice, or the standard timings for anything unrecognised.
+
+    Unrecognised rather than empty is deliberate: a stored value from a future version, or
+    a hand-edited entry, should get working defaults rather than nothing at all.
+    """
+    if not gateway_type:
+        return dict(GATEWAY_PROFILES[GATEWAY_TYPE_STANDARD])
+    return dict(GATEWAY_PROFILES.get(gateway_type, GATEWAY_PROFILES[GATEWAY_TYPE_STANDARD]))
 
 
 def is_read_only_register(register_def) -> bool:
@@ -1432,6 +1847,12 @@ PROFILE_STATUS_MAP: dict[str, str] = {
     # uwSysWorkMode) — the actual hybrid status register. Accidental, but correct.
     # Do not "tidy" this without re-checking that fallback.
     'SPA_3000_6000_TL_BL': 'hybrid',
+    # MIN TL-XH2 — no register 0 at all (the base range answers Illegal Function), so
+    # data.status falls through to min_addr, which here is 31000: the VPP working state,
+    # documented with exactly the hybrid table (protocol-vpp.md, row 31000). Unlike the
+    # first-generation TL-XH above, this is not a reg-0 reading. A MIN 3000TL-XH2 with a
+    # battery on-grid read 6, which the standard table has no entry for (#461).
+    'MIN_TL_XH2_3000_10000_V201': 'hybrid',
     # Off-grid — SPF codes.  SPE inherits SPF's input_registers wholesale (see spe.py:47),
     # including `inverter_status` at reg 0 with SPF semantics, so it must use the SPF table.
     'SPF_3000_6000_ES_PLUS': 'spf',
@@ -1520,6 +1941,32 @@ def combine_registers(high: int, low: int) -> int:
     return (high << 16) | low
 
 
+def decode_firmware_build(registers) -> str | None:
+    """V1.39 holding 82-87, "FW Build No.", as the string the Growatt portal shows.
+
+    Each register is one component: 82/83 the model letters, then the DSP1, DSP2/M0,
+    CPLD/AFCI and M3 builds. A unit without one of the trailing processors reports 0 for
+    it - an SPH-TL3 reads 87 = 0 and its other five spell YBAA030308 (#446) - so trailing
+    all-zero registers are dropped rather than failing the whole decode.
+
+    Otherwise None unless every byte is printable ASCII: on other protocol families those
+    addresses hold settings (a TL3-S reads 100, 0, 0, 0, 0, 0 there), and a decode with a
+    NUL in the middle would present a meaningless fragment as a version. At least the
+    model letters and the DSP1 build (82-84) must be present.
+    """
+    if not registers or len(registers) != 6:
+        return None
+    words = [int(r) for r in registers]
+    while words and words[-1] == 0:
+        words.pop()
+    if len(words) < 3:
+        return None
+    raw = b"".join(w.to_bytes(2, "big") for w in words)
+    if not all(0x20 <= b <= 0x7E for b in raw):
+        return None
+    return raw.decode("ascii").strip() or None
+
+
 def scale_value(raw_value: float, scale: float) -> float:
     """Apply scaling factor to raw register value."""
     return raw_value * scale
@@ -1577,4 +2024,38 @@ if __name__ == "__main__":
         print(f"  Combined: {combined}")
         print(f"  Scaled: {scaled}W")
 
+# Shared by BOTH callers that drive the VPP HOLD workaround: the Mode (VPP) select in
+# select.py and the growatt_modbus.set_battery_mode service in diagnostic.py. It lives
+# here because it was fixed in one of them first and the service kept the bug (#423) -
+# a second copy of this arithmetic is exactly how that happens again.
+def hold_tou_periods(current_minutes: int, duration_minutes: int = 120) -> list[tuple[int, int]]:
+    """TOU periods covering a HOLD window that may cross midnight.
 
+    Period words are minutes since midnight and DO NOT WRAP: 1440 is out of range, not
+    00:00 tomorrow. Clamping the end to 1439 - which is what this used to do inline -
+    silently shortened any Hold selected after 21:59. At 23:50 the user got nine minutes
+    instead of two hours; the period expired at midnight, the battery resumed discharging,
+    and the entity went on reporting Hold because `current_option` returns the last
+    commanded mode rather than device state.
+
+    Overnight is when a hold is most likely to be wanted, so the window where the clamp bit
+    hardest was the window it would be used in (#423).
+
+    A window crossing midnight is returned as two periods. The roster holds 20 periods at 3
+    registers each (30412-30471), so a second one is well inside it.
+
+    Returns a list of (start_minute, end_minute) pairs, in write order.
+    """
+    start_min = max(0, current_minutes - 5)
+    raw_end = current_minutes + duration_minutes
+
+    if raw_end <= 1439:
+        return [(start_min, raw_end)]
+
+    periods = [(start_min, 1439)]
+    wrap_end = raw_end - 1440
+    # Exactly 1440 means the window ends at midnight, so there is no second period to
+    # write - a 0-0 period would be degenerate.
+    if wrap_end > 0:
+        periods.append((0, wrap_end))
+    return periods

@@ -6,6 +6,27 @@ Most problems that look like integration bugs turn out to be the box between Hom
 
 ---
 
+## Setup asks what your hardware is
+
+From **v2.0.2**, the TCP setup form has a **Connection hardware** question, and the answer seeds four polling settings:
+
+| Answer | Scan interval | Timeout | Request delay | Block size |
+|---|---|---|---|---|
+| Dedicated RS485 gateway or not sure | 60 s | 10 s | 250 ms | Auto |
+| Growatt ShineWiFi-X / ShineLan or PUSR-class bridge | 120 s | 15 s | 500 ms | 25 registers |
+| Growatt ShineWiLan-X2 | 120 s | 10 s | 250 ms | Auto |
+
+Every setting it touches was already adjustable by hand. The question exists because there was no way to know *which* of them mattered before something broke — the defaults suit a dedicated gateway, and on a Growatt WiFi dongle they produce the transaction-ID cascade described below, a minute or two after setup ([#433](https://github.com/0xAHA/Growatt_ModbusTCP/issues/433)).
+
+These are **starting points from field reports, not measured optima.** The evidence behind each row is in the sections that follow, and every value stays editable in **Configure**.
+
+!!! note "Changing it later will not overwrite your own tuning"
+    The same question appears in **Configure**. Changing the answer re-applies that hardware's timings — but only to the fields still sitting at their stored value. Anything you edit in the same save is kept as you set it, so a block size you arrived at over an evening survives answering a question about your adapter.
+
+    Existing entries have no stored answer and show "Dedicated RS485 gateway or not sure". That is not a change, so saving does nothing to your settings.
+
+---
+
 ## The one setting that matters most
 
 Your gateway must do **Modbus TCP to RTU translation**, not transparent passthrough.
@@ -85,6 +106,8 @@ These can return **a complete, valid response to an earlier request** when answe
 
 Since v1.3.7 the integration detects this and discards the frame, so the data is safe — but you will see `Short/misaligned read at N: got X of Y registers` warnings. If you are on an older version, this is the failure mode that published a serial-number fragment as 85,893,614.8 W of AC power.
 
+A replayed frame of the *same* length is caught one layer lower instead, as a transaction ID mismatch — see [Are the transaction IDs exactly one behind?](#diagnosing-your-own-gateway) below. A ShineWiFi-X USB dongle produced that signature in [#433](https://github.com/0xAHA/Growatt_ModbusTCP/issues/433). Note these dongles also serve Growatt's cloud through the same RS485 master, so the integration is never the only thing asking questions.
+
 Two settings materially improved a PUSR unit on #360:
 
 | Setting | Change | Why |
@@ -100,7 +123,64 @@ Reported in [#367](https://github.com/0xAHA/Growatt_ModbusTCP/issues/367). Repea
 
 ## Diagnosing your own gateway
 
+**Does nothing answer at all?** If every read times out, on every unit ID, from the
+integration and from a standalone client alike, with no Modbus *exception* ever coming back,
+nothing on that wire is answering. A wrong unit ID or unsupported register still gets a
+reply, just a refusal. Look at the inverter's own side before the gateway:
+
+- **Baud rate.** Growatt documents the RS485 port as 9600 *or* 38400 baud (VPP register
+  30113). A gateway at the wrong speed produces exactly this silence.
+- **Communication address**, on the inverter's display. It can be anything up to 247, not
+  only 1.
+
+A MID 30KTL3-XH on a correctly configured Waveshare, wired to COM pins 3/4, answered nothing
+until both the gateway's baud rate and the inverter's address were changed to match
+([#459](https://github.com/0xAHA/Growatt_ModbusTCP/issues/459)).
+
 **Is it replaying stale frames?** Look for `Short/misaligned read` warnings. Note whether the count returned is *larger* than requested — a reply longer than the request cannot be a truncation, and points at a replayed earlier response.
+
+**Are the transaction IDs exactly one behind?** A log full of
+
+```text
+ERROR: request ask for transaction_id=196 but got id=195, Skipping.
+ERROR: request ask for transaction_id=198 but got id=197, Skipping.
+```
+
+is a different fault from the replayed frames above, and the distinguishing feature is that the gap is **always one**, never two or random. That is not corruption — it is a slow gateway answering a request twice:
+
+1. A read goes out. The gateway takes longer to answer than the **Connection Timeout**.
+2. pymodbus stops waiting and re-sends the request. It reuses the *same* transaction ID on a retry — the ID is assigned before the retry loop, not inside it.
+3. The gateway, which was never dead, eventually answers **both** copies.
+4. One answer satisfies the retry; the second is left in the receive buffer.
+5. The next read asks for ID N+1, finds N waiting, and skips it.
+
+Every answer in the stream now belongs to the previous question, so reads keep timing out, which causes more retries, which leaves more stale answers. It is self-sustaining: communication is normal for the first half-minute after the gateway is restarted and then never recovers on its own. Reported on a ShineWiFi-X in [#433](https://github.com/0xAHA/Growatt_ModbusTCP/issues/433), where a fresh socket showed the same signature at `2 / 1` — the counter restarts at 1 and the second transaction is already behind.
+
+The root cause is response latency exceeding the timeout, so the fix is upstream of the mismatches: **take Max Register Block Size down** (a 125-register read is far less likely to be answered in time than five short ones), **raise Modbus Request Delay** to 500-1000 ms, and **raise Scan Interval**. Raising the Connection Timeout also stops the retry duplicating the request, but a genuinely wedged read then costs a minute before the poll gives up — try the other three first.
+
+Quickest route: set **Connection hardware** to the Growatt dongle option in **Configure**, which applies all four in one step — see [Setup asks what your hardware is](#setup-asks-what-your-hardware-is).
+
+!!! info "A gateway that hangs up is reconnected to immediately"
+    Two failures look similar in a log and are not the same thing. A gateway that stops
+    *answering* is usually busy, and opening another socket queues behind whatever is
+    stalling it — so from the second consecutive failure the integration waits before
+    reconnecting, 2 s doubling to 32 s.
+
+    A gateway that **closes** the connection is different: there is nothing to queue behind,
+    and the only way back is a new socket. From **v2.0.3** that case skips the wait entirely.
+
+    Before v2.0.3 both were treated the same, which on a ShineWiFi-X that drops its end
+    regularly meant a blip that used to be recovered mid-poll took the entities offline
+    instead ([#433](https://github.com/0xAHA/Growatt_ModbusTCP/issues/433)). If you are on
+    v1.10.0 through v2.0.2 and see `not reconnecting yet: ...s of the post-failure quiet
+    window remain` in a debug log, that is this.
+
+!!! warning "Smaller blocks do not always help this dongle"
+    On the ShineWiFi-X in [#433](https://github.com/0xAHA/Growatt_ModbusTCP/issues/433) the preset above was **not** enough. With 25-register blocks the log filled with frames of **125 and 20 registers** answering requests for four to eight — sizes nothing in the poll asks for, so they are not truncations of our reads. 17 of 200 requests (8%) came back as somebody else's answer.
+
+    That points at the dongle putting its own Modbus traffic on the same session, which no setting on this side controls. Since **v2.0.2-b7** a discarded frame is re-read once instead of costing the whole block, which recovers most of them — the data was never at risk, but the reads were being lost.
+
+    If it still drops out after that, the durable fix is a dedicated RS485 adapter rather than the dongle's local server.
 
 **Is latency per-request or per-register?** This decides whether a smaller block size helps or hurts. Read the same register range at several block sizes and compare total time:
 
@@ -157,6 +237,26 @@ The integration holds one socket per host:port across polls. It was suspected of
 
 ---
 
+## Two *integrations* on one adapter — only one of them will work
+
+A USB RS485 adapter can be opened by **one program at a time**. If another Growatt
+integration is installed and reading the same adapter, this one gets nothing: every read
+times out, no sensor ever populates, and the symptom is identical to a wrong unit ID or bad
+wiring.
+
+Reported in [#432](https://github.com/0xAHA/Growatt_ModbusTCP/issues/432), where the same
+adapter and unit ID were demonstrably working in another integration at the same time — which
+is exactly what made it look like our problem.
+
+**Disable or remove the other integration, then reload this entry.** Not just its entities —
+the integration itself, so it releases the port.
+
+The "no response since setup" repair notice lists this among the causes to check. It is not
+the same thing as the section below, which is about several inverters inside *this*
+integration sharing one bus.
+
+---
+
 ## Two or more inverters on one adapter
 
 If you run several inverters as separate integration entries over **one** USB-RS485 adapter or one gateway, they share a single physical bus. Only one master can be talking at a time.
@@ -164,6 +264,26 @@ If you run several inverters as separate integration entries over **one** USB-RS
 The integration handles this for you: every entry pointing at the same device path (or the same host:port) shares one connection and one lock, so their reads are queued rather than interleaved. Nothing to configure.
 
 **Serial setups need v1.7.0 or later for this.** Before that, only TCP entries were coordinated — each serial entry opened its own client on the same adapter and paced only itself, which produced random read failures on *all* the inverters sharing that bus. If you have two entries on one adapter and see unexplained dropouts, this is the first thing to rule out.
+
+### WIT: every unit answers on address 1, whatever ShineTools says
+
+Sharing a bus depends on each inverter having its own Modbus address. **On the WIT HU15 the
+EMS/VPP RS485 address cannot be changed** - confirmed on firmware `3030` and `5050`, across
+two units. Setting the EMS COM address to 2, and separately to 3, in ShineTools was accepted
+and then read back as 1, and a standalone Modbus client found each unit answering only on 1
+([#414](https://github.com/0xAHA/Growatt_ModbusTCP/issues/414)).
+
+So **two such WITs on one shared RS485 bus collide**: both answer every request addressed to
+1, and neither reads reliably. It looks like an intermittent fault between the two, and the
+tell is that unplugging either inverter's RS485 line immediately steadies the other.
+Separate TCP ports or separate IPs on the network side do not help if the RS485 side behind
+them is one bus.
+
+Give each unit an RS485 bus of its own - a separate adapter, or a separate channel on a
+multi-channel gateway where that channel is genuinely its own bus rather than a shared one.
+The only other route is Growatt's own parallel / master-slave arrangement. Growatt does not
+publish firmware changelogs, so whether a later release honours the setting is unknown; test
+it with a standalone client before relying on it.
 
 ### Two adapters: check they are actually two
 
@@ -232,3 +352,13 @@ Occasional dropped frames are normal on RS485 and cannot be eliminated entirely.
 You do not necessarily have to choose. On both systems in #367 the inverter has a **`SYS COM` port separate from the USB port the ShineWiFi dongle occupies**, so a second RS485 master can run alongside the stock dongle. Home Assistant gets a local Modbus path, and the dongle keeps feeding Growatt's own app.
 
 Note this is one local path and one cloud path — not two paths into Home Assistant. If you keep the dongle, be aware the Growatt cloud can overwrite local writes to control registers within seconds; the integration logs a `Write reversion detected` warning when it sees this.
+
+### Sharing one port with a broker (community tool)
+
+If your inverter has only one free port, [growatt-rtu-broker](https://github.com/l4m4re/growatt-rtu-broker)
+by @l4m4re runs on a Raspberry Pi between the inverter and everything that talks to it: a
+Shine dongle and one or more Home Assistant instances share a single RS485 link, each
+connection optionally read-only. It also has a sniffer port that logs the traffic between
+the dongle and the inverter, which shows exactly what the Growatt app and portal write.
+It is experimental and third-party, and has not been tested with this integration by us
+([#458](https://github.com/0xAHA/Growatt_ModbusTCP/issues/458)).

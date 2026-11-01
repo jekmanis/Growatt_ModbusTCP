@@ -1,6 +1,6 @@
-# VPP Protocol (V2.03)
+# VPP Protocol (V2.03-V2.05)
 
-!!! info "This page is current to V2.03"
+!!! info "This page is based on V2.03, with V2.04 and V2.05 changes marked"
 
     The integration labels profiles and the protocol-variant option **"VPP V2.01"**, and
     that name is kept for compatibility with existing configurations. The register
@@ -9,6 +9,20 @@
     on/off-grid switch) and the bypass value on register 30101.
 
     If a distributor hands you "V2.03" documentation, it is the same document we work from.
+
+    **V2.04 and V2.05** changes are marked in the tables, taken from the V2.05 document
+    (2026-05-29). Field reports: `30099 = 204` on a WIT 4-15K-HU
+    ([#481](https://github.com/0xAHA/Growatt_ModbusTCP/issues/481)) and `30099 = 205` on a
+    MOD 12KTL3-HU ([#480](https://github.com/0xAHA/Growatt_ModbusTCP/issues/480)).
+
+    - **V2.04** (2026-03-26): CT values on 30200, USB values on 30204, AC charge limit II
+      (30216), battery wake-up (30495), PV total energy (input 31060), third-party, GEN,
+      EPS and intelligent-load power (input 31126-31133), per-cluster battery status
+      (input 31229, +100 per cluster), alarm codes renamed protection codes, and wider
+      ranges on 30206, 30215, 30302 and 30303.
+    - **V2.05** (2026-05-29): per-period priorities at 30380-30399, the clearing rule on
+      30477, and the remote-control logic diagram, which shows that a 30408 window of
+      1-1440 minutes expires to self-consumption.
 
 > **Source documents:** Growatt VPP Communication Protocol of Inverter V2.03, with V2.01
 > for comparison
@@ -52,7 +66,7 @@ that model has, for most entries, never been verified against hardware. See
 
 | DTC | Model | Profile to select | Mapping |
 | --- | --- | --- | --- |
-| 3501 | SPH 3000-6000TL BL | SPH (3-6kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 3501 | SPH 3000-6000TL BL | SPH (3-6kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
 | 3502 | SPH 3000-6000TL BL-UP | SPH (3-6kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
 | 3503 | SPH 3000-6000TL HU | SPH (3-6kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
 | 3504 | SPH 3000-6000TL HUB | SPH (3-6kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
@@ -62,6 +76,10 @@ that model has, for most entries, never been verified against hardware. See
 | 3716 | SPA 3000-6000TL AUB | SPH (3-6kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
 | 3725 | SPA-TL3 4-10kW | SPA-TL3 (AC Storage, 3-Phase) 4-10kW | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
 | 3735 | SPA 3000TL BL-UP | SPH (3-6kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 21304 | SPM 3000-6000TL-HU | SPH/SPM HU (8-10kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
+| 21305 | SPM 3000-6000TL-HU(BR) | SPH/SPM HU (8-10kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 21308 | SPM 3000-6000TL-HU(IT) | SPH/SPM HU (8-10kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 21309 | SPM 2500-6000TL-HU(EU) | SPH/SPM HU (8-10kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
 | 5001 | MID 17-25KTL3-X; MID 20-30KTL3-X2; MID 25-30KTL3-X2 Pro/X2 Pro.E; MID 33-50KTL3-X2/X2 Pro/X2 Pro.E; MID 30-40KTL3-X; MID 33-36KTL3-X(Pro.E); MID 3-33KTL3-X3 | MID (15-25kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
 | 5002 | MOD 3-15KTL3-X; MOD 3-15KTL3-X2(Pro); MOD 12-20KTL3-X2; MOD 12-20KTL3-X2(E); MOD 3-33KTL3-X3 | MID (15-25kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
 | 5003 | MAC 30-70KTL3-X; MAC 15-36KTL3-XL; MAC 50-70KTL3-X2; MAC 30-36KTL3-XL2 | MID (15-25kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
@@ -76,8 +94,10 @@ that model has, for most entries, never been verified against hardware. See
 | 5401 | MOD 3-15KTL3-HU; MID 33-50KTL3-HU | MOD Hybrid (6-15kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
 | 5600 | WIS 100K-AM; WIT 50-100K-H/HE/HU/A/AE/AU (incl. -US); WIT 28-55K-H/HE/HU/A/AE/AU-US L2 | WIT (29.9-50kW XHU) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
 | 5601 | WIT 29.9-50K-XHU | WIT (29.9-50kW XHU) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
-| 5800 | WIS 210K | MID (15-25kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
-| 5801 | WIS 215K-AM | MID (15-25kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 5603 | WIT 4-15K-HU; WIT 17-25K-HU | WIT (4-15kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
+| 5604 | WIS 125K-AM | WIT (29.9-50kW XHU) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 5605 | WIT 4-25K-XHU | WIT (4-15kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
+| 5801 | WIS 200-215K-AMA | MID (15-25kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
 
 </div>
 
@@ -93,13 +113,15 @@ that model has, for most entries, never been verified against hardware. See
 
 | DTC | Model | Profile to select | Mapping |
 | --- | --- | --- | --- |
-| 5603 | WIT 4-15kW Hybrid | WIT (4-15kW) | :material-check-circle:{ .dtc-ok }&nbsp;Confirmed |
+| 5800 | WIS 210K | MID (15-25kW) | :material-help-circle:{ .dtc-unknown }&nbsp;Unconfirmed |
 
 </div>
 
-> **WIT residential models (4-15KTL3):** The VPP V2.03 spec (dated 2025.9.1) does **not** include the WIT 4-15KTL3 residential series in its DTC table — only commercial WIT (50K-100K) models appear. DTC 5603 was confirmed by a live register read (register 30000 = 5603 on a WIT 15KTL3, Issue #335) with protocol version register 30099 = 203, so the residential range follows V2.03 register structure despite being omitted from the spec's device table.
+> **5800 (WIS 210K)** was listed up to V2.03 and is absent from the V2.05 table. It stays mapped for units that still report it.
+>
+> **Changes from V2.03:** V2.05 adds the SPM-HU codes (21304-21305, 21308-21309), the residential WIT codes 5603 and 5605, and 5604 (WIS 125K-AM), and renames 5801 to WIS 200-215K-AMA. 5603 and 21304 were already mapped here from hardware (#335, #463) before the document listed them.
 
-**Non-VPP models** are not listed here. Legacy V1.39 devices (MIC 2500-5500MTL-S, TL3-S, SPH/SPM 8000-10000TL-HU), off-grid SPF (3400-3403) and SPE (64541) carry their DTC at holding register **43** rather than 30000. They appear in the [full DTC reference](../troubleshooting/dtc-debugging.md).
+**Non-VPP models** are not listed here. Legacy V1.39 devices (MIC 2500-5500MTL-S, TL3-S, SPH/SPM 8000-10000TL-HU), off-grid SPF (3400-3403, and 20105 for the SPF 5000 ES) and SPE (64541) carry their DTC at holding register **43** rather than 30000. They appear in the [full DTC reference](../troubleshooting/dtc-debugging.md).
 
 ---
 
@@ -168,23 +190,24 @@ that model has, for most entries, never been verified against hardware. See
 | 30162 | Power factor | RW | UINT16 | - | 1 | [0,2000] ∪ [18000,20000], Default: 20000, Actual PF = (set value - 10000) * 0.0001 |
 | 30163 | Reserve | RW | INT16 | % | 1 | - |
 | 30164 | Reserve (reactive power curve) | RW | UINT16 | - | 36 | - |
-| 30200 | Export Limitation Enable | RW | UINT16 | - | 1 | 0: not enabled, 1: single machine enable, Default: 0 |
+| 30200 | Export Limitation Enable | RW | UINT16 | - | 1 | 0: not enabled, 1: single machine enable (meter), Default: 0. V2.04 adds 2: reserved, 3: external CT, 4: internal CT - 3/4 on some models only (commercial ES) |
 | 30201 | Export Limitation power Rate | RW | INT16 | % | 1 | [-100,100], Default: 0, Positive=backflow, negative=fair current |
-| 30202 | Export Limitation Failure power Rate | RW | UINT16 | % | 1 | [0,100], Default: 0 |
-| 30203 | EMS Communicating Failure Time | RW | UINT16 | S | 1 | [1,300], Default: 30 |
-| 30204 | EMS Communication Failure Enable | RW | UINT16 | - | 1 | 0: not enabled, 1: enable, Default: 0 |
+| 30202 | Export Limitation Failure power Rate | RW | UINT16 | % | 1 | [0,100], Default: 0. V2.04 name: export power limit percentage in failure; 30202-30203 are shared |
+| 30203 | EMS Communicating Failure Time | RW | UINT16 | S | 1 | [1,300], Default: 30. V2.04 name: communication failure time; the inverter keeps normal power for this long after communication fails |
+| 30204 | EMS Communication Failure Enable | RW | UINT16 | - | 1 | 0: not enabled, 1: RS485 failure enable, Default: 0. V2.04 adds 2: USB failure, 3: either RS485 or USB fails, 4: both fail |
 | 30205 | Super Export Limitation enable | RW | UINT16 | - | 1 | 0: not enabled, 1: enable, Default: 0 |
-| 30206 | Export Limitation change slope | RW | UINT16 | *0.01%Pn/s | 1 | [1,20000], Default: 27 |
+| 30206 | Export Limitation change slope | RW | UINT16 | *0.01%Pn/s | 1 | [1,20000], Default: 27. V2.04 range: [0,20000] |
 | 30207 | Export Limitation single phase control enable | RW | UINT16 | - | 1 | 0: not enabled, 1: enable, Default: 0 |
 | 30208 | Export Limitation protection mode | RW | UINT16 | - | 1 | 0: Default mode, 1: Combine control, 2: software control, 3: hardware control, Default: 0 — **not used by SPH/SPA/WIT/WIS** (per spec Note 2) |
 | 30209 | Automatic on/off-grid switch enable (V2.03) | RW | UINT16 | - | 1 | 0: Automatic, 1: Manual, Default: 0 |
 | 30210 | On/off-grid set (V2.03) | RW | UINT16 | - | 1 | 0: on-grid, 1: off-grid, 2: diesel engine mode, Default: 0 — settable only when 30209=1 (Manual) |
-| 30211 | Active power R (V2.03) | RW | UINT16 | 0.1kW | 1 | [0, rated power/3] |
-| 30212 | Active power S (V2.03) | RW | UINT16 | 0.1kW | 1 | [0, rated power/3] |
-| 30213 | Active power T (V2.03) | RW | UINT16 | 0.1kW | 1 | [0, rated power/3] |
+| 30211 | Active power R (V2.03) | RW | UINT16 | 0.1kW | 1 | [0, rated power/3], Default (V2.04): rated power/3 |
+| 30212 | Active power S (V2.03) | RW | UINT16 | 0.1kW | 1 | [0, rated power/3], Default (V2.04): rated power/3 |
+| 30213 | Active power T (V2.03) | RW | UINT16 | 0.1kW | 1 | [0, rated power/3], Default (V2.04): rated power/3 |
 | 30214 | Single phase active power control enable (V2.03) | RW | UINT16 | - | 1 | 0: not enabled, 1: enable, Default: 0 |
-| 30215 | AC charge power max limitation (V2.03) | RW | UINT16 | 0.1kW | 1 | [0, rated power], Default: no limit — active only when 30410 is enabled |
-| 30216 | Reserve | RW | UINT16 | - | 34 | - |
+| 30215 | AC charge power max limitation (V2.03) | RW | UINT16 | 0.1kW | 1 | [0, rated power], Default: no limit — active only when 30410 is enabled. V2.04 range: [0,65535], 65535 = not limited |
+| 30216 | AC charge power max limitation II (V2.04) | RW | UINT16 | 0.1kW | 1 | [0,65535], 65535 = not limited. The lower of 30215 and 30216 applies. Not stored |
+| 30217 | Reserve | RW | UINT16 | - | 33 | - |
 | 30250 | Diesel engine rated power (V2.03) | RW | UINT16 | 0.1kW | 1 | [0,10000], Default: inverter rated power |
 | 30251 | Diesel engine charge power (V2.03) | RW | UINT16 | 0.1kW | 1 | [0,10000], Default: inverter rated power |
 | 30252 | Diesel engine enable (V2.03) | RW | BOOL | - | 1 | 0: not enabled, 1: enable, Default: 0 |
@@ -194,11 +217,12 @@ that model has, for most entries, never been verified against hardware. See
 | 30256 | Reserve | RW | UINT16 | - | 44 | - |
 | 30300 | Battery cluster index | RW | UINT16 | - | 1 | [0,3], Default: 0 |
 | 30301 | Demand management enable (V2.03) | RW | UINT16 | - | 1 | 0: not enabled, 1: enable, Default: 0 |
-| 30302 | Demand management export power limitation (V2.03) | RW | UINT16 | 0.1kW | 1 | [0, rated power], Default: no limit |
-| 30303 | Demand management import power limitation (V2.03) | RW | UINT16 | 0.1kW | 1 | [0, rated power], Default: no limit |
+| 30302 | Demand management export power limitation (V2.03) | RW | UINT16 | 0.1kW | 1 | [0, rated power], Default: no limit. V2.04 range: [0,65535], 65535 = not limited |
+| 30303 | Demand management import power limitation (V2.03) | RW | UINT16 | 0.1kW | 1 | [0, rated power], Default: no limit. V2.04 range: [0,65535], 65535 = not limited |
 | 30304 | Peak-shaving backup power SOC (V2.03) | RW | UINT16 | % | 1 | [0,100], Default: 50 |
 | 30305 | Peak-shaving enable (V2.03) | RW | UINT16 | - | 1 | 0: not enabled, 1: enable, Default: 0 |
-| 30306 | Reserve | RW | UINT16 | - | 94 | - |
+| 30306 | Reserve | RW | UINT16 | - | 94 | - (V2.05: 74, ending at 30379) |
+| 30380 | Time period priority, periods 1-20 (V2.05) | RW | UINT16 | - | 20 | 0: Load first, 1/2: battery/grid first from the sign of the period's power, 3: PV-only storage, 4: idle charging, 6: idle, 5/7: reserved. Default: 1 |
 | 30400 | Reserve (Battery max charging power) | RW | UINT32 | 0.1W | 2 | Not used |
 | 30402 | Reserve (Battery max discharging power) | RW | UINT32 | 0.1W | 2 | Not used |
 | 30404 | Charging cut off SOC | RW | UINT8 | % | 1 | [10,100], Default: 100 |
@@ -207,18 +231,19 @@ that model has, for most entries, never been verified against hardware. See
 | 30407 | Remote power control enable | RW | UINT8 | - | 1 | 0: not enabled, 1: Enable, Default: 0, Not storage |
 | 30408 | Remote power control charging time | RW | UINT16 | min | 1 | 0: unlimited, 1~1440min, Default: 0, Not storage |
 | 30409 | Remote charge and discharge power | RW | INT16 | - | 1 | [-100,100], Positive=charging, Negative=discharge, Default: 0, Not storage |
-| 30410 | AC charging enable | RW | UINT8 | - | 1 | 0: not enabled, 1: Enable AC charge (PV charging first), 2: Enable AC charge (AC charging first) (V2.03), Default: 0 |
+| 30410 | AC charging enable | RW | UINT8 | - | 1 | 0: not enabled, 1: Enable AC charge (PV charging first), 2: Enable AC charge (AC charging first) (V2.03; V2.05 words it as grid charging only), Default: 0 |
 | 30411 | Charging and discharging in different periods (20 sections) | RW | UINT16 | - | 61 | See Table 3-2, 30412~30471 default: 0 |
 | 30472 | Reserve | RO | UINT16 | - | 2 | - |
 | 30474 | Actual control value of charging and discharging power | RO | UINT16 | - | 1 | [-100,100], Positive=charging, Negative=discharge |
 | 30475 | Offline discharge cut off SOC | RW | UINT16 | % | 1 | [10,100], Default: 10 |
 | 30476 | TOU default mode (V2.03) | RW | UINT8 | - | 1 | Mode outside configured TOU periods: 0: load first, 1: battery first, 2: grid first, Default: 0 |
-| 30477 | TOU reset enable (V2.03) | RW | UINT8 | - | 1 | [0,1] — when enabled, all existing TOU period data is cleared on next period write, Default: 0 |
-| 30478 | Reserve | RW | UINT16 | - | 18 | - |
-| 30496 | Battery charge stop voltage | RW | UINT16 | 0.1V | 1 | Lead-acid only, [0,15000] |
-| 30497 | Battery discharge stop voltage | RW | UINT16 | 0.1V | 1 | Lead-acid only, [0,15000] |
-| 30498 | Battery max charge current | RW | UINT16 | 0.1A | 1 | Lead-acid only, [0,2000], Default: 1500 |
-| 30499 | Battery max discharge current | RW | UINT16 | 0.1A | 1 | Lead-acid only, [0,2000], Default: 1500 |
+| 30477 | TOU reset enable (V2.03) | RW | UINT8 | - | 1 | [0,1] — when enabled, all existing TOU period data is cleared on next period write, Default: 0. V2.05: the next write to 30411 clears 30380-30399 and 30412-30471 |
+| 30478 | Reserve | RW | UINT16 | - | 17 | - |
+| 30495 | Battery wake-up (V2.04) | W | UINT16 | - | 1 | Write 1 to send a wake-up command to the battery |
+| 30496 | Battery charge stop voltage | RW | UINT16 | 0.1V | 1 | Lead-acid only, [0,15000]. V2.04 defaults, C&I ES: 6500 (127 V), 10000 (227 V), 8000 otherwise |
+| 30497 | Battery discharge stop voltage | RW | UINT16 | 0.1V | 1 | Lead-acid only, [0,15000]. V2.04 defaults, C&I ES: 3800 (127 V), 7500 (227 V), 6500 otherwise |
+| 30498 | Battery max charge current | RW | UINT16 | 0.1A | 1 | Lead-acid only, [0,2000], Default: 1500. V2.04: C&I ES only, default per model |
+| 30499 | Battery max discharge current | RW | UINT16 | 0.1A | 1 | Lead-acid only, [0,2000], Default: 1500. V2.04: C&I ES only, default per model |
 | 30500 | Safety Information | RW | UINT16 | - | 500 | See GROWATT INVERTER VPP COMMUNICATION PROTOCOL & SAFETY PARAMETERS |
 | 32000 | Reserve | RW | UINT16 | - | 100 | - |
 
@@ -321,8 +346,8 @@ to 100 on its own has since failed to reproduce and should not be relied on.
 | 31003 | Reserve | RO | UINT16 | - | 2 | - |
 | 31005 | Fault code | RO | UINT16 | - | 1 | See Table 3-3 |
 | 31006 | Fault sub code | RO | UINT16 | - | 1 | See Table 3-3 |
-| 31007 | Alarm code | RO | UINT16 | - | 1 | See Table 3-4 |
-| 31008 | Alarm sub code | RO | UINT16 | - | 1 | See Table 3-4 |
+| 31007 | Alarm code | RO | UINT16 | - | 1 | See Table 3-4. V2.04 renames it protection code |
+| 31008 | Alarm sub code | RO | UINT16 | - | 1 | See Table 3-4. V2.04 renames it protection sub code |
 | 31009 | Reserve | RO | UINT16 | - | 1 | - |
 | 31010 | PV1 voltage | RO | INT16 | 0.1V | 1 | - |
 | 31011 | PV1 current | RO | INT16 | 0.1A | 1 | - |
@@ -358,7 +383,8 @@ to 100 on its own has since failed to reproduce and should not be relied on.
 | 31041 | PV16 current | RO | INT16 | 0.1A | 1 | - |
 | 31042 | Reserve | RO | INT16 | - | 16 | - |
 | 31058 | PV input power | RO | INT32 | 0.1W | 2 | - |
-| 31060 | Reserve | RO | UINT32 | - | 40 | - |
+| 31060 | PV total energy (V2.04) | RO | UINT32 | 0.1kWh | 2 | - |
+| 31062 | Reserve | RO | UINT32 | - | 38 | - |
 | 31100 | Active power | RO | INT32 | 0.1W | 2 | Positive:export to grid, Negative:import from grid — **grid-tied MID models:** this is inverter AC output only; use Meter Power (31112) for actual grid exchange |
 | 31102 | Reactive power | RO | INT32 | 0.1VAR | 2 | - |
 | 31104 | Reserve | RO | INT16 | - | 1 | - |
@@ -378,7 +404,11 @@ to 100 on its own has since failed to reproduce and should not be relied on.
 | 31120 | Total power to user | RO | UINT32 | 0.1KWH | 2 | - |
 | 31122 | Power to grid daily | RO | UINT32 | 0.1KWH | 2 | - |
 | 31124 | Total power to grid | RO | UINT32 | 0.1KWH | 2 | - |
-| 31126 | Reserved | RO | INT16 | - | 74 | - |
+| 31126 | Third-party inverter active power (V2.04) | RO | UINT32 | 0.1W | 2 | - |
+| 31128 | GEN port active power (V2.04) | RO | UINT32 | 0.1W | 2 | GEN port may carry third-party inverters, intelligent loads or a generator |
+| 31130 | EPS off-grid active power (V2.04) | RO | UINT32 | 0.1W | 2 | - |
+| 31132 | Independent intelligent load active power (V2.04) | RO | UINT32 | 0.1W | 2 | Only DTC 21304-21305 and 21308-21309 |
+| 31134 | Reserved | RO | UINT16 | - | 66 | - |
 | 31200 | Charge/discharge power | RO | INT32 | 0.1W | 2 | Positive:charging, Negative:discharge |
 | 31202 | Daily charge of battery | RO | UINT32 | 0.1KWH | 2 | - |
 | 31204 | Cumulative charge of battery | RO | UINT32 | 0.1KWH | 2 | - |
@@ -390,7 +420,7 @@ to 100 on its own has since failed to reproduce and should not be relied on.
 | 31215 | Battery current | RO | INT32 | 0.1A | 2 | Positive:charging, Negative:discharge |
 | 31217 | SOC | RO | UINT8 | - | 1 | [0,100] |
 | 31218 | SOH | RO | UINT8 | - | 1 | [0,100] |
-| 31219 | Battery capacity rating (FCC) | RO | UINT32 | AH | 2 | - |
+| 31219 | Battery capacity rating (FCC) | RO | UINT32 | 0.1AH | 2 | V2.05 unit; confirmed by a MID 25KTL3-XH cluster reading 4160 for four 104.0 Ah modules, dropping 1040 per module put to sleep ([#482](https://github.com/0xAHA/Growatt_ModbusTCP/issues/482)) |
 | 31221 | Reserved | RO | UINT32 | AH | 2 | Reserved for Battery remaining capacity (RM) |
 | 31223 | Battery environmental temperature | RO | INT16 | 0.1℃ | 1 | [-400,1250] |
 | 31224 | Reserved | RO | INT16 | 0.1℃ | 1 | Reserved for Maximum battery temperature |
@@ -398,7 +428,8 @@ to 100 on its own has since failed to reproduce and should not be relied on.
 | 31226 | Single Cluster Module Number | RO | UINT16 | 1 | 1 | - |
 | 31227 | Module Rated Voltage | RO | UINT16 | 0.1V | 1 | - |
 | 31228 | Module Rated Cap | RO | UINT16 | 0.1AH | 1 | - |
-| 31229 | Reserve | RO | UINT16 | - | 71 | - |
+| 31229 | Battery operating status (V2.04) | RO | UINT16 | - | 1 | 0: idle, 1: cut-off, 2: charge, 3: discharge, 4: fault, 5: upgrading. Clusters 2-4 at 31329, 31429, 31529 |
+| 31230 | Reserve | RO | UINT16 | - | 70 | - |
 | 31300 | Battery Information 2 | RO | - | - | 100 | Refer to 31200~31299 |
 | 31400 | Battery Information 3 | RO | - | - | 100 | Refer to 31200~31299 |
 | 31500 | Battery Information 4 | RO | - | - | 100 | Refer to 31200~31299 |

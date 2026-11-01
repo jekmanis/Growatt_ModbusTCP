@@ -16,10 +16,12 @@ import homeassistant.helpers.config_validation as cv
 
 from .const import (
     DOMAIN,
+    CONF_DEVICE_PATH,
     CONF_INVERTER_SERIES,
     SERVICE_BUS_TIMEOUT,
     WIT_AC_CHARGE_MODES,
     WIT_MODES,
+    hold_tou_periods,
     resolve_block_size,
 )
 from .device_profiles import fill_register_map, get_display_name_for_profile, get_profile
@@ -137,7 +139,7 @@ UNIVERSAL_SCAN_RANGES = [
     # address we could point at (#360). Harmless on non-SPA models — the range simply
     # does not respond.
     {"name": "SPA Extended 2000-2124",   "start": 2000,  "count": 125, "group": "storage"},
-    # MIN/MOD extended data ranges (input registers FC03)
+    # MIN/MOD extended data ranges (input registers, FC04)
     {"name": "MIN/MOD Range 3000-3124",         "start": 3000, "count": 125, "group": "mod_extended"},
     {"name": "MOD Extended 3125-3249",          "start": 3125, "count": 125, "group": "mod_extended"},
     {"name": "MOD/TL-XH Extended Input 3250-3374",    "start": 3250, "count": 125, "group": "mod_extended"},
@@ -145,7 +147,7 @@ UNIVERSAL_SCAN_RANGES = [
     # (TOU schedule, charge/discharge control, AC charge enable, priority mode, etc.)
     {"name": "Legacy Holding 0-124",    "start": 0,    "count": 125, "group": "legacy",  "register_type": "holding"},
     {"name": "Legacy Holding 1000-1124","start": 1000, "count": 125, "group": "storage", "register_type": "holding"},
-    # MOD TL3-XH holding registers (FC04) — includes TOU schedule (3038-3045) and other settings
+    # MOD TL3-XH holding registers (FC03) — includes TOU schedule (3038-3045) and other settings
     {"name": "MOD Holding 3000-3124",           "start": 3000, "count": 125, "group": "mod_extended", "register_type": "holding"},
     {"name": "MOD Holding 3125-3249",           "start": 3125, "count": 125, "group": "mod_extended", "register_type": "holding"},
     {"name": "MOD/TL-XH Extended Holding 3250-3374",  "start": 3250, "count": 125, "group": "mod_extended", "register_type": "holding"},
@@ -245,18 +247,53 @@ SERVICE_READ_REGISTER_SCHEMA = vol.Schema(
     }
 )
 
+# Fork: set_battery_mode accepts "preserve_soc" as an alias for "hold". services.yaml once
+# offered it as the only standby option while the schema rejected it, so selecting it
+# raised vol.Invalid and the action never ran. The selector is back to upstream's "hold";
+# the alias stays so anything written against the fork's wording keeps working.
+_BATTERY_MODE_ALIASES = {"preserve_soc": "hold"}
+
+
+def _battery_mode_alias(value):
+    """Map a fork spelling of a set_battery_mode mode onto upstream's."""
+    return _BATTERY_MODE_ALIASES.get(value, value)
+
+
 SERVICE_SET_BATTERY_MODE_SCHEMA = vol.Schema(
     {
         vol.Required("device_id"): cv.string,
-        # "preserve_soc" is an accepted alias for "hold". services.yaml offered it as
-        # the only standby option while the schema rejected it, so selecting the
-        # dropdown's third entry raised vol.Invalid and the action never ran. The
-        # selector is back to upstream's "hold"; the alias stays so anything written
-        # against the fork's wording keeps working.
-        vol.Required("mode"): vol.In(["charge", "discharge", "hold", "preserve_soc"]),
+        # Fork: "preserve_soc" is an accepted alias for "hold", mapped before vol.In sees
+        # it (see _battery_mode_alias). The vol.In list itself is upstream's, verbatim.
+        vol.Required("mode"): vol.All(_battery_mode_alias, vol.In(["charge", "discharge", "hold", "release"])),
         vol.Optional("power_percent", default=100): vol.All(vol.Coerce(int), vol.Range(min=1, max=100)),
     }
 )
+
+def release_vpp_control(client, holding: dict) -> list[int]:
+    """Hand battery control back to the inverter's own mode. Returns the registers written.
+
+    Every other mode leaves control authority (30100) at 1, and authority with no active
+    command is not "back to normal": on a MIN TL-XH, 30100 = 1 with 30407 = 0 and 30411 = 0
+    held the inverter in VPP standby with Load First selected - the battery gave ~102 W and
+    the grid carried the house. Clearing 30100 restored Load First immediately, the battery
+    rising to ~1,348 W (@GoncaloRibeiro11, #460).
+
+    The direct branch (30407) and the roster count (30411) are cleared first where the
+    profile maps them, so nothing is left armed behind the authority, which goes last.
+    Each write is one step of a single command, so the 30 s control cooldown is bypassed.
+    """
+    written = []
+    for register in (30407, 30411, 30100):
+        if register not in holding:
+            continue
+        if not client.write_register(register, 0, True):
+            raise HomeAssistantError(
+                f"Could not clear register {register} while releasing VPP control. "
+                f"Registers cleared so far: {written or 'none'}."
+            )
+        written.append(register)
+    return written
+
 
 SERVICE_SYNC_TOU_SCHEDULE_SCHEMA = vol.Schema(
     {
@@ -541,7 +578,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             connection_type = entry_data.get("connection_type", "tcp")
             host = entry_data.get("host")
             port = entry_data.get("port", 502)
-            device = entry_data.get("device")
+            # Stored under CONF_DEVICE_PATH ("device_path"), not "device" - the plain
+            # string here always missed, so a config_entry-selected serial scan connected
+            # to None regardless of which device was picked (#432, @JHPHendriks).
+            device = entry_data.get(CONF_DEVICE_PATH)
             baudrate = entry_data.get("baudrate", 9600)
             slave_id = entry_data.get("slave_id", 1)
 
@@ -669,21 +709,21 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         if not device_entry:
             _LOGGER.error("Device %s not found", device_id)
-            raise ValueError(f"Device {device_id} not found")
+            raise HomeAssistantError(f"Device {device_id} not found")
 
         # Find the config entry for this device
         config_entry_id = _config_entry_id_for_device(hass, device_entry)
 
         if not config_entry_id:
             _LOGGER.error("No config entry found for device %s", device_id)
-            raise ValueError(f"No config entry found for device {device_id}")
+            raise HomeAssistantError(f"No config entry found for device {device_id}")
 
         # Get the coordinator
         coordinator = _coordinator_for_entry(hass, config_entry_id)
 
         if not coordinator:
             _LOGGER.error("Coordinator not found for config entry %s", config_entry_id)
-            raise ValueError(f"Coordinator not found for device {device_id}")
+            raise HomeAssistantError(f"Coordinator not found for device {device_id}")
 
         # Write the register using the coordinator's client
         # write_register() raises ModbusWriteError on failure, returns False
@@ -716,11 +756,17 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 await coordinator.async_request_refresh()
             else:
                 _LOGGER.warning("Write to register %d was rate-limited", register)
-                raise ValueError(f"Write to register {register} was rate-limited (WIT cooldown)")
+                # HomeAssistantError, not ValueError: a caller that retries after
+                # the cooldown needs to read this message, and only a
+                # HomeAssistantError survives HA's service boundary (a plain
+                # exception becomes a 500 with a generic body over the REST API).
+                raise HomeAssistantError(
+                    f"Write to register {register} was rate-limited (WIT cooldown)"
+                )
 
         except ModbusWriteError as e:
             _LOGGER.error("Modbus write error: %s", e.error_message)
-            raise ValueError(f"Modbus write failed: {e.error_message}")
+            raise HomeAssistantError(f"Modbus write failed: {e.error_message}") from e
 
     async def write_registers(call: ServiceCall) -> None:
         """Write multiple consecutive Modbus holding registers (function 0x10)."""
@@ -738,21 +784,21 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         if not device_entry:
             _LOGGER.error("Device %s not found", device_id)
-            raise ValueError(f"Device {device_id} not found")
+            raise HomeAssistantError(f"Device {device_id} not found")
 
         # Find the config entry for this device
         config_entry_id = _config_entry_id_for_device(hass, device_entry)
 
         if not config_entry_id:
             _LOGGER.error("No config entry found for device %s", device_id)
-            raise ValueError(f"No config entry found for device {device_id}")
+            raise HomeAssistantError(f"No config entry found for device {device_id}")
 
         # Get the coordinator
         coordinator = _coordinator_for_entry(hass, config_entry_id)
 
         if not coordinator:
             _LOGGER.error("Coordinator not found for config entry %s", config_entry_id)
-            raise ValueError(f"Coordinator not found for device {device_id}")
+            raise HomeAssistantError(f"Coordinator not found for device {device_id}")
 
         # Write the registers using the coordinator's client
         # write_registers() always raises ModbusWriteError on failure
@@ -784,7 +830,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         except ModbusWriteError as e:
             _LOGGER.error("Modbus write error: %s", e.error_message)
-            raise ValueError(f"Modbus write failed: {e.error_message}")
+            raise HomeAssistantError(f"Modbus write failed: {e.error_message}") from e
 
     async def sync_inverter_time(call: ServiceCall) -> dict:
         """Set the inverter's clock from Home Assistant's local time (#393).
@@ -805,20 +851,23 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         device_reg = dr.async_get(hass)
         device_entry = device_reg.async_get(device_id)
         if not device_entry:
-            raise ValueError(f"Device {device_id} not found")
+            raise HomeAssistantError(f"Device {device_id} not found")
 
         config_entry_id = _config_entry_id_for_device(hass, device_entry)
         if not config_entry_id:
-            raise ValueError(f"No config entry found for device {device_id}")
+            raise HomeAssistantError(f"No config entry found for device {device_id}")
 
         coordinator = _coordinator_for_entry(hass, config_entry_id)
         client = coordinator.modbus_client
 
-        if not client.is_clock_supported:
-            raise ValueError(
-                "Clock sync is not available on off-grid profiles. The off-grid protocol "
-                "stores the year as an offset from 2000 and uses register 51 for something "
-                "other than the weekday, and no scan has confirmed the encoding (#393)."
+        # Reached on MIN TL-XH2, whose clock is at VPP 30104-30109 and whose write form is
+        # untested (#461). Raised as HomeAssistantError so the reason reaches the user: a
+        # ValueError crosses HA's service boundary as "Unknown error", which is all one
+        # reporter saw.
+        if not client.is_clock_writable:
+            raise HomeAssistantError(
+                "Setting the clock is not available on this model yet. Reading the clock "
+                "still works - set it from ShinePhone or the front panel instead."
             )
 
         # One line per call, at debug. Confirmed working on a MIN TL-X in v1.8.4: the write
@@ -887,19 +936,19 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             device_reg = dr.async_get(hass)
             device_entry = device_reg.async_get(device_id)
             if not device_entry:
-                raise ValueError(f"Device {device_id} not found")
+                raise HomeAssistantError(f"Device {device_id} not found")
 
             config_entry_id = _config_entry_id_for_device(hass, device_entry)
 
             if not config_entry_id:
-                raise ValueError(f"No config entry found for device {device_id}")
+                raise HomeAssistantError(f"No config entry found for device {device_id}")
 
             coordinator = _coordinator_for_entry(hass, config_entry_id)
         else:
             # Use first available coordinator
             coordinator = next((c for _, c in _all_coordinators(hass)), None)
             if not coordinator:
-                raise ValueError("No Growatt Modbus integrations found")
+                raise HomeAssistantError("No Growatt Modbus integrations found")
 
         # Check if inverter is online and producing
         if not coordinator.data:
@@ -920,6 +969,39 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             return
 
         data = coordinator.data
+
+        # "Nothing was read" is not "nothing is being produced" (#432).
+        #
+        # `coordinator.data` is an empty GrowattData placeholder until the first successful
+        # poll, and a dataclass instance is truthy - so the check above passes and every
+        # field reads 0.0. A reporter whose serial port was held by another integration ran
+        # this in full sun and was told his solar production was 0 W and to try again when
+        # the sun was shining. The inverter had never answered a single read.
+        if not coordinator.has_real_data:
+            message = (
+                "❌ **Grid Orientation Detection Failed**\n\n"
+                "The inverter has not answered a single read since setup, so there is "
+                "nothing to measure - this is **not** a reading of zero production.\n\n"
+                "**Common causes:**\n"
+                "• Another integration or program is holding the serial port. A USB "
+                "adapter can only be opened by one at a time, so a second Growatt "
+                "integration on the same adapter will stop this one reading anything.\n"
+                "• Wrong Modbus unit ID, wrong device path, or wrong baud rate\n"
+                "• The adapter is not wired to the inverter's RS485 terminals\n\n"
+                "Check any repair notices on the integration first, then run this again "
+                "once sensors are showing live values."
+            )
+            await hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "title": "Grid Orientation Detection",
+                    "message": message,
+                    "notification_id": "growatt_grid_detection",
+                },
+            )
+            return
+
         pv_power = getattr(data, "pv_total_power", 0)
         consumption = getattr(data, "house_consumption", 0) or getattr(data, "power_to_load", 0)
 
@@ -1089,21 +1171,21 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         if not device_entry:
             _LOGGER.error("Device %s not found", device_id)
-            raise ValueError(f"Device {device_id} not found")
+            raise HomeAssistantError(f"Device {device_id} not found")
 
         # Find the config entry for this device
         config_entry_id = _config_entry_id_for_device(hass, device_entry)
 
         if not config_entry_id:
             _LOGGER.error("No config entry found for device %s", device_id)
-            raise ValueError(f"No config entry found for device {device_id}")
+            raise HomeAssistantError(f"No config entry found for device {device_id}")
 
         # Get the coordinator
         coordinator = _coordinator_for_entry(hass, config_entry_id)
 
         if not coordinator:
             _LOGGER.error("Coordinator not found for config entry %s", config_entry_id)
-            raise ValueError(f"Coordinator not found for device {device_id}")
+            raise HomeAssistantError(f"Coordinator not found for device {device_id}")
 
         # Read the register using the coordinator's client
         read_result = await hass.async_add_executor_job(
@@ -1266,8 +1348,9 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         CRITICAL - HOLD Mode Implementation:
         - Simply setting 30407=0 returns to SELF-CONSUMPTION, NOT true HOLD!
         - In self-consumption, battery WILL discharge to supply house load
-        - True HOLD requires TOU workaround: Set +1% charge via TOU period
-        - This firmware quirk creates actual idle state
+        - HOLD uses a TOU workaround instead: Set +1% charge via TOU period
+        - Close to idle, not zero: ~+140 W on MOD DTC 5400, ~270-310 W on MIN DTC 5100,
+          both measured at night with no PV (#400). See GrowattWitVppBatteryModeSelect.
         - WARNING: +1% = HOLD, but -1% = FULL DISCHARGE (asymmetric behavior!)
         """
         device_id = call.data["device_id"]
@@ -1286,18 +1369,18 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         if not device_entry:
             _LOGGER.error("Device %s not found", device_id)
-            raise ValueError(f"Device {device_id} not found")
+            raise HomeAssistantError(f"Device {device_id} not found")
 
         # Find the config entry for this device
         config_entry_id = _config_entry_id_for_device(hass, device_entry)
 
         if not config_entry_id:
-            raise ValueError(f"No config entry found for device {device_id}")
+            raise HomeAssistantError(f"No config entry found for device {device_id}")
 
         coordinator = _coordinator_for_entry(hass, config_entry_id)
         if not coordinator:
             _LOGGER.error("Coordinator not found for config entry %s", config_entry_id)
-            raise ValueError(f"Coordinator not found for device {device_id}")
+            raise HomeAssistantError(f"Coordinator not found for device {device_id}")
 
         client = coordinator._client
 
@@ -1309,6 +1392,27 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         # on every model regardless, with the WIT scope stated only in its description
         # (#400).
         holding = client.register_map.get('holding_registers', {})
+
+        # Release needs only the authority register: it exists to undo what the other modes
+        # leave behind, and on MIN TL-XH (which maps 30100 but not 30407/30409) clearing
+        # 30100 is exactly the step measured to restore local control (#460).
+        if mode == "release":
+            if 30100 not in holding:
+                raise HomeAssistantError(
+                    f"Nothing to release: this model's profile "
+                    f"({client.register_map.get('name', 'unknown')}) has no VPP control "
+                    f"authority register (30100)."
+                )
+            try:
+                written = await hass.async_add_executor_job(release_vpp_control, client, holding)
+            except HomeAssistantError:
+                raise
+            except Exception as e:
+                raise HomeAssistantError(f"Failed to release VPP control: {e}") from e
+            _LOGGER.info("Released VPP control - cleared registers %s", written)
+            await coordinator.async_request_refresh()
+            return
+
         missing = [r for r in (30100, 30407, 30409) if r not in holding]
         if missing:
             raise HomeAssistantError(
@@ -1334,29 +1438,85 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 _LOGGER.warning("Failed to enable VPP control authority, continuing anyway...")
 
             if mode == "hold":
-                # HOLD: Use TOU +1% charge workaround for TRUE standby
+                # HOLD: Use TOU +1% charge workaround - close to idle, not zero (#400)
                 _LOGGER.debug("Setting HOLD mode via TOU +1%% workaround")
 
                 success = await hass.async_add_executor_job(client.write_register, VPP_AC_CHARGE_ENABLE, 1)
                 if not success:
                     _LOGGER.warning("Failed to enable AC charging (30410)")
 
-                from datetime import datetime as dt
-                now = dt.now()
-                current_minutes = now.hour * 60 + now.minute
-                start_min = max(0, current_minutes - 5)
-                end_min = min(1439, current_minutes + 120)
-
+                # Select the roster branch before writing into it (#400).
+                #
+                # The same gap the Mode (VPP) select had: charge and discharge set 30407 = 1
+                # for the direct setpoint and never clear it, and hold wrote its roster
+                # without touching it - so charge -> hold left the direct branch selected
+                # with 30409 still standing, and held nothing.
+                #
+                # This action is reachable on MOD as well as WIT (its guard asks only for
+                # 30100/30407/30409, which MOD_6000_15000TL3_XH carries), so the select's fix
+                # did not cover it. Reported by @KevlarD-67 from the code, alongside the
+                # cooldown gap that the third argument below closes: charge stamps 30407's
+                # 30 s limiter, so without the bypass a quick charge -> hold has this write
+                # refused and carries on regardless.
+                #
+                # Positional rather than keyword because async_add_executor_job passes
+                # positionally.
                 success = await hass.async_add_executor_job(
-                    client.write_registers, VPP_TOU_PERIOD1_BASE,
-                    [start_min, end_min, 1]  # +1% = HOLD (NOT -1% which = full discharge!)
+                    client.write_register, VPP_REMOTE_POWER_ENABLE, 0, True
                 )
                 if not success:
-                    raise ValueError("Failed to write TOU period for HOLD mode")
+                    raise HomeAssistantError(
+                        "Failed to clear remote power control (30407) before writing the "
+                        "HOLD schedule. The inverter is still following the previous mode's "
+                        "power setpoint and nothing further was written."
+                    )
 
-                success = await hass.async_add_executor_job(client.write_register, VPP_TOU_NUM_PERIODS, 1)
+                # And clear the setpoint behind it, for the reason given in select.py: 30409
+                # is inert while 30407 is 0, but Growatt's own scheduler reopens 30407 on
+                # MOD (#349), and a stale setpoint returns with it. Warned rather than
+                # aborted - the hold is already in force once the selector is cleared.
+                #
+                # This branch is the one @KevlarD-67 measured on b9: charge at 20 %, then
+                # hold, and the battery went on charging at 1.52 kW with 30407 = 1 and
+                # 30409 = 20 while the roster period sat unselected (#400).
+                cleared_setpoint = await hass.async_add_executor_job(
+                    client.write_register, VPP_REMOTE_POWER_PERCENT, 0, True
+                )
+                if not cleared_setpoint:
+                    _LOGGER.warning(
+                        "Could not clear the remote power setpoint (30409) after selecting "
+                        "the HOLD roster. The hold is in force, but a later re-enable of "
+                        "30407 would restore the previous setpoint."
+                    )
+
+                # Home Assistant's zone, the one the inverter clock is synced in (#458).
+                import homeassistant.util.dt as dt_util
+                now = dt_util.now()
+                current_minutes = now.hour * 60 + now.minute
+
+                # Shared with the Mode (VPP) select. TOU period words are minutes since
+                # midnight and do not wrap, so a window crossing midnight is two periods -
+                # clamping the end to 1439 instead turned a Hold set at 23:50 into nine
+                # minutes that lapsed silently (#423).
+                periods = hold_tou_periods(current_minutes)
+
+                for index, (period_start, period_end) in enumerate(periods):
+                    base = VPP_TOU_PERIOD1_BASE + (index * 3)
+                    success = await hass.async_add_executor_job(
+                        client.write_registers, base,
+                        # +1% = HOLD (NOT -1% which = full discharge!)
+                        [period_start, period_end, 1]
+                    )
+                    if not success:
+                        raise HomeAssistantError(
+                            f"Failed to write TOU period {index + 1} for HOLD mode"
+                        )
+
+                success = await hass.async_add_executor_job(
+                    client.write_register, VPP_TOU_NUM_PERIODS, len(periods)
+                )
                 if not success:
-                    raise ValueError("Failed to enable TOU period")
+                    raise HomeAssistantError("Failed to enable TOU period")
 
             elif mode == "charge":
                 await hass.async_add_executor_job(client.write_register, VPP_TOU_NUM_PERIODS, 0)
@@ -1367,30 +1527,34 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
                 success = await hass.async_add_executor_job(client.write_register, VPP_REMOTE_POWER_ENABLE, 1)
                 if not success:
-                    raise ValueError("Failed to enable remote power control")
+                    raise HomeAssistantError("Failed to enable remote power control")
 
                 success = await hass.async_add_executor_job(client.write_register, VPP_REMOTE_POWER_PERCENT, power_percent)
                 if not success:
-                    raise ValueError("Failed to set charge power percentage")
+                    raise HomeAssistantError("Failed to set charge power percentage")
 
             elif mode == "discharge":
                 await hass.async_add_executor_job(client.write_register, VPP_TOU_NUM_PERIODS, 0)
 
                 success = await hass.async_add_executor_job(client.write_register, VPP_REMOTE_POWER_ENABLE, 1)
                 if not success:
-                    raise ValueError("Failed to enable remote power control")
+                    raise HomeAssistantError("Failed to enable remote power control")
 
                 power_value = 65536 - power_percent  # -100 becomes 65436
                 success = await hass.async_add_executor_job(client.write_register, VPP_REMOTE_POWER_PERCENT, power_value)
                 if not success:
-                    raise ValueError("Failed to set discharge power percentage")
+                    raise HomeAssistantError("Failed to set discharge power percentage")
 
             _LOGGER.info("Successfully set battery mode to %s at %d%%", mode.upper(), power_percent)
             await coordinator.async_request_refresh()
 
+        except HomeAssistantError:
+            # Already carries the reason the write failed; re-wrapping would
+            # bury it inside a second message.
+            raise
         except Exception as e:
             _LOGGER.error("Failed to set battery mode: %s", e)
-            raise ValueError(f"Failed to set battery mode: {e}")
+            raise HomeAssistantError(f"Failed to set battery mode: {e}") from e
 
     async def get_register_data(call: ServiceCall):
         """Read specific Modbus registers and return values programmatically."""
@@ -1405,18 +1569,18 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         if not device_entry:
             _LOGGER.error("Device %s not found", device_id)
-            raise ValueError(f"Device {device_id} not found")
+            raise HomeAssistantError(f"Device {device_id} not found")
 
         # Find the config entry for this device
         config_entry_id = _config_entry_id_for_device(hass, device_entry)
 
         if not config_entry_id:
-            raise ValueError(f"No config entry found for device {device_id}")
+            raise HomeAssistantError(f"No config entry found for device {device_id}")
 
         coordinator = _coordinator_for_entry(hass, config_entry_id)
         if not coordinator:
             _LOGGER.error("Coordinator not found for config entry %s", config_entry_id)
-            raise ValueError(f"Coordinator not found for device {device_id}")
+            raise HomeAssistantError(f"Coordinator not found for device {device_id}")
 
         client = coordinator._client
 
@@ -1460,7 +1624,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         - Next period starts at XX:00 (e.g., 360 = 06:00)
         - The inverter will REJECT writes if periods overlap!
 
-        For HOLD mode, use power=1 (+1% charge = true standby)
+        For HOLD mode, use power=1 (+1% charge - close to idle, not an exact zero)
         """
         device_id = call.data["device_id"]
         periods = call.data["periods"]
@@ -1470,7 +1634,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                      device_id, len(periods), default_mode)
 
         if len(periods) > 20:
-            raise ValueError("Maximum 20 TOU periods supported")
+            raise HomeAssistantError("Maximum 20 TOU periods supported")
 
         # Validate periods don't overlap
         sorted_periods = sorted(periods, key=lambda p: p["start"])
@@ -1478,7 +1642,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             current_end = sorted_periods[i]["end"]
             next_start = sorted_periods[i + 1]["start"]
             if current_end >= next_start:
-                raise ValueError(
+                raise HomeAssistantError(
                     f"TOU periods CANNOT overlap! Period {i+1} ends at {current_end} "
                     f"but period {i+2} starts at {next_start}. "
                     f"Use XX:59 end times (e.g., 359 for 05:59) with XX:00 start times."
@@ -1489,16 +1653,16 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         device_entry = device_reg.async_get(device_id)
 
         if not device_entry:
-            raise ValueError(f"Device {device_id} not found")
+            raise HomeAssistantError(f"Device {device_id} not found")
 
         config_entry_id = _config_entry_id_for_device(hass, device_entry)
 
         if not config_entry_id:
-            raise ValueError(f"No config entry found for device {device_id}")
+            raise HomeAssistantError(f"No config entry found for device {device_id}")
 
         coordinator = _coordinator_for_entry(hass, config_entry_id)
         if not coordinator:
-            raise ValueError(f"Coordinator not found for device {device_id}")
+            raise HomeAssistantError(f"Coordinator not found for device {device_id}")
 
         client = coordinator._client
 
@@ -1557,19 +1721,21 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     client.write_registers, base_addr, [start, end, power_unsigned]
                 )
                 if not success:
-                    raise ValueError(f"Failed to write TOU period {i + 1}")
+                    raise HomeAssistantError(f"Failed to write TOU period {i + 1}")
 
             # Step 4: Set number of active periods (activates the schedule)
             success = await hass.async_add_executor_job(client.write_register, VPP_TOU_NUM_PERIODS, len(periods))
             if not success:
-                raise ValueError("Failed to set number of TOU periods")
+                raise HomeAssistantError("Failed to set number of TOU periods")
 
             _LOGGER.info("Successfully synced %d TOU periods to inverter", len(periods))
             await coordinator.async_request_refresh()
 
+        except HomeAssistantError:
+            raise
         except Exception as e:
             _LOGGER.error("Failed to sync TOU schedule: %s", e)
-            raise ValueError(f"Failed to sync TOU schedule: {e}")
+            raise HomeAssistantError(f"Failed to sync TOU schedule: {e}") from e
 
     async def set_wit_mode(call: ServiceCall) -> dict:
         """Set WIT inverter mode via atomic multi-register VPP write."""
@@ -1591,16 +1757,16 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         device_entry = device_reg.async_get(device_id)
         if not device_entry:
             _LOGGER.error("Device %s not found", device_id)
-            raise ValueError(f"Device {device_id} not found")
+            raise HomeAssistantError(f"Device {device_id} not found")
 
         config_entry_id = _config_entry_id_for_device(hass, device_entry)
         if not config_entry_id:
-            raise ValueError(f"No config entry found for device {device_id}")
+            raise HomeAssistantError(f"No config entry found for device {device_id}")
 
         coordinator = _coordinator_for_entry(hass, config_entry_id)
         if not coordinator:
             _LOGGER.error("Coordinator not found for config entry %s", config_entry_id)
-            raise ValueError(f"Coordinator not found for device {device_id}")
+            raise HomeAssistantError(f"Coordinator not found for device {device_id}")
 
         client = coordinator.modbus_client
 
@@ -1763,7 +1929,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     priority_val = 1
                 success = _write(VPP_PRIORITY_MODE, priority_val)
                 if not success:
-                    raise ValueError(f"Failed to set priority mode (30476={priority_val})")
+                    raise HomeAssistantError(f"Failed to set priority mode (30476={priority_val})")
                 registers_written[VPP_PRIORITY_MODE] = priority_val
 
                 # ---- Step 2: AC charge mode (before enabling remote control) ----
@@ -1775,31 +1941,31 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                         ac_val = 1
                         success = _write(VPP_AC_CHARGE_ENABLE, 1)
                     if not success:
-                        raise ValueError(f"Failed to write AC charge mode (30410={ac_val})")
+                        raise HomeAssistantError(f"Failed to write AC charge mode (30410={ac_val})")
                     registers_written[VPP_AC_CHARGE_ENABLE] = ac_val
                 elif mode == "grid_charge":
                     success = _write(VPP_AC_CHARGE_ENABLE, 1)
                     if not success:
-                        raise ValueError("Failed to write AC charge mode (30410=1)")
+                        raise HomeAssistantError("Failed to write AC charge mode (30410=1)")
                     registers_written[VPP_AC_CHARGE_ENABLE] = 1
                 elif mode in ("discharge_to_load", "discharge_to_grid", "max_export",
                               "hold", "preserve_soc", "passthrough"):
                     success = _write(VPP_AC_CHARGE_ENABLE, 0)
                     if not success:
-                        raise ValueError("Failed to write AC charge mode (30410=0)")
+                        raise HomeAssistantError("Failed to write AC charge mode (30410=0)")
                     registers_written[VPP_AC_CHARGE_ENABLE] = 0
 
                 # ---- Step 3: SOC limits (before charge/discharge starts) ----
                 if charge_cutoff_soc is not None:
                     success = _write(VPP_CHARGE_CUTOFF_SOC, charge_cutoff_soc)
                     if not success:
-                        raise ValueError(f"Failed to write charge cutoff SOC (30404={charge_cutoff_soc})")
+                        raise HomeAssistantError(f"Failed to write charge cutoff SOC (30404={charge_cutoff_soc})")
                     registers_written[VPP_CHARGE_CUTOFF_SOC] = charge_cutoff_soc
 
                 if discharge_cutoff_soc is not None:
                     success = _write(VPP_DISCHARGE_CUTOFF_SOC, discharge_cutoff_soc)
                     if not success:
-                        raise ValueError(f"Failed to write discharge cutoff SOC (30405={discharge_cutoff_soc})")
+                        raise HomeAssistantError(f"Failed to write discharge cutoff SOC (30405={discharge_cutoff_soc})")
                     registers_written[VPP_DISCHARGE_CUTOFF_SOC] = discharge_cutoff_soc
 
                 # ---- Step 4: Export rate ----
@@ -1807,15 +1973,15 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     if export_rate >= 100:
                         success = _write(VPP_EXPORT_LIMIT_ENABLE, 0)
                         if not success:
-                            raise ValueError("Failed to disable export limit (30200=0)")
+                            raise HomeAssistantError("Failed to disable export limit (30200=0)")
                         registers_written[VPP_EXPORT_LIMIT_ENABLE] = 0
                     else:
                         success = _write(VPP_EXPORT_LIMIT_ENABLE, 1)
                         if not success:
-                            raise ValueError("Failed to enable export limit (30200=1)")
+                            raise HomeAssistantError("Failed to enable export limit (30200=1)")
                         success = _write(VPP_EXPORT_LIMIT_RATE, export_rate)
                         if not success:
-                            raise ValueError(f"Failed to write export limit rate (30201={export_rate})")
+                            raise HomeAssistantError(f"Failed to write export limit rate (30201={export_rate})")
                         registers_written[VPP_EXPORT_LIMIT_ENABLE] = 1
                         registers_written[VPP_EXPORT_LIMIT_RATE] = export_rate
                 elif mode == "discharge_to_load":
@@ -1823,10 +1989,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     # mode appears as "Max Export" (battery dumps to grid).
                     success = _write(VPP_EXPORT_LIMIT_ENABLE, 1)
                     if not success:
-                        raise ValueError("Failed to enable export limit (30200=1) - discharge would export to grid!")
+                        raise HomeAssistantError("Failed to enable export limit (30200=1) - discharge would export to grid!")
                     success = _write(VPP_EXPORT_LIMIT_RATE, 0)
                     if not success:
-                        raise ValueError("Failed to set zero export rate (30201=0)")
+                        raise HomeAssistantError("Failed to set zero export rate (30201=0)")
                     registers_written[VPP_EXPORT_LIMIT_ENABLE] = 1
                     registers_written[VPP_EXPORT_LIMIT_RATE] = 0
                 elif mode in ("max_export", "discharge_to_grid", "hold", "preserve_soc",
@@ -1835,14 +2001,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     # (grid_charge needs this - stale 30200=1 from discharge_to_load blocks charging)
                     success = _write(VPP_EXPORT_LIMIT_ENABLE, 0)
                     if not success:
-                        raise ValueError("Failed to clear export limit (30200=0)")
+                        raise HomeAssistantError("Failed to clear export limit (30200=0)")
                     registers_written[VPP_EXPORT_LIMIT_ENABLE] = 0
 
                 # ---- Step 5: Battery power command ----
                 # Clear any leftover TOU periods from previous modes
                 success = _write(VPP_TOU_NUM_PERIODS, 0)
                 if not success:
-                    raise ValueError("Failed to clear TOU periods (30411=0)")
+                    raise HomeAssistantError("Failed to clear TOU periods (30411=0)")
                 registers_written[VPP_TOU_NUM_PERIODS] = 0
 
                 if mode == "passthrough":
@@ -1850,13 +2016,13 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     # stale command remains if 30407 is re-enabled externally.
                     success = _write(VPP_REMOTE_POWER_DURATION, 0)
                     if not success:
-                        raise ValueError("Failed to clear duration (30408=0)")
+                        raise HomeAssistantError("Failed to clear duration (30408=0)")
                     success = _write(VPP_REMOTE_POWER_PERCENT, 0)
                     if not success:
-                        raise ValueError("Failed to clear power (30409=0)")
+                        raise HomeAssistantError("Failed to clear power (30409=0)")
                     success = _write(VPP_REMOTE_POWER_ENABLE, 0)
                     if not success:
-                        raise ValueError("Failed to disable remote power control (30407)")
+                        raise HomeAssistantError("Failed to disable remote power control (30407)")
                     registers_written[VPP_REMOTE_POWER_DURATION] = 0
                     registers_written[VPP_REMOTE_POWER_PERCENT] = 0
                     registers_written[VPP_REMOTE_POWER_ENABLE] = 0
@@ -1871,13 +2037,13 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     # Confirmed 2026-03-30: Bat goes from -700W to -36W (standby only).
                     success = _write(VPP_REMOTE_POWER_DURATION, duration_minutes)
                     if not success:
-                        raise ValueError("Failed to write duration (30408)")
+                        raise HomeAssistantError("Failed to write duration (30408)")
                     success = _write(VPP_REMOTE_POWER_PERCENT, 1)
                     if not success:
-                        raise ValueError("Failed to write power (30409=1)")
+                        raise HomeAssistantError("Failed to write power (30409=1)")
                     success = _write(VPP_REMOTE_POWER_ENABLE, 1)
                     if not success:
-                        raise ValueError("Failed to enable remote power control (30407)")
+                        raise HomeAssistantError("Failed to enable remote power control (30407)")
                     registers_written[VPP_REMOTE_POWER_DURATION] = duration_minutes
                     registers_written[VPP_REMOTE_POWER_PERCENT] = 1
                     registers_written[VPP_REMOTE_POWER_ENABLE] = 1
@@ -1888,13 +2054,13 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     # Confirmed 2026-03-30: 30476=1 + 30407=1 + 30409=100 -> 3kW+ charge.
                     success = _write(VPP_REMOTE_POWER_DURATION, duration_minutes)
                     if not success:
-                        raise ValueError("Failed to write duration (30408)")
+                        raise HomeAssistantError("Failed to write duration (30408)")
                     success = _write(VPP_REMOTE_POWER_PERCENT, power_percent)
                     if not success:
-                        raise ValueError("Failed to write power (30409)")
+                        raise HomeAssistantError("Failed to write power (30409)")
                     success = _write(VPP_REMOTE_POWER_ENABLE, 1)
                     if not success:
-                        raise ValueError("Failed to enable remote power control (30407)")
+                        raise HomeAssistantError("Failed to enable remote power control (30407)")
                     registers_written[VPP_REMOTE_POWER_DURATION] = duration_minutes
                     registers_written[VPP_REMOTE_POWER_PERCENT] = power_percent
                     registers_written[VPP_REMOTE_POWER_ENABLE] = 1
@@ -1904,13 +2070,13 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     power_unsigned = 65536 - p
                     success = _write(VPP_REMOTE_POWER_DURATION, duration_minutes)
                     if not success:
-                        raise ValueError("Failed to write duration (30408)")
+                        raise HomeAssistantError("Failed to write duration (30408)")
                     success = _write(VPP_REMOTE_POWER_PERCENT, power_unsigned)
                     if not success:
-                        raise ValueError("Failed to write power (30409)")
+                        raise HomeAssistantError("Failed to write power (30409)")
                     success = _write(VPP_REMOTE_POWER_ENABLE, 1)
                     if not success:
-                        raise ValueError("Failed to enable remote power control (30407)")
+                        raise HomeAssistantError("Failed to enable remote power control (30407)")
                     registers_written[VPP_REMOTE_POWER_DURATION] = duration_minutes
                     registers_written[VPP_REMOTE_POWER_PERCENT] = power_unsigned
                     registers_written[VPP_REMOTE_POWER_ENABLE] = 1
@@ -1960,7 +2126,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         except Exception as err:
             _LOGGER.exception("[WIT] set_wit_mode failed: %s", err)
-            raise ValueError(f"set_wit_mode failed: {err}") from err
+            raise HomeAssistantError(f"set_wit_mode failed: {err}") from err
 
     # Register services
     hass.services.async_register(

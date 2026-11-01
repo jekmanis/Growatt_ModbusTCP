@@ -652,9 +652,14 @@ def test_a_bus_lock_timeout_reaches_the_caller_as_a_failure(wired):
 
 
 def test_an_unknown_device_raises_before_touching_the_bus(wired):
+    # HomeAssistantError since the v2.0.6 merge: upstream's #461 rule (a ValueError
+    # reaches the user as "Unknown error") now covers set_wit_mode too. The optimizer
+    # treats any raised call as a confirmed failure, so the type change is invisible to it.
+    from homeassistant.exceptions import HomeAssistantError
+
     _, _, client, handlers = wired()
     before = len(client._fake.calls)
-    with pytest.raises(ValueError):
+    with pytest.raises(HomeAssistantError):
         _set_wit_mode(handlers, device_id="not-a-device", mode="hold",
                       duration_minutes=20, power_percent=100)
     assert len(client._fake.calls) == before
@@ -933,11 +938,13 @@ def test_a_refused_register_is_not_blamed_on_the_rate_limiter(wired, caplog):
     which swallows the ModbusWriteError and returns False, made that the normal path for
     the one register most likely to be refused.
     """
+    from homeassistant.exceptions import HomeAssistantError
+
     client = _client(refuse=[(30410, 0)], refuse_fc06=[30410])
     _, _, _, handlers = wired(client)
 
     with caplog.at_level("DEBUG"):
-        with pytest.raises(ValueError):
+        with pytest.raises(HomeAssistantError):
             _set_wit_mode(handlers, device_id=DEVICE_ID, mode="hold",
                           duration_minutes=20, power_percent=100)
 
@@ -982,15 +989,17 @@ def test_the_gate_names_every_register_the_sequence_raises_on(register):
 
 
 def test_the_profiles_the_gate_now_refuses_would_have_aborted_mid_sequence():
-    """Three shipped profiles carry 30407/30409/30410 without 30411 or 30476. Under the
+    """Shipped profiles that carry 30407/30409/30410 without 30411 or 30476. Under the
     narrower gate they were accepted and then failed at the priority-mode write - with
-    30100=1 already applied."""
+    30100=1 already applied. MIN TL-XH2 joined the list when upstream v2.0.5 mapped its
+    VPP block (30407-30410 present, the rest of HARD_REQUIRED not)."""
     partial = sorted(
         name for name, m in _const.REGISTER_MAPS.items()
         if all(r in m.get("holding_registers", {}) for r in (30407, 30409, 30410))
         and not all(r in m.get("holding_registers", {}) for r in HARD_REQUIRED)
     )
     assert partial == [
+        "MIN_TL_XH2_3000_10000_V201",
         "MOD_6000_15000TL3_XH", "SPH_3000_6000_V201", "SPH_7000_10000_V201",
     ], partial
 

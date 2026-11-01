@@ -1,5 +1,6 @@
 """Data update coordinator for Growatt Modbus Integration."""
 import asyncio
+import contextlib
 import logging
 import time
 from datetime import datetime, timedelta
@@ -12,8 +13,11 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.storage import Store
+import homeassistant.util.dt as dt_util
 
 from .const import (
+    battery_power_scale_from_store,
+    battery_power_scale_into_payload,
     DOMAIN,
     CONF_SLAVE_ID,
     CONF_REGISTER_MAP,
@@ -38,7 +42,7 @@ from .const import (
     WIT_MODE_DISPLAY_NAMES,
 )
 
-from .const import REGISTER_MAPS, resolve_block_size
+from .const import REGISTER_MAPS, decode_firmware_build, resolve_block_size
 
 from .growatt_modbus import (
     GrowattModbus,
@@ -69,6 +73,21 @@ _WRITE_CHECK_EXPIRY_S = 240
 _IDENTIFICATION_MAX_ATTEMPTS = 3
 _IDENTIFICATION_RETRY_SECONDS = 300
 
+# (address, count) -> cache label for the reads _read_device_identification and
+# _check_inverter_clock issue. _read_holding applies the identification rules (failure
+# cache, short timeout, hub lock per read) to these and only these.
+_IDENTIFICATION_READ_LABELS = {
+    (23, 5): "serial",
+    (3000, 15): "serial",
+    (9, 3): "firmware",
+    (82, 6): "firmware_build",
+    (125, 8): "inverter_type",
+    (30099, 1): "protocol_version",
+    (73, 1): "protocol_version",
+    (30104, 6): "clock",
+    (45, 6): "clock",
+}
+
 
 class _IdentificationDeferred(Exception):
     """The shared bus was busy, so this identification read never reached the inverter.
@@ -78,6 +97,25 @@ class _IdentificationDeferred(Exception):
     that is already running.
     """
 
+# How far a daily or lifetime counter may step backwards before we stop absorbing it.
+# The observed case is a single count - 0.1 kWh - from the inverter rounding its own
+# total down. This allows a few of those while leaving a genuine reset, which goes to
+# zero or drops far, to be handled as the real event it is (#417).
+_BACKWARD_STEP_TOLERANCE_KWH = 0.5
+
+# A daily counter at or above this has a non-zero high word (65536 x 0.1 kWh). No single
+# inverter's day reaches it - a 50 kW unit at full power for 24 h is 1,200 kWh - but the
+# word-tear garbage the spike guard exists for lands there, so a first reading of this size
+# is never confirmed, however often it repeats (#412 repeated one every poll).
+_DAILY_FIRST_READING_CEILING_KWH = 6553.6
+
+# A daily counter that drops to 0 from a non-zero value is believed on the Nth consecutive
+# zero poll, not the first. Home Assistant reads any decrease in a total_increasing sensor
+# as a meter reset, so a single torn 0 read published mid-day makes the Energy Dashboard
+# count the whole day so far twice: a MID 25KTL3-XH's Battery Discharge Today dipped to 0
+# for one poll at 7.1 kWh and the dashboard showed 22.2 kWh for a 15.2 kWh day (#464).
+# A counter that really is 0 still reads 0 within a couple of polls (#410).
+_DAILY_ZERO_CONFIRM_POLLS = 3
 
 def test_connection(config: dict) -> dict:
     """Test the connection to the Growatt inverter (TCP or Serial)."""
@@ -113,22 +151,34 @@ def test_connection(config: dict) -> dict:
             )
 
         # Test connection
-        if client.connect():
-            # Try to read some basic data
+        if not client.connect():
+            return {"success": False, "error": "Could not connect to inverter"}
+
+        # Closed in `finally`, not after the read.
+        #
+        # This client is built WITHOUT a shared hub, so it owns its own socket - the only
+        # place in the integration that opens one outside the hub. The close used to sit
+        # immediately after read_all_data(), so any exception in the read skipped it, the
+        # `except` below swallowed the error, and the socket was left established with
+        # nothing holding a reference to close it.
+        #
+        # A leaked socket is not free: a gateway has a hard client limit (an Elfin EW11
+        # accepts five), and this runs on every connection test in the config and options
+        # flows - the retry loop a user works through when a connection is not yet right,
+        # which is exactly when the read is most likely to throw (#426).
+        try:
             data = client.read_all_data()
+        finally:
             client.disconnect()
 
-            if data is not None:
-                return {
-                    "success": True,
-                    "serial_number": data.serial_number,
-                    "firmware_version": data.firmware_version,
-                    "register_map": register_map
-                }
-            else:
-                return {"success": False, "error": "Could not read data from inverter"}
-        else:
-            return {"success": False, "error": "Could not connect to inverter"}
+        if data is not None:
+            return {
+                "success": True,
+                "serial_number": data.serial_number,
+                "firmware_version": data.firmware_version,
+                "register_map": register_map
+            }
+        return {"success": False, "error": "Could not read data from inverter"}
 
     except Exception as err:
         _LOGGER.exception("Connection test failed")
@@ -160,7 +210,10 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         
         # Device identification (populated during first refresh)
         self._serial_number = None
+        self._identification_complete = False
         self._firmware_version = None
+        # Holding 82-87, "FW Build No." - the string the Growatt portal shows as Version.
+        self._firmware_build = None
         self._inverter_type = None
         self._model_name = None
         self._protocol_version = None  # VPP Protocol version (from register 30099)
@@ -168,8 +221,7 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         # One-shot device identification bookkeeping (see the module docstring above
         # _IDENTIFICATION_MAX_ATTEMPTS).  _identification_failed_reads caches the reads
         # the inverter did not answer so they are never paid for twice, and
-        # _identification_complete stops the whole pass for good.
-        self._identification_complete = False
+        # _identification_complete (initialised above) stops the whole pass for good.
         self._identification_attempts = 0
         self._identification_next_attempt = 0.0  # time.monotonic() deadline
         self._identification_failed_reads: set[str] = set()
@@ -216,6 +268,14 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         # Adaptive polling for offline inverters
         self._consecutive_failures = 0
         self._failure_threshold = 5  # After 5 failures, slow down polling
+
+        # An entry that has NEVER had a successful read is a different condition from one
+        # that was working and stopped, and only the first points at configuration (#424).
+        # A wrong unit ID looks exactly like a dead link - every block read times out and
+        # the log says "transport error during block read" - so nothing in the symptoms
+        # suggests the address as the thing to check. It cost one reporter two days.
+        self._ever_polled_successfully = False
+        self._unit_id_issue_raised = False
         scan_interval = entry.options.get("scan_interval", 60)  # Default 60 seconds
         self._normal_update_interval = timedelta(seconds=scan_interval)
         self._offline_update_interval = timedelta(seconds=entry.options.get("offline_scan_interval", 300))  # 5 min default
@@ -246,8 +306,27 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         # Energy total retention — prevents total_increasing spikes from dormant-inverter zeros
         self._retained_lifetime_totals: dict[str, float] = {}
         self._retained_daily_totals: dict[str, float] = {}
+        # A large first reading with no retained baseline, waiting for the next poll to
+        # agree with it before it is believed (#464).
+        self._daily_first_candidates: dict[str, float] = {}
+        # Consecutive zero polls per daily counter that was non-zero (#464).
+        self._daily_zero_streak: dict[str, int] = {}
         _store_key = f"{DOMAIN}.{entry.entry_id}_energy_totals"
         self._energy_store: Store = Store(hass, version=1, key=_store_key)
+
+        # Battery power scale, carried across sessions (#434).
+        #
+        # It lives in the energy store rather than a store of its own because that file is
+        # already loaded at setup and written after polls - a second one would double the
+        # disk traffic to persist a single float. The profile key is stored beside it: a
+        # scale validated for one register map means nothing for another, so changing
+        # profile discards it rather than applying it to different registers.
+        self._persisted_battery_power_scale: float | None = None
+
+        # The payload as it was last read from or written to storage. A save rebuilds the
+        # dict from scratch, so without this a write in a session that has not restored yet
+        # drops the stored scale for good (#434).
+        self._stored_payload: dict | None = None
 
         # Midnight grace window: set by _handle_midnight_reset() and checked in
         # _protect_energy_totals() to suppress stale pre-reset values that the inverter
@@ -266,6 +345,10 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         # counter the inverter is slow to clear — and a guard working as designed should
         # not file an error-log line a minute for hours (#412, same reasoning as #384).
         self._spike_warned: set[str] = set()
+
+        # Attributes already warned about for a backwards step. The inverter can do
+        # this on any poll, and one line per counter per session is enough (#417).
+        self._backward_step_warned: set[str] = set()
 
         # Cloud override detection: tracks recently written register values
         # Format: {register_address: (expected_value, write_timestamp, control_name, mismatch_count)}
@@ -291,12 +374,27 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         self._inverter_clock: datetime | None = None
         self._clock_poll_wanted: bool = False
 
+        # On/off register, for the Inverter Power switch on profiles where it reads back
+        # the real state. Same opt-in as the clock: nothing is read until the switch -
+        # disabled by default - is enabled and asks.
+        self._onoff_register: int | None = None
+        self._onoff_raw: int | None = None
+
         # Profile re-check (#405). Detection runs once, in the config flow, and is never
         # revisited - so one failed read of register 30000 at setup strands an inverter
         # on a lesser profile permanently, with nothing telling the owner. Checked once
         # per session against a live connection instead.
         self._profile_recheck_done: bool = False
         self._pending_profile_issue: dict | None = None
+        # Set when the recheck finds the equivalence now holds, so a stale
+        # profile_mismatch from a previous session can be cleared. Not gated on "did this
+        # session raise it" - the issue is persistent across restarts and the flag that
+        # would track that is not, so the clear has to be unconditional here and safe to
+        # attempt against an issue that never existed (#454, reported by @as-wallpen: the
+        # notice survived the b25 alias-equivalence fix because nothing ever cleared it).
+        # Deleted from the async side only - the recheck itself runs in the executor,
+        # where issue_registry calls are not safe.
+        self._pending_profile_issue_clear = False
 
     @property
     def inverter_clock(self) -> datetime | None:
@@ -315,6 +413,26 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         next reload is not worth the bookkeeping.
         """
         self._clock_poll_wanted = True
+
+    @property
+    def onoff_raw(self) -> int | None:
+        """The on/off register as of the last poll; None until requested or when unreadable."""
+        return self._onoff_raw
+
+    def enable_onoff_polling(self, register: int) -> None:
+        """Start reading the on/off register each poll. Called by the Inverter Power switch."""
+        self._onoff_register = register
+
+    def _refresh_onoff(self) -> None:
+        """Read the on/off register into _onoff_raw. Runs in the executor, both fetch paths."""
+        if self._onoff_register is None:
+            return
+        try:
+            regs = self._client.read_holding_registers(self._onoff_register, 1)
+            self._onoff_raw = int(regs[0]) if regs else None
+        except Exception as err:
+            _LOGGER.debug("Could not read on/off register this poll: %s", err)
+            self._onoff_raw = None
 
     def _recheck_profile_against_dtc(self) -> None:
         """Re-read the device type code and check it agrees with the profile in use.
@@ -386,6 +504,21 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         configured = self.config_entry.data.get(CONF_INVERTER_SERIES, "")
         if suggested == configured:
             _LOGGER.debug("Profile re-check: DTC %s agrees with the profile in use", dtc)
+            self._pending_profile_issue_clear = True
+            return
+
+        # A DTC shared by hardware generations that need different profiles. 5100 covers
+        # MIN TL-XH and TL-XH2, and the XH2 answers only the VPP ranges - so the default
+        # profile's 3000 block is silent there, and "move to the default" was advice that
+        # would break a working install (#461).
+        _entry = DTC_REGISTRY.get(dtc)
+        if _entry and configured in _entry.alternatives:
+            _LOGGER.debug(
+                "Profile re-check: DTC %s covers several generations and '%s' is one of "
+                "its recognised profiles - staying quiet", dtc, configured,
+            )
+            self._profile_recheck_done = True
+            self._pending_profile_issue_clear = True
             return
 
         # Say nothing when the two profiles would behave identically.
@@ -420,6 +553,7 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 dtc, suggested, configured,
             )
             self._profile_recheck_done = True
+            self._pending_profile_issue_clear = True
             return
 
         entry = DTC_REGISTRY.get(dtc)
@@ -615,6 +749,67 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
     # during a reboot is normal, and 2 failures out of 3 reads says nothing.
     _GATEWAY_MIN_SAMPLE = 200
     _GATEWAY_BAD_FRACTION = 0.05
+
+    @callback
+    def _check_never_responded(self) -> None:
+        """Suggest the Modbus unit ID when an entry has never once answered (#424).
+
+        Deliberately narrow. This fires only when there has been no successful read since
+        setup - not when a working entry goes offline, which is an inverter that is asleep,
+        powered down or briefly unreachable, and where naming the unit ID would be actively
+        misleading. Raised at most once per entry, and withdrawn on the first success.
+
+        A wrong unit ID is indistinguishable from a broken link from the symptoms alone: on
+        #414 a WIT configured for unit 2 answered only on unit 1, and every block read timed
+        out and surfaced as a transport error. The EMS COM address had been set to 2 in
+        ShineTools and the firmware ignored it. Two days to find, with a standalone Modbus
+        client, and the fix was one field.
+
+        Note this cannot distinguish a wrong unit ID from an unreachable host - both produce
+        silence. It is worded as something to check rather than as a diagnosis.
+        """
+        if self._ever_polled_successfully or self._unit_id_issue_raised:
+            return
+        if self._consecutive_failures < self._failure_threshold:
+            return
+
+        self._unit_id_issue_raised = True
+        slave_id = self.config_entry.data.get(CONF_SLAVE_ID, 1)
+
+        if self.config_entry.data.get(CONF_CONNECTION_TYPE) == "serial":
+            target = self.config_entry.data.get(CONF_DEVICE_PATH, "the serial port")
+        else:
+            target = (
+                f"{self.config_entry.data.get(CONF_HOST, '?')}:"
+                f"{self.config_entry.data.get(CONF_PORT, '?')}"
+            )
+
+        _LOGGER.warning(
+            "No successful read since setup after %d attempts on %s at unit ID %s. If the "
+            "address is wrong every read times out and looks like a dead link - check which "
+            "unit ID the inverter actually answers on before assuming a connection fault.",
+            self._consecutive_failures, target, slave_id,
+        )
+        try:
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                f"unit_id_never_responded_{self.config_entry.entry_id}",
+                is_fixable=False,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key="unit_id_never_responded",
+                translation_placeholders={
+                    "target": str(target),
+                    "slave_id": str(slave_id),
+                    "attempts": str(self._consecutive_failures),
+                },
+                learn_more_url=(
+                    "https://github.com/0xAHA/Growatt_ModbusTCP/blob/main/"
+                    "docs/troubleshooting/raising-an-issue.md"
+                ),
+            )
+        except Exception as err:
+            _LOGGER.debug("Could not create unit ID repair issue: %s", err)
 
     @callback
     def _check_gateway_health(self) -> None:
@@ -823,10 +1018,13 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
 
         # Clear daily total retention so new day starts fresh
         self._retained_daily_totals = {}
+        self._daily_first_candidates = {}
+        self._daily_zero_streak = {}
 
         # A new day may hit the spike guard for new reasons, and one line per day is worth
         # having. Without this the first session-warning is the only one ever logged (#412).
         self._spike_warned = set()
+        self._backward_step_warned = set()
 
         # Open a grace window so _protect_energy_totals() can suppress the stale
         # pre-reset values the inverter reports before it clears its own daily counters
@@ -1033,8 +1231,31 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             retained = self._retained_lifetime_totals.get(attr)
 
             if value > 0:
+                # A lifetime counter stepping backwards by a hair, exactly as the daily
+                # ones do below. This guard was added to the daily loop alone in
+                # v1.10.0-b4, which fixed half the reported case: load_energy_today is a
+                # daily attribute and was held, while load_energy_total is a lifetime one
+                # and went on tripping total_increasing on its own - from the same
+                # underlying event, three milliseconds apart (#417).
+                #
+                # A lifetime counter has no legitimate reason to decrease at all, so this
+                # is if anything less ambiguous here than on the daily side.
+                if (
+                    retained is not None
+                    and value < retained
+                    and (retained - value) <= _BACKWARD_STEP_TOLERANCE_KWH
+                ):
+                    if attr not in self._backward_step_warned:
+                        self._backward_step_warned.add(attr)
+                        _LOGGER.debug(
+                            "[ENERGY_GUARD] %s stepped back %.3f kWh (%.3f -> %.3f); "
+                            "holding the previous value so Home Assistant does not record "
+                            "a meter reset. Further occurrences not logged.",
+                            attr, retained - value, retained, value,
+                        )
+                    setattr(data, attr, retained)
                 # Real value — update retention if changed
-                if self._retained_lifetime_totals.get(attr) != value:
+                elif self._retained_lifetime_totals.get(attr) != value:
                     self._retained_lifetime_totals[attr] = value
                     _updated = True
             elif retained is not None and retained > 0:
@@ -1068,8 +1289,10 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             retained = self._retained_daily_totals.get(attr)
 
             if value > 0:
+                self._daily_zero_streak.pop(attr, None)
                 # Spike guard — reject implausible jumps
                 _spike = False
+                _awaiting_confirmation = False
                 if retained is None:
                     # First reading after midnight clear (or inverter just came online).
                     #
@@ -1116,14 +1339,54 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                         )
                         setattr(data, attr, 0)
                         continue  # Do not update retention
-                    # Grace expired — normal spike guard: morning readings should be near 0.
+                    # Grace expired. With no baseline, a large reading is either a glitch
+                    # or a real mid-day total - and there is nothing to compare it against.
+                    #
+                    # This used to reject it outright, which is right for a glitch and
+                    # wrong for everything else: retention is lost on every restart or
+                    # reload, and whenever a counter reads a single 0, so on a 25 kW MID the
+                    # next genuine reading (22 kWh at 14:00) was rejected, and so was every
+                    # one after it, leaving Energy Today or a PV string unknown until
+                    # midnight (#464).
+                    #
+                    # A glitch does not repeat; a real counter does, or grows a little. So
+                    # the reading is withheld once and believed when the next poll agrees
+                    # with it - unless it is beyond any day's possible total, which no
+                    # amount of repetition makes real.
                     if value > _SPIKE_THRESHOLD_KWH:
-                        _spike = True
+                        _candidate = self._daily_first_candidates.get(attr)
+                        if (
+                            value < _DAILY_FIRST_READING_CEILING_KWH
+                            and _candidate is not None
+                            and _candidate - _BACKWARD_STEP_TOLERANCE_KWH
+                            <= value
+                            <= _candidate + _SPIKE_THRESHOLD_KWH
+                        ):
+                            _LOGGER.debug(
+                                "[ENERGY_GUARD] %s: %.3f kWh confirmed by a second poll "
+                                "(previous %.3f kWh) - accepting as today's total",
+                                attr, value, _candidate,
+                            )
+                        else:
+                            self._daily_first_candidates[attr] = value
+                            _spike = True
+                            _awaiting_confirmation = value < _DAILY_FIRST_READING_CEILING_KWH
                 elif value - retained > _SPIKE_THRESHOLD_KWH:
                     # Value jumped far more than any real system can accumulate in one poll.
                     _spike = True
 
-                if _spike:
+                if _spike and _awaiting_confirmation:
+                    # Not a glitch yet, just unconfirmed - nothing to warn about. One poll
+                    # of unknown, then the next decides.
+                    _LOGGER.debug(
+                        "[ENERGY_GUARD] %s: first reading %.3f kWh has no baseline - "
+                        "withholding until the next poll confirms it",
+                        attr, value,
+                    )
+                    _unread = getattr(data, 'unread_fields', None)
+                    if _unread is not None:
+                        _unread.add(attr)
+                elif _spike:
                     # Warn once per attribute per session, then drop to debug. The
                     # condition is not always transient: a register the model never
                     # populates, or a daily counter this inverter clears late, repeats on
@@ -1164,7 +1427,38 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                         if _unread is not None:
                             _unread.add(attr)
                 else:
-                    if self._retained_daily_totals.get(attr) != value:
+                    # A counter that steps backwards by a hair is the inverter's own
+                    # arithmetic, and Home Assistant reads any decrease on a
+                    # total_increasing sensor as a meter reset.
+                    #
+                    # Confirmed at the register: load_energy_today read raw 92 against a
+                    # retained 9.3 kWh - one count down, 0.1 kWh - with load_energy_total
+                    # stepping identically in the same poll. Nothing wrong on the wire; the
+                    # inverter recomputed a total and rounded down (#417).
+                    #
+                    # Held at the previous value rather than published. The counter is
+                    # monotonic again within a poll or two, and the alternative is a
+                    # phantom reset that distorts the energy dashboard - which is a
+                    # permanent record, where a tenth of a kWh briefly held is not.
+                    #
+                    # Only a hair. A genuine reset drops to zero and is handled above; a
+                    # large drop is left alone, because that is a real event we should not
+                    # be inventing continuity across.
+                    if (
+                        retained is not None
+                        and value < retained
+                        and (retained - value) <= _BACKWARD_STEP_TOLERANCE_KWH
+                    ):
+                        if attr not in self._backward_step_warned:
+                            self._backward_step_warned.add(attr)
+                            _LOGGER.debug(
+                                "[ENERGY_GUARD] %s stepped back %.3f kWh (%.3f -> %.3f); "
+                                "holding the previous value so Home Assistant does not "
+                                "record a meter reset. Further occurrences not logged.",
+                                attr, retained - value, retained, value,
+                            )
+                        setattr(data, attr, retained)
+                    elif self._retained_daily_totals.get(attr) != value:
                         _LOGGER.debug(
                             "[ENERGY_GUARD] Accepted %s: %.3f kWh (was retained=%.3f kWh, delta=%.3f kWh)",
                             attr, value,
@@ -1172,13 +1466,27 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                             value - (retained if retained is not None else 0.0),
                         )
                         self._retained_daily_totals[attr] = value
+                        self._daily_first_candidates.pop(attr, None)
                         _updated = True
             elif retained is not None and retained > 0:
-                if _device_reporting:
+                _zero_streak = self._daily_zero_streak.get(attr, 0) + 1
+                if _device_reporting and _zero_streak < _DAILY_ZERO_CONFIRM_POLLS:
+                    # A drop to 0 from a counter that read non-zero: hold the last value
+                    # until the zero repeats. One torn read published here becomes a meter
+                    # reset in Home Assistant and double-counts the day (#464).
+                    self._daily_zero_streak[attr] = _zero_streak
+                    _LOGGER.debug(
+                        "[ENERGY_GUARD] %s read 0 after %.3f kWh (zero poll %d of %d) - "
+                        "holding the previous value until the zero is confirmed",
+                        attr, retained, _zero_streak, _DAILY_ZERO_CONFIRM_POLLS,
+                    )
+                    setattr(data, attr, retained)
+                elif _device_reporting:
                     # A real zero from a working inverter: no activity of this kind today.
                     # Substituting here is what kept a reporter's AC Discharge Energy Today
                     # showing yesterday's 2.90 kWh for a whole day while the register read
-                    # 0 on every poll (#410).
+                    # 0 on every poll (#410). Confirmed above over a few polls first (#464).
+                    self._daily_zero_streak.pop(attr, None)
                     _LOGGER.debug(
                         "[ENERGY_GUARD] %s: hardware reported 0 and the inverter is "
                         "reporting (lifetime totals non-zero) — accepting the zero and "
@@ -1246,6 +1554,8 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                             self._consecutive_failures
                         )
 
+                self._check_never_responded()
+
                 if self.data is None:
                     # First startup with inverter offline — create empty placeholder so the
                     # integration loads successfully. Regular polling will connect when the
@@ -1256,7 +1566,9 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                         "Inverter unreachable at startup — integration loading with empty state. "
                         "Sensors will be unavailable until the inverter responds."
                     )
-                    from .growatt_modbus import GrowattData
+                    # GrowattData is imported at module level. A local import here made it
+                    # local to the whole method, so the startup-failure path further down,
+                    # which also builds a placeholder, raised UnboundLocalError (#479).
                     self.data = GrowattData()
 
                 _LOGGER.debug("Inverter offline - applying smart offline behavior")
@@ -1282,6 +1594,8 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                     self._current_date = current_date
                     # Clear daily retention for new day
                     self._retained_daily_totals = {}
+                    self._daily_first_candidates = {}
+                    self._daily_zero_streak = {}
 
                 # Return existing data (sensors will apply offline behavior via get_sensor_value)
                 return self.data
@@ -1299,6 +1613,22 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 )
                 self.update_interval = self._normal_update_interval
             self._consecutive_failures = 0
+
+            # First success clears the never-responded state for good. Whatever the entry
+            # is configured with demonstrably works, so the unit-ID suggestion would be
+            # wrong from here on.
+            if not self._ever_polled_successfully:
+                self._ever_polled_successfully = True
+                if self._unit_id_issue_raised:
+                    self._unit_id_issue_raised = False
+                    try:
+                        ir.async_delete_issue(
+                            self.hass,
+                            DOMAIN,
+                            f"unit_id_never_responded_{self.config_entry.entry_id}",
+                        )
+                    except Exception as err:
+                        _LOGGER.debug("Could not clear unit ID repair issue: %s", err)
 
             # Update successful - record timestamp (timezone-aware)
             from datetime import timezone as tz
@@ -1458,6 +1788,24 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 except Exception as err:
                     _LOGGER.debug("Could not create profile mismatch issue: %s", err)
 
+            # Clear a stale profile_mismatch left over from a previous session. The recheck
+            # sets this whenever the equivalence check now holds - which includes the case
+            # that motivated it: an alias-table fix (#453) landing after the notice was
+            # raised, with nothing to restore the two profiles' equivalence except an
+            # update the user has now installed. Attempted unconditionally rather than
+            # tracked against "did this session raise it" - that flag would reset on every
+            # restart while the issue itself persists, which is the bug. Wrapped the same
+            # way the create call above is, so a delete against an ID that was never raised
+            # costs nothing worse than a debug line (#454, reported by @as-wallpen).
+            if self._pending_profile_issue_clear:
+                self._pending_profile_issue_clear = False
+                try:
+                    ir.async_delete_issue(
+                        self.hass, DOMAIN, f"profile_mismatch_{self.config_entry.entry_id}",
+                    )
+                except Exception as err:
+                    _LOGGER.debug("Could not clear profile mismatch issue: %s", err)
+
             if self._pending_clock_notification:
                 notif = self._pending_clock_notification
                 self._pending_clock_notification = None
@@ -1470,7 +1818,9 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
 
             # Protect energy totals from dormant-inverter zeros; persist immediately
             # so a HA restart between polls doesn't cause a backward step (Issue #285).
-            if self._protect_energy_totals(data):
+            # A newly validated battery power scale rides the same write (#434).
+            scale_changed = self._note_validated_battery_power_scale()
+            if self._protect_energy_totals(data) or scale_changed:
                 await self._async_save_energy_totals()
 
             # Compute WIT mode status from control registers (WIT profiles only)
@@ -1616,11 +1966,13 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 # turned a 5s poll into a 205s one and starved set_wit_mode of the lock.
                 # Flag it instead; the event loop dispatches it as its own executor job
                 # (see _async_update_data), which takes the hub lock per read.
-                if self._identification_due():
-                    self._identification_pending = True
-                # These two stay inline: both are bounded single reads on registers the
-                # profile declares, and both need the connection this poll already holds.
+                if not self._identification_complete:
+                    if self._identification_due():
+                        self._identification_pending = True
+                # These stay inline: they are bounded single reads on registers the
+                # profile declares, and they need the connection this poll already holds.
                 self._refresh_inverter_clock()
+                self._refresh_onoff()
                 self._recheck_profile_against_dtc()
 
             time.sleep(inter_slave_delay)
@@ -1633,7 +1985,16 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             return None
 
         finally:
-            hub._lock.release()
+            # end_poll() is what closes a hub released mid-poll: release_ref() only
+            # marks it and takes the lock best-effort, so if a poll was holding the bus
+            # this is the moment the socket actually goes away. The lock is an RLock and
+            # we still hold it, so calling it here closes under the lock rather than
+            # racing whatever starts next. (For serial it also gives the port back
+            # between polls, which is its original purpose.)
+            try:
+                hub.end_poll()
+            finally:
+                hub._lock.release()
 
     def _fetch_data(self) -> GrowattData | None:
         """Fetch data from the inverter (runs in executor)."""
@@ -1710,9 +2071,11 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                     # re-enter rather than block, and the client is disconnected right
                     # after this block — so identification still runs inline here, but
                     # bounded to one pass instead of repeating every poll.
-                    self._run_identification()
+                    if not self._identification_complete:
+                        self._run_identification()
                     # Before the disconnect - this path closes the socket on its way out.
                     self._refresh_inverter_clock()
+                    self._refresh_onoff()
                     self._recheck_profile_against_dtc()
                     self._client.disconnect()
                     return data
@@ -1805,17 +2168,80 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 "Restored %d lifetime totals, %d daily totals from storage",
                 len(self._retained_lifetime_totals), len(self._retained_daily_totals),
             )
+            self._stored_payload = dict(stored)
+            self._restore_battery_power_scale(stored)
         except Exception as err:
             _LOGGER.warning("Failed to load persisted energy totals (non-fatal): %s", err)
+
+    def _restore_battery_power_scale(self, stored: dict) -> None:
+        """Hand a previously validated battery power scale back to the client (#434).
+
+        Runs at setup, which is also what runs after a reload - so whatever rebuilds the
+        client on the reporter's gateway, the scale comes back with it instead of falling
+        to the profile default and needing 500 W of load to be re-earned.
+        """
+        scale, reason = battery_power_scale_from_store(
+            stored, self._profile_key_for_storage()
+        )
+        if scale is None:
+            # At INFO, not debug. A reporter whose scale did not come back needs to know
+            # which of these happened, and asking them to turn on debug and restart again
+            # costs a day (#434).
+            _LOGGER.info("Battery power scale not restored: %s", reason)
+            return
+
+        self._persisted_battery_power_scale = scale
+        if self._client is not None:
+            self._client.restore_battery_power_scale(scale)
+        else:
+            _LOGGER.info(
+                "Battery power scale of %sW read from storage, but the client is not built "
+                "yet - it will be re-detected instead", scale,
+            )
+
+    def _profile_key_for_storage(self) -> str:
+        """Identifies the register map a stored scale was validated against."""
+        client = self._client
+        if client is None:
+            return ""
+        return str(client.register_map.get("name", ""))
+
+    def _note_validated_battery_power_scale(self) -> bool:
+        """Record a newly confirmed scale for persistence. True if it changed.
+
+        Only a scale the detector fully validated this session is stored - never one that
+        was itself restored, or a mis-detection would copy itself forward for ever (#406).
+        """
+        client = self._client
+        if client is None:
+            return False
+        detected = getattr(client, "validated_battery_power_scale", None)
+        if detected is None or detected == self._persisted_battery_power_scale:
+            return False
+        self._persisted_battery_power_scale = float(detected)
+        _LOGGER.info(
+            "Storing the validated battery power scale of %sW so it survives a reconnect "
+            "or restart (#434)", detected,
+        )
+        return True
 
     async def _async_save_energy_totals(self) -> None:
         """Save energy retention dicts to HA storage."""
         try:
-            await self._energy_store.async_save({
+            payload = {
                 "lifetime_totals": dict(self._retained_lifetime_totals),
                 "daily_totals": dict(self._retained_daily_totals),
                 "daily_totals_date": datetime.now().date().isoformat(),
-            })
+            }
+            # Never drop a scale this session has not restored - see the note in const.py.
+            battery_power_scale_into_payload(
+                payload,
+                self._persisted_battery_power_scale,
+                self._profile_key_for_storage(),
+                previous=self._stored_payload,
+            )
+            await self._energy_store.async_save(payload)
+            self._stored_payload = dict(payload)
         except Exception as err:
             _LOGGER.debug("Failed to save energy totals: %s", err)
 
@@ -1897,61 +2323,71 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             finally:
                 hub._lock.release()
 
-        raw = getattr(client, "client", None)
-        if raw is None:
-            return None
-        with optional_read_limits(raw):
+        # Direct (non-shared) path: through the wrapper, never past it (#426). The inner
+        # pymodbus client is only touched to shorten its timeout for the duration.
+        inner = getattr(client, "client", None)
+        limits = optional_read_limits(inner) if inner is not None else contextlib.nullcontext()
+        with limits:
             try:
-                try:
-                    response = raw.read_holding_registers(
-                        address=address, count=count, device_id=self._slave_id
-                    )
-                except TypeError:
-                    try:
-                        response = raw.read_holding_registers(
-                            address=address, count=count, slave=self._slave_id
-                        )
-                    except TypeError:
-                        response = raw.read_holding_registers(address=address, count=count)
+                return client.read_holding_registers(address, count)
             except Exception as err:
                 _LOGGER.debug("Identification read of holding %d failed: %s", address, err)
                 return None
-        if response is None:
-            return None
-        if hasattr(response, "isError") and callable(response.isError) and response.isError():
-            _LOGGER.debug("Identification read of holding %d returned %r", address, response)
-            return None
-        registers = getattr(response, "registers", None)
-        return list(registers) if registers else None
 
-    def _read_identification_registers(self, label: str, address: int, count: int):
-        """One identification read, with the per-register failure cache applied.
+    def _read_holding(self, address: int, count: int) -> list | None:
+        """Read holding registers through the client, never past it (#426).
 
-        A register the inverter ignored once will ignore us again, and each repeat costs
-        a full timeout.  Caching the failure for the session is the whole point: it is
-        the difference between a 5s poll and a 205s one.
+        Fork: a read listed in _IDENTIFICATION_READ_LABELS is an identification read - the
+        per-register failure cache applies and the read takes the short optional timeout
+        (see _identification_modbus_read). A register the inverter ignored once will ignore
+        us again, and each repeat costs a full timeout; caching the failure for the session
+        is the difference between a 5s poll and a 205s one. A _IdentificationDeferred
+        propagates: the read never reached the inverter, so it is not cached. The call
+        sites stay exactly upstream's, so the next sync does not conflict on them.
+
+        These calls used to go to `self._client.client` - the raw pymodbus client inside the
+        wrapper - which skips the branch that routes everything through the shared connection
+        hub. pymodbus sync clients auto-connect on their first transaction, so each of those
+        calls opened a SECOND socket to the gateway: one the hub never saw, never closed, and
+        could not close, because the hub only owns its own client.
+
+        That is the leak in #426. A clean start ended with two connections because setup
+        opened one and the first device-identification read opened the other, and every reload
+        added one more, since unload closes only the hub's. On a gateway with a five-client
+        ceiling it exhausted the slots.
+
+        Returns the registers, or None when the read failed or was not attempted - the same
+        shape `GrowattModbus.read_holding_registers()` uses, rather than a pymodbus result
+        object.
         """
-        if label in self._identification_failed_reads:
+        label = _IDENTIFICATION_READ_LABELS.get((address, count))
+        if label is not None:
+            if label in self._identification_failed_reads:
+                return None
+            registers = self._identification_modbus_read(address, count)
+            if registers is None:
+                # Genuinely unanswered (as opposed to "the bus was busy") - never repeat it.
+                self._identification_failed_reads.add(label)
+                _LOGGER.debug(
+                    "Identification read '%s' (holding %d, %d regs) unanswered - "
+                    "not retried this session",
+                    label, address, count,
+                )
+            return registers
+        if not self._client:
             return None
-        # A _IdentificationDeferred here propagates: the read never reached the inverter,
-        # so it must not be cached as unanswered.
-        registers = self._identification_modbus_read(address, count)
-        if registers is None:
-            # Genuinely unanswered (as opposed to "the bus was busy") - never repeat it.
-            self._identification_failed_reads.add(label)
-            _LOGGER.debug(
-                "Identification read '%s' (holding %d, %d regs) unanswered - "
-                "not retried this session",
-                label, address, count,
-            )
-        return registers
+        try:
+            return self._client.read_holding_registers(address, count)
+        except Exception as err:
+            _LOGGER.debug("Holding read %d (+%d) failed: %s", address, count, err)
+            return None
 
     def _read_device_identification(self):
         """Read device identification info (serial, firmware, inverter type).
 
         Called only from _run_identification(), which bounds how often this happens.
-        Every read goes through _read_identification_registers so an unanswered register
-        is paid for once, not once per poll.
+        Every read goes through _read_holding so an unanswered register is paid for once,
+        not once per poll, and never past the client wrapper (#426).
         """
         try:
             if not self._client:
@@ -1967,21 +2403,37 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
 
             # Read serial number
             if is_tl_x_model:
-                registers = self._read_identification_registers("serial", 3000, 15)
+                # TL-X/TL-XH: registers 3000-3015 (30 characters)
+                registers = self._read_holding(3000, 15)
             else:
-                registers = self._read_identification_registers("serial", 23, 5)
+                # Standard: registers 23-27 (10 characters)
+                registers = self._read_holding(23, 5)
             if registers:
                 self._serial_number = self._registers_to_ascii(registers)
                 _LOGGER.debug("Read serial number: %s", self._serial_number)
 
             # Read firmware version (registers 9-11)
-            registers = self._read_identification_registers("firmware", 9, 3)
+            registers = self._read_holding(9, 3)
             if registers:
                 self._firmware_version = self._registers_to_ascii(registers)
                 _LOGGER.debug("Read firmware version: %s", self._firmware_version)
 
+            # Firmware build string (V1.39 holding 82-87, "FW Build No.").
+            #
+            # 9-11 is what V1.39 calls the firmware version, but it reads "AL1.0" on MIN
+            # TL-XH units whose builds differ - ALBA130101 drops low SOC-limit writes and
+            # ALBA180101 accepts them, and ALBA10010129 lacks VPP entirely where
+            # ALBA18010122 has it. The build string is what tells them apart, and what the
+            # Growatt portal shows as "Version" (@l4m4re, #458; #400, #449).
+            #
+            # Off-grid profiles are skipped: their holding 82+ are unrelated settings.
+            if not profile.get("offgrid_protocol", False):
+                self._firmware_build = decode_firmware_build(self._read_holding(82, 6))
+                if self._firmware_build:
+                    _LOGGER.debug("Read firmware build: %s", self._firmware_build)
+
             # Read inverter type (registers 125-132)
-            registers = self._read_identification_registers("inverter_type", 125, 8)
+            registers = self._read_holding(125, 8)
             if registers:
                 self._inverter_type = self._registers_to_ascii(registers)
                 _LOGGER.debug("Read inverter type: %s", self._inverter_type)
@@ -1994,11 +2446,11 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             # Read Protocol version (register 30099 for VPP, 73 for offgrid).
             # If readable, shows actual protocol version (e.g. 2.01, 2.02).
             if not profile.get("offgrid_protocol", False):
-                registers = self._read_identification_registers("protocol_version", 30099, 1)
+                registers = self._read_holding(30099, 1)
                 legacy_label = "Protocol Legacy"
                 version_prefix = "Protocol"
             else:
-                registers = self._read_identification_registers("protocol_version", 73, 1)
+                registers = self._read_holding(73, 1)
                 legacy_label = "OffGrid Modbus"
                 version_prefix = "Modbus"
 
@@ -2019,6 +2471,18 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             else:
                 # Register not available - likely legacy protocol
                 self._protocol_version = legacy_label
+
+            # Identification is done once we have learned ANYTHING, not once we have the
+            # serial (#438): on hardware whose serial answers blank, gating on the serial
+            # repeated every read on every poll. Fork note: _run_identification() also
+            # closes the pass after one undeferred attempt, because every read is either
+            # answered or cached as unanswered by then.
+            self._identification_complete = any((
+                self._serial_number,
+                self._firmware_version,
+                self._inverter_type,
+                self._protocol_version,
+            ))
 
             # Consolidated identification summary - replaces scattered debug lines
             # with one INFO-level line visible in the default HA log.
@@ -2066,9 +2530,9 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
 
         try:
             if is_vpp:
-                raw = self._read_identification_registers("clock", 30104, 6)
+                raw = self._read_holding(30104, 6)
             else:
-                raw = self._read_identification_registers("clock", 45, 6)
+                raw = self._read_holding(45, 6)
 
             if not raw or len(raw) < 6:
                 _LOGGER.debug(
@@ -2086,7 +2550,11 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 _LOGGER.debug("Inverter clock returned invalid values: %s", raw)
                 return
 
-            ha_dt = datetime.now()
+            # Home Assistant's configured zone, not the host's. The RTC is wall-clock time
+            # with no zone, and the clock sync writes it in HA's zone - so on a host running
+            # in UTC (Docker without TZ, a dev container) the host clock reported a false
+            # drift of the whole UTC offset, straight after a correct sync (@l4m4re, #458).
+            ha_dt = dt_util.now().replace(tzinfo=None)
             drift_s = (inverter_dt - ha_dt).total_seconds()
             drift_abs = abs(drift_s)
 
@@ -2097,12 +2565,75 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 drift_s,
             )
 
-            if drift_abs > _CLOCK_DRIFT_THRESHOLD_S:
+            # User-configurable, and 0 turns the notice off entirely (#439).
+            #
+            # Some plants cannot clear this at all. The Growatt portal's plant timezone
+            # field offers fixed UTC offsets with no DST-aware zones, and the datalogger
+            # pushes that offset to the inverter - so from late March to late October an
+            # owner on UTC+2 is an hour out, structurally, with no portal setting that
+            # fixes it. A sync is reverted by the dongle within about a minute, and a
+            # scheduled one would fight it indefinitely and burn EEPROM writes for nothing.
+            threshold_s = self.config_entry.options.get(
+                "clock_drift_threshold_min", _CLOCK_DRIFT_THRESHOLD_S / 60) * 60
+            if threshold_s <= 0:
+                return
+
+            if drift_abs > threshold_s:
                 drift_min = drift_s / 60
                 direction = "ahead of" if drift_s > 0 else "behind"
-                self._pending_clock_notification = {
-                    "title": "Growatt: Inverter Clock Drift Detected",
-                    "message": (
+
+                # A whole-hour offset is a timezone, not drift.
+                #
+                # An RTC drifts gradually - seconds, then minutes - and does not arrive at
+                # exactly 3600 s. Landing within a minute of a whole hour says the clock is
+                # being *set* to a different zone, which is a different problem with a
+                # different answer, and telling that owner to press Sync is advice that
+                # cannot work: the datalogger overwrites it on its next push.
+                hours_off = round(drift_abs / 3600)
+                looks_like_timezone = hours_off >= 1 and abs(drift_abs - hours_off * 3600) <= 60
+
+                if looks_like_timezone:
+                    plural = "s" if hours_off != 1 else ""
+                    message = (
+                        f"The inverter's clock is **almost exactly {hours_off} hour{plural} "
+                        f"{direction}** Home Assistant time.\n\n"
+                        f"**Inverter time:** {inverter_dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"**HA time:** {ha_dt.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                        f"**This is a timezone offset rather than clock drift.** A clock that "
+                        f"is genuinely drifting does not land on a whole hour. The usual cause "
+                        f"is the plant timezone in the Growatt portal, which offers fixed UTC "
+                        f"offsets with no daylight-saving zones - so it is correct in winter "
+                        f"and an hour out in summer. Your datalogger pushes that offset to the "
+                        f"inverter.\n\n"
+                        f"**Syncing will not hold** while the datalogger is attached: it "
+                        f"overwrites the inverter's clock within a minute or two. Correct the "
+                        f"plant timezone in the portal if it is simply wrong; if your zone "
+                        f"observes daylight saving and the portal has no entry for it, there is "
+                        f"nothing to correct and this notice can be turned off.\n\n"
+                        f"**To stop this notice:** set **Clock Drift Warning** to 0 in the "
+                        f"integration's options, or raise it above "
+                        f"{hours_off * 60} minutes."
+                    )
+                else:
+                    # Off-grid clock writes are confirmed working (#443) — same remedy for
+                    # every profile now. is_clock_writable is kept as the check rather than
+                    # inlining True, so a future model that genuinely cannot write its clock
+                    # still gets an accurate notice instead of this one going stale again.
+                    if getattr(self._client, "is_clock_writable", True):
+                        remedy = (
+                            "**To fix:** Enable the **Inverter Clock Sync** button on the "
+                            "inverter device and press it, or call the "
+                            "`growatt_modbus.sync_inverter_time` action. Failing that, set "
+                            "the time via the ShinePhone app, the inverter LCD menu, or the "
+                            "Growatt web portal."
+                        )
+                    else:
+                        remedy = (
+                            "**To fix:** set the time via the ShinePhone app or the "
+                            "inverter's front panel. This model's clock can be read but not "
+                            "set over Modbus."
+                        )
+                    message = (
                         f"The inverter's internal clock is **{abs(drift_min):.1f} minutes {direction}** "
                         f"Home Assistant time.\n\n"
                         f"**Inverter time:** {inverter_dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -2111,11 +2642,12 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                         f"at its own midnight, not HA midnight. A large clock offset causes daily "
                         f"energy sensors to reset at the wrong time, which can produce incorrect "
                         f"daily totals and confuse the energy dashboard.\n\n"
-                        f"**To fix:** Enable the **Inverter Clock Sync** button on the inverter "
-                        f"device and press it, or call the `growatt_modbus.sync_inverter_time` "
-                        f"action. Failing that, set the time via the ShinePhone app, the inverter "
-                        f"LCD menu, or the Growatt web portal."
-                    ),
+                        f"{remedy}"
+                    )
+
+                self._pending_clock_notification = {
+                    "title": "Growatt: Inverter Clock Drift Detected",
+                    "message": message,
                     "notification_id": "growatt_clock_drift",
                 }
 
@@ -2213,6 +2745,55 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
         """
         return self.get_device_info(DEVICE_TYPE_INVERTER)
 
+    def _via_parent_inverter(self, entry_id: str) -> dict:
+        """How a child device points at the parent inverter, across HA versions.
+
+        `DeviceInfo["via_device"]` took an identifier tuple. It is deprecated because
+        identifiers are only unique *per config entry* and so no longer name one device;
+        the replacement is `via_device_id`, an already-resolved device id, looked up with
+        `async_get_device_id_by_identifier()` - a helper added alongside the deprecation in
+        HA 2026.8. The old form warns now and raises from HA 2027.8.
+
+        **We declare no minimum Home Assistant version**, in neither `hacs.json` nor
+        `manifest.json`, so HACS offers our releases to any HA. Calling that helper
+        unconditionally would raise `AttributeError` on anything older and leave every
+        child device unbuilt - solar, grid, load and battery all gone. That is far worse
+        than a deprecation line in the log, so the old form stays as the fallback until
+        the floor moves (#416, reported by @Vict20).
+
+        The parent is pre-created in `__init__.py` before the platforms are forwarded (the
+        #224 race fix), which is exactly the precondition an id lookup needs.
+
+        Returns the fragment to splat into a DeviceInfo dict.
+        """
+        identifier = (DOMAIN, f"{entry_id}_inverter")
+
+        from homeassistant.helpers import device_registry as dr
+
+        resolve = getattr(dr, "async_get_device_id_by_identifier", None)
+        if resolve is None:
+            return {"via_device": identifier}
+
+        try:
+            device_id = resolve(self.hass, identifier, config_entry_id=entry_id)
+        except Exception as err:  # noqa: BLE001 - signature differences across versions
+            _LOGGER.debug(
+                "via_device_id lookup unavailable (%s); using the deprecated identifier "
+                "form. Harmless until HA 2027.8.", err,
+            )
+            return {"via_device": identifier}
+
+        if device_id is None:
+            # Should not happen - the parent is pre-created before platforms load. Losing
+            # the parent link keeps the device; raising here would lose the device.
+            _LOGGER.debug(
+                "Parent inverter device is not in the registry yet for %s; child device "
+                "will be created without a parent link", entry_id,
+            )
+            return {}
+
+        return {"via_device_id": device_id}
+
     def get_device_info(self, device_type: str) -> dict:
         """Get device info for a specific device type.
 
@@ -2242,9 +2823,11 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             if self._serial_number:
                 device_info["serial_number"] = self._serial_number
 
-            # Add firmware version if available
-            if self._firmware_version:
-                device_info["sw_version"] = self._firmware_version
+            # Add firmware version if available, with the build string where there is one
+            if self._firmware_version and self._firmware_build:
+                device_info["sw_version"] = f"{self._firmware_version} ({self._firmware_build})"
+            elif self._firmware_version or self._firmware_build:
+                device_info["sw_version"] = self._firmware_version or self._firmware_build
 
             # Add protocol version (VPP 2.01 or Legacy)
             if self._protocol_version:
@@ -2253,7 +2836,7 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
             return device_info
 
         # All other devices reference the inverter as parent
-        via_device = (DOMAIN, f"{entry_id}_inverter")
+        via_device = self._via_parent_inverter(entry_id)
 
         if device_type == DEVICE_TYPE_SOLAR:
             return {
@@ -2261,7 +2844,7 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 "name": f"{base_name} Solar",
                 "manufacturer": "Growatt",
                 "model": "Solar Production",
-                "via_device": via_device,
+                **via_device,
             }
 
         elif device_type == DEVICE_TYPE_GRID:
@@ -2270,7 +2853,7 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 "name": f"{base_name} Grid",
                 "manufacturer": "Growatt",
                 "model": "Grid Connection",
-                "via_device": via_device,
+                **via_device,
             }
 
         elif device_type == DEVICE_TYPE_LOAD:
@@ -2279,7 +2862,7 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 "name": f"{base_name} Load",
                 "manufacturer": "Growatt",
                 "model": "Load Management",
-                "via_device": via_device,
+                **via_device,
             }
 
         elif device_type == DEVICE_TYPE_BATTERY:
@@ -2288,7 +2871,7 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 "name": f"{base_name} Battery",
                 "manufacturer": "Growatt",
                 "model": "Battery Storage",
-                "via_device": via_device,
+                **via_device,
             }
 
         elif device_type == DEVICE_TYPE_BACKUPBOX:
@@ -2296,8 +2879,11 @@ class GrowattModbusCoordinator(DataUpdateCoordinator[GrowattData]):
                 "identifiers": {(DOMAIN, f"{entry_id}_backup_box")},
                 "name": f"{base_name} Backup Box",
                 "manufacturer": "Growatt",
-                "model": "ARK Backup Box",
-                "via_device": via_device,
+                # V1.39 calls 3250-3342 the "Backup box"; VPP 30115 names it "SYN". It
+                # said ARK, which is a Growatt battery line, so APX owners saw their
+                # transfer switch labelled as someone else's battery (#460).
+                "model": "Backup Box (SYN)",
+                **via_device,
             }
 
         # Default to inverter for unknown device types

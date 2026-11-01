@@ -127,10 +127,1940 @@ everything else in v1.9.0-v1.9.6 is documented in the upstream sections further 
 
 ---
 
-## Unreleased
+## v2.0.6
 
-Staged for the next release. **Not yet published** - v1.9.6 is the current stable.
+Promoted to stable from the pre-release line below (b1 through b12). Every change in that
+line is included. See each `v2.0.6-bN` section for the individual reports and hardware
+confirmations behind it, or the [GitHub release](https://github.com/0xAHA/Growatt_ModbusTCP/releases/tag/v2.0.6)
+for a summary grouped by area.
 
+What you may notice on upgrading from v2.0.5:
+
+- **WIT:** a control write refused by the 30-second cooldown now fails with an error
+  instead of appearing to succeed. Releasing control (Control Authority or Remote Power
+  Control set to Disabled) is never refused. Automations that arm VPP control twice within
+  30 seconds should allow for the error.
+- **WIT:** Discharge Cutoff SOC is now **On-Grid Discharge Cutoff SOC**, and both cut-off
+  controls show the inverter's values rather than defaults.
+- **SPH / SPH-TL3:** Battery First and Grid First periods 4-6 moved to the registers the
+  inverter actually uses. If you set them from Home Assistant before, check them in the
+  Growatt app.
+- **Dry Contact State** is now only on MIN TL-X, the only profiles with its register.
+- **MOD/MID TL3-XH:** new battery pack and full charge capacity sensors appear (diagnostic).
+- **New controls are disabled by default.** Enable them on the device page if you want them.
+
+---
+
+## v2.0.6-b12
+
+Issues: #483, #484
+
+- **Fix (SPH, SPH-TL3): Battery First and Grid First periods 4-6 now use the right
+  registers.** They were one register early, so setting a period wrote its end time into
+  the start and its enable flag into the end. They now match what the inverter uses. If
+  you set periods 4-6 from Home Assistant before, check them in the Growatt app after
+  updating. Confirmed on an SPH3600 by @Vict20; enables for periods 5 and 6 follow the
+  same pattern.
+
+- **No more warning for a missing second battery stack.** On a single-battery system,
+  "Optional VPP range (31300-31323) failed" is no longer logged as a warning. It was
+  expected, not a fault. Reported by @feinerer.
+
+---
+
+## v2.0.6-b11
+
+Issues: #482
+
+- **MOD/MID TL3-XH: full charge capacity for each battery stack.** **Battery Full Charge
+  Capacity** (stack 1) and **Battery 2 Full Charge Capacity** (stack 2, disabled by
+  default), in Ah. The figure drops by one module's capacity when the BMS puts a module to
+  sleep, and slowly as the battery ages. Thanks to @robintheander for the scans.
+
+- **MOD/MID TL3-XH: battery pack sensors.** Battery Clusters, Modules per Cluster, Module
+  Rated Voltage / Capacity and Battery Working Status, already on MIN TL-XH, now appear on
+  these profiles too. Modules per Cluster is the installed count.
+
+---
+
+## v2.0.6-b10
+
+Issues: #481, #482
+
+- **Fix (WIT): a control write refused by the 30-second cooldown no longer reports a
+  "write reversion".** Nothing had been sent, but the integration verified it anyway and
+  raised a notice blaming the cloud. The action now fails with an error, so an automation
+  can see the value was not written. Reported by @Wojak129.
+
+- **WIT: releasing VPP control is never held back by the cooldown.** Setting Control
+  Authority or Remote Power Control to Disabled now goes through at once, however recently
+  it was enabled.
+
+- **WIT: Remote Control Duration (30408) and Remote Charge/Discharge Power (30409) are always
+  written**, even when the value has not changed. They are commands rather than stored
+  settings, so a repeated write is no longer skipped.
+
+- **Auto-detection follows Growatt's latest model table (VPP V2.05).** New, unconfirmed:
+  SPM-HU regional variants (DTC 21305, 21308, 21309), WIT 4-25K-XHU (5605) and WIS 125K-AM
+  (5604). If you own one of these, a register scan would confirm the mapping.
+
+- Register labels on some VPP addresses now match the protocol (grid energy counters at
+  31118-31123, battery full-charge capacity scale). No sensor values change.
+
+---
+
+## v2.0.6-b9
+
+Issues: #481
+
+- **Fix (WIT): Charge Cutoff SOC and Discharge Cutoff SOC now show the inverter's
+  values.** They showed fixed defaults (100 % and 10 %) until written from Home Assistant,
+  so a limit set in ShinePhone was never visible. The discharge control is renamed
+  **On-Grid Discharge Cutoff SOC** (register 30405); the off-grid floor is separate (30475).
+  Reported by @Wojak129.
+
+- **WIT: new VPP Last Setpoint sensor** (register 30474, diagnostic, disabled by default).
+
+- **Docs: Remote Control Duration (30408) is a countdown, not a maximum.** Per VPP V2.05,
+  any value from 1 to 1440 expires and the inverter returns to self-consumption while the
+  controls still read as set. Use 0 for control that runs until you stop it.
+
+---
+
+## v2.0.6-b8
+
+Issues: #475, #478, #479
+
+- **Fix: Grid Connection Status stopped updating in v2.0.6-b6 and b7** on SPH, SPH-TL3, SPA
+  and MIN TL-XH2 without the VPP status register, and logged an error on every poll. It
+  updates normally again. Found and diagnosed by @Vict20.
+
+- **TOU periods (MOD, MID, MIN TL-XH): changing several settings of one period in quick
+  succession no longer undoes the earlier change**, and the change shows straight away
+  instead of after the next poll. Reported by @robintheander.
+
+- **The integration now ships its own icon and logo**, shown by Home Assistant 2026.3 and
+  newer. Contributed by @frenck (PR #478).
+
+---
+
+## v2.0.6-b7
+
+Issues: #475
+
+- **MOD/MID-XH: Priority Mode now shows the mode the inverter is actually in.** It read a
+  default-mode register that stays at 0, so it showed Load First whatever was set. It now
+  reads the live mode register. Reported by @robintheander.
+
+---
+
+## v2.0.6-b6
+
+Issues: #451, #471, #474
+
+- **SPH, SPH-TL3, SPA and MIN TL-XH2: Grid Connection Status shows On-grid in normal
+  running.** On models without the VPP status register it read the wrong status table, so it
+  showed Unknown through PV On-Grid and Bat On-Grid, and On-grid only while Waiting.
+  Reported by @Vict20.
+
+- **SPF: Battery to Utility Switchover can no longer be set above Utility to Battery
+  Switchover**, and the other way round. The inverter silently reverts a value that breaks
+  that order; the controls now stop there, and a script asking for one gets an error saying
+  why. To raise both, raise Utility to Battery first. Found by @takisbg.
+
+- **MOD/MID with two battery packs: new Battery 1 Charge/Discharge Today/Total sensors**,
+  pack 1's own counters, disabled by default. The main battery counters cover both packs
+  together. Requested by @Rocko84.
+
+---
+
+## v2.0.6-b5
+
+Issues: #469, #470
+
+- **MIC (MIN-range profile): new PV Startup Voltage control (holding 17, 50-550 V).**
+  Raising it stops an inverter on a single high-voltage panel connecting at dawn before
+  the panel can hold the load, dropping out and reconnecting over and over. Keep it below
+  your panel's open-circuit voltage. Contributed by @AguiMr (PR #469), tested on a MIC
+  2000TL-X.
+
+- **SPH 3000-6000TL BL (DTC 3501) is now a confirmed mapping**, checked against the Growatt
+  portal on an SPH6000 by @kabadisha.
+
+---
+
+## v2.0.6-b4
+
+Issues: #468, #470
+
+- **SPH 3000-10000 (VPP V2.01 profiles): the "Short/misaligned read at 3000" warning is
+  gone.** These profiles read a register range that these inverters don't fill, and one
+  bridge answered it with a truncated reply on every retry. No values change; the energy
+  figures come from the inverter's storage registers as before. Reported by @kabadisha.
+
+- **Dry Contact State is now offered only on MIN TL-X**, the only profiles that map its
+  register. On every other model it showed a permanent "Off" that was never read. It was
+  disabled by default, so most installs won't notice it go.
+
+- **SPF: Bulk and Float Charge Voltage are now on the Battery device**, next to the other
+  charge settings, instead of the Inverter device. Reported by @horiace.
+
+---
+
+## v2.0.6-b3
+
+Issues: #464
+
+- **The Energy Dashboard could count part of a day twice.** When a daily energy counter
+  read 0 for a single poll mid-day, that 0 was published, and Home Assistant treats any
+  drop as a meter reset, so it counted the day so far again. A 15.2 kWh day of battery
+  discharge showed as 22.2 kWh. A drop to 0 is now held for two polls and accepted only if
+  the zero persists. Days already recorded are not changed. Reported by @Rocko84.
+
+---
+
+## v2.0.6-b2
+
+Issues: #463, #466, #467
+
+- **MIN TL-XH: new Allow Grid Charge control (holding 3049)**, **disabled by default**. It
+  matches ShinePhone's setting in both states, but writing to it from Home Assistant hasn't
+  been tested yet. Contributed by @GoncaloRibeiro11 (PR #466).
+
+- **AC Charge Energy is reported as unknown when it exceeds the battery's own charge
+  energy**, which no real reading can. On an SPM 6000TL-HU, AC Charge Energy Total showed
+  393,216 kWh this way. Units where the reading is genuine keep it. Reported by @guhdias.
+
+- **SPH-TL3 / SPA-TL3: the Modbus warning every five minutes is gone, and so is the Dry
+  Contact State sensor.** That sensor read a register these models don't have, so it only
+  ever showed Off. Reported by @feinerer.
+
+---
+
+## v2.0.6-b1
+
+Issues: #464
+
+- **Daily energy sensors could stay unknown from mid-afternoon until midnight** on larger
+  systems. After a Home Assistant restart or integration reload, or after a counter
+  briefly read 0, the first reading above 20 kWh was treated as a glitch, and so was every
+  reading after it. The reading is now held back for one poll and accepted once the next
+  poll agrees. Affects Energy Today, the PV string Energy Today sensors, and any other
+  daily counter that passes 20 kWh. Reported by @Rocko84.
+
+---
+
+## v2.0.5
+
+Promoted to stable from the pre-release line below (b1 through b19). Every change in that
+line is included. See each `v2.0.5-bN` section for the individual reports and hardware
+confirmations behind it, or the [GitHub release](https://github.com/0xAHA/Growatt_ModbusTCP/releases/tag/v2.0.5)
+for a summary grouped by area.
+
+What you may notice on upgrading from v2.0.4:
+
+- **SPH-TL3:** House Consumption reads about 10 % lower. It now comes from the AC side, so
+  it no longer includes the inverter's conversion loss.
+- **MIN TL-XH2:** about 20 sensors the model has no register for are removed. They only ever
+  showed 0.
+- **TL3-S:** Fault Code and Warning Code read 0 unless there is a live fault.
+- **New controls are disabled by default.** Enable them on the device page if you want them.
+
+---
+
+## v2.0.5-b19
+
+Issues: #432, #446
+
+- **TL3-S: Fault Code and Warning Code now show the inverter's live codes.** They were
+  reading entries from its stored grid-fault history, which is why they stayed at 30 and
+  1042. Expect both to read 0 unless the inverter reports a fault. Reported by @JHPHendriks.
+
+- **Inverter Power switch: shows on while the inverter reports Normal**, on grid-tied models
+  where the switch can't read its state back (TL3-S, for example). It no longer starts blank
+  after a restart while the inverter is running. Suggested by @JHPHendriks.
+
+- **The firmware build now also shows when one of its six registers is empty**, as on an
+  SPH-TL3 that shows `YA1.0 (YBAA030308)`. Found by @acsel91.
+
+---
+
+## v2.0.5-b18
+
+Issues: #461, #463
+
+- **MIN TL-XH2: the Inverter Clock Sync button and `sync_inverter_time` action now work.**
+  The XH2 only accepts its clock as one write of all six fields; single-register writes are
+  acknowledged and ignored. Tested by @GersomSoldaat.
+
+- **MIN TL-XH2: Battery Temperature is removed.** Its documented register reads 0 on every
+  XH2 seen so far, so it only ever showed 0 °C.
+
+- **SPM 6000TL-HU (DTC 21304) is now detected** and set up with the SPH/SPM HU profile,
+  instead of MIN TL-XH. Reported by @guhdias.
+
+---
+
+## v2.0.5-b17
+
+Issues: #461
+
+- **MIN TL-XH2: new Charge Stop SOC control (register 30404)**, which held a change for over
+  an hour. Set Battery Mode `charge` and `release` are now confirmed on the XH2. Tested by
+  @GersomSoldaat.
+
+- **MIN TL-XH2: Battery State of Health** (register 31218) is now shown.
+
+- **MIN TL-XH2: sensors with no source on this model are removed**, including AC charge
+  energy, Priority Mode, the fault and warning codes and the safety diagnostics. They came
+  from register ranges the XH2 doesn't have and showed a constant 0. The entities disappear
+  on upgrade.
+
+- **Actions now show their actual error message** instead of "Unknown error", e.g. when
+  clock sync isn't available on a model.
+
+---
+
+## v2.0.5-b16
+
+Issues: #400, #460
+
+- **MIN TL-XH: time-of-use periods 1-9** (Start, End, Priority and Enable for each),
+  registers 3038-3045 and 3050-3059. Reading is confirmed against ShinePhone on a MIN
+  4200TL-XH; writing from Home Assistant isn't yet, so the entities are **disabled by
+  default**. Enable the ones you need on the device page. Decoded by @GoncaloRibeiro11.
+
+- **MIN TL-XH: new Battery Working Status sensor** (register 31001): Standby, Disconnected,
+  Charging, Discharging, Fault or Upgrade. A sleeping APX battery shows *Disconnected*.
+  Confirmed by @GoncaloRibeiro11.
+
+---
+
+## v2.0.5-b15
+
+Issues: #460, #461
+
+- **MIN TL-XH2: new controls validated on hardware.** On-Grid Discharge Stop SOC (register
+  30405), plus the VPP remote power controls (30407-30410), which are disabled by default.
+  With those mapped, Set Battery Mode is available on the XH2. The registers were tested
+  with direct writes; the action itself hasn't been run on an XH2 yet. The charge cut-off
+  SOC (30404) is not offered, because a changed value reverted on its own after six
+  minutes. Tested by @GersomSoldaat.
+
+- **MIN TL-XH2: Status shows the inverter's state.** The XH2 reports it at register 31000,
+  which uses the hybrid table (e.g. *Bat On-Grid*), not the grid-tied one, which has no entry
+  for most of its values.
+
+- **MIN TL-XH2: Inverter Clock now reads.** It comes from VPP registers 30104-30109, since
+  the XH2 has no registers 45-50. The clock sync button isn't offered on the XH2, because
+  the write format there is untested.
+
+- **MIN TL-XH2: no more "wrong profile" notice.** DTC 5100 is shared with the
+  first-generation TL-XH, and the integration used to tell XH2 owners to switch to a
+  profile that can't read their inverter. An existing notice clears itself.
+
+- **MIN TL-XH: four new diagnostic battery sensors**: Battery Clusters, Battery Modules per
+  Cluster, Battery Module Rated Voltage and Battery Module Rated Capacity (VPP 31225-31228).
+  Confirmed on a MIN 4200TL-XH with two APX modules by @GoncaloRibeiro11.
+
+- **The backup box device is now named "Backup Box (SYN)"**, as the protocol calls it. It
+  was labelled as an ARK battery. Only the label changes; no entities move.
+
+---
+
+## v2.0.5-b14
+
+Issues: #400, #460
+
+- **Set Battery Mode has a new `release` mode that hands control back to the inverter's own
+  mode.** Charge, Discharge and Hold switch on VPP control authority and leave it on, and
+  authority with no active command is not a return to normal: on a MIN TL-XH it held the
+  inverter in standby with Load First selected, so the battery barely discharged while the
+  grid carried the house. `release` clears the remote-power and schedule registers, then the
+  authority. It needs only register 30100, so it also works on MIN TL-XH, where the other
+  modes don't. Measured by @GoncaloRibeiro11.
+
+- **MIN TL-XH: new Off-Grid Discharge Stop SOC control (register 30475, 10–100 %)**, and the
+  existing register 3067 control is now labelled **On-Grid Discharge Stop SOC** there.
+  Confirmed read and write on firmware ALBA18. On the older ALBA13 build, SOC-limit writes
+  were refused by the inverter itself, so they may not stick if you're on it. Your build is
+  shown on the inverter's device page. Contributed by @GoncaloRibeiro11 (PR #460).
+
+---
+
+## v2.0.5-b13
+
+Issues: #400, #449, #458
+
+- **The inverter's device page now shows the firmware build alongside the firmware
+  version**, e.g. `AL1.0 (ALBA18010122)`, and diagnostics include it as `firmware_build`. The
+  Growatt portal's *Version* is its first ten characters. The short version alone reads the same
+  across builds that behave differently: on MIN TL-XH, VPP support and whether low SOC-limit
+  writes stick have both been seen to depend on the build. Read from V1.39 holding registers
+  82-87; nothing is shown where those don't hold a complete build string. Decoding worked out
+  by @l4m4re.
+
+  **Update (2026-09-30):** both halves now hold, with a narrower meaning for the SOC one.
+  VPP support depends on the build: an older MIN TL-XH build refuses the VPP registers
+  outright. On SOC limits, the inverter that dropped low writes on **ALBA13** accepts them
+  after Growatt updated it to **ALBA18**, with the same unit and the same battery. An even
+  older build (ALba10) has also accepted one, so this points at ALBA13 specifically rather
+  than old firmware in general ([#400](https://github.com/0xAHA/Growatt_ModbusTCP/issues/400)).
+
+---
+
+## v2.0.5-b12
+
+Issues: #447
+
+- **SPH-TL3: House Consumption now comes from the AC side, and reads about 10 % lower.** It
+  used the inverter's load register (1037/1038), which on this firmware is calculated from
+  DC-side terms and so includes the conversion loss. It is now AC output + grid import −
+  grid export, which matched an independent wallbox meter to 0.4 %. Expect a step down in
+  your House Consumption history from this version. **Power to Load** still shows the
+  inverter's own figure. While the battery charges from the grid, House Consumption keeps
+  the previous method, as that case has not been measured yet. SPA-TL3 is unchanged.
+
+- **SPH-TL3: new AC Power entity**, the inverter's real output power (registers 35/36). It
+  was never offered here before, because the register it would have used holds apparent
+  power (VA), which reads about 1 % high at several kW and about 25 % high below 1 kW.
+  Measured and verified by @acsel91, and confirmed on a second unit from @AzraelsDisk's
+  register scan.
+
+---
+
+## v2.0.5-b11
+
+Issues: #432, #446, #458
+
+- **The Inverter Power switch now shows the inverter's real state on MIN TL-X**, and works
+  as an ordinary toggle there. The register reads back 0 while off and 1 while on,
+  confirmed on a real unit. Other models still show the last command sent, until each is
+  confirmed the same way.
+
+- **The clock drift notice and the VPP Hold window used the host's time zone instead of
+  Home Assistant's.** On a host whose system clock runs in UTC (Docker without a `TZ`
+  setting, for example) the notice reported the whole UTC offset as drift straight after a
+  correct clock sync, and Hold computed its time window hours away from the inverter's own
+  clock. Both now use Home Assistant's configured zone, the one the clock sync already
+  used. Found by @l4m4re, who also supplied the fix for the notice.
+
+- **Grid import (`power_to_user`) no longer goes unknown whenever nothing is being
+  imported on SPH-TL3.** With the total register at zero it fell back to summing the
+  per-phase registers, which on this model are often withheld as corrupt, and a corrupt
+  phase that slipped through reached grid import as a spike. Once the total has read
+  non-zero, the inverter is known to fill it, and its zero is now taken as a real zero.
+  Found by @acsel91 and @AzraelsDisk.
+
+---
+
+## v2.0.5-b10
+
+Issues: #446
+
+- **Multi-megawatt spikes could still reach grid import and grid power on SPH-TL3.** The
+  word-corruption guard withheld each bad reading, but published one anyway once a register
+  had looked corrupted for three polls running - without checking it was the same value
+  each time. A register returning different garbage every poll therefore got its third bad
+  value published: an SPH 10000 TL3 BH-UP's per-phase grid import produced 6,022,667 W this
+  way, from its own logged readings. Now only the same value holding steady counts, which
+  still lets a genuine steady load through; and on signed pairs such as grid power the
+  guard never publishes, because no real reading can fall in the range it withholds. Found
+  by @AzraelsDisk. Spikes already in your history are not removed by this.
+
+---
+
+## v2.0.5-b9
+
+Issues: #400, #432
+
+- **New: Inverter Power switch - remote on/off, on every model that has an on/off
+  register.** Disabled by default so nobody turns an inverter off by accident; enable it
+  from the inverter device's entity settings. Off-grid models (SPF, SPE) get **AC Output**
+  instead, which is what their protocol actually controls - turning it off cuts power to
+  everything the inverter supplies. Each protocol family is written in its own encoding;
+  on MIC and TL3-S the register also holds the auto-start setting, which is preserved. The
+  switch shows the last command sent, not a reading. Not yet confirmed on hardware for any
+  family - see [Entity Reference](docs/controls/entity-reference.md). Requested by
+  @JHPHendriks.
+
+- **TL3-S on firmware dhaa01 now polls with Max Register Block Size on Auto.** That
+  firmware refuses a single 113-register read, so every poll failed and every entity stayed
+  unavailable. The profile now reads in blocks of up to 50, which the reference TL3-S
+  handles too. If you set a smaller block size as a workaround, you can return it to Auto.
+  Found and tested by @JHPHendriks.
+
+- **Set Battery Mode (VPP) and Sync TOU Schedule no longer describe Hold as "true
+  standby".** Measured on hardware it is close to idle, not an exact zero: about 140 W
+  charging on a MOD 10KTL3-XH at night, and more on a MIN TL-XH. Wording only - what Hold
+  writes is unchanged. Measurements by @KevlarD-67 and @GoncaloRibeiro11.
+
+---
+
+## v2.0.5-b8
+
+Issues: #400
+
+- **The Wake APX Battery button (new in v2.0.5-b7) could fail immediately with "The
+  inverter rejected the APX wake command" whenever a VPP direct-charge branch was already
+  active.** The button's own first step - clearing that branch so it can be replaced -
+  primed the same 30-second control cooldown that then blocked its very next write, to the
+  same register, moments later. Both writes are part of one bounded command and now bypass
+  the cooldown consistently. Found on hardware and fixed by @GoncaloRibeiro11 (PR #457),
+  the same day b7 shipped.
+
+---
+
+## v2.0.5-b7
+
+Issues: #400, #432, #455
+
+- **New: Wake APX Battery button, for MIN TL-XH on VPP 2.01 firmware (DTC 5100) whose APX
+  pack has gone to sleep in a way Priority Mode alone does not wake.** Disabled by default,
+  and only created on that one hardware-tested profile. Sends a bounded 5%, one-minute VPP
+  direct-charge request for 12 seconds, then reverses itself completely - clearing the pulse
+  and restoring whatever VPP authority, branch and parameters were active before the press.
+  Hardware-tested and contributed by @GoncaloRibeiro11 (PR #456). See
+  [Entity Reference](docs/controls/entity-reference.md) for details.
+
+  Separately, the same hardware investigation found that on this DTC 5100/VPP 2.01 firmware,
+  none of the tested Battery Mode paths - including the MOD/WIT `Hold` workaround - produce
+  a true zero-power hold; the closest available state still shows residual discharge. `Hold`
+  is not being changed or exposed differently for this profile as a result of this alone,
+  but treat it as unconfirmed on MIN TL-XH VPP 2.01 rather than assumed to behave like
+  MOD/WIT.
+
+- **The Universal Register Scanner (`export_register_dump`) always failed to connect when a
+  serial-connected device was selected from the dropdown**, with "Cannot connect to None @
+  9600 baud" - the baud rate resolved correctly; only the serial port did not, because the
+  scan read the entry's connection details under the wrong key. Manually re-entering the
+  same device path as a workaround always worked, which is why this went unnoticed until
+  now. Found by @JHPHendriks on issue #432.
+
+- **Battery SOC's Energy Dashboard icon stayed permanently full regardless of charge
+  level.** The sensor set an explicit icon alongside `device_class: battery`, and an
+  explicit icon always overrides Home Assistant's own charge-level icon - only the icon's
+  colour was changing with state, not its fill. Fixed for Battery SOC and for the Peak
+  Shaving Reserve SOC diagnostic sensor, which had the same issue. Found by
+  @AzraelsDisk on issue #455.
+
+---
+
+## v2.0.5-b6
+
+Issues: #432
+
+- **A Modbus read that timed out waiting for the bus was reported as a failed write.**
+  Reads, writes and whole polls share one lock, and a timeout on it always raised the same
+  exception with a message hardcoded to "Failed to write registers..." - so a plain register
+  read, including the `read_register` diagnostic service, could surface as a write failure
+  with a nonsensical register range. The message now names the operation that actually timed
+  out (read, write or poll). No behaviour changes - the same exception type is still raised,
+  only what it says changes. Found by @JHPHendriks while diagnosing a separate reported
+  issue, on a screenshot showing exactly this mismatch.
+
+---
+
+## v2.0.5-b5
+
+Issues: #454
+
+- **A `profile_mismatch` repair notice raised before the b25/#453 alias fix landed stayed
+  in the repair list forever, even after upgrading and restarting.** The re-check that
+  raises the notice never had a matching path to withdraw it — only `unit_id_never_responded`
+  self-clears on success. It now does the same: whenever the DTC re-check finds the
+  configured and suggested profiles equivalent (a straight name match, or the same register
+  map and sensor set under different names), any existing notice for that entry is removed.
+  A restart or config entry reload is needed to re-run the check. Found by @as-wallpen, on
+  the exact case #453 fixed.
+
+- **Documentation correction:** the v2.0.4-b25 release note overstated what a single
+  battery-pack install sees from the Battery 2 sensors — they are not created at all there,
+  not merely disabled. See the correction added to that entry below, and the updated
+  [Entity Reference](docs/controls/entity-reference.md#a-second-physical-battery-pack-battery-2-sensors).
+  Also found by @as-wallpen.
+
+---
+
+## v2.0.5-b4
+
+Issues: #400
+
+- **On MIN TL-XH, the generic Priority Mode sensor could show "Load First" while the
+  inverter was actually running Battery First or Grid First.** The writable Priority Mode
+  select reads the real register (3018) correctly and always has, but the separate
+  diagnostic "Priority Mode" sensor reads a differently-named field that this profile has
+  never populated — so it sat at its default forever, regardless of the inverter's actual
+  state. Confirmed on hardware: Battery First was selected and the inverter visibly ran
+  Battery First (solar charged the battery while the house imported its full load from the
+  grid), while the diagnostic sensor kept reporting Load First throughout — two entities
+  describing different states from the same inverter.
+
+  The diagnostic sensor now reflects the same state the select and the inverter agree on.
+  Applies to MIN TL-XH profiles. Root cause found, and the fix verified, by
+  @GoncaloRibeiro11.
+
+---
+
+## v2.0.5-b3
+
+Issues: #451
+
+- **Battery 2's four energy sensors (Charge/Discharge Today/Total) never populated on
+  MOD/MID hybrids, even when the rest of Battery 2 worked correctly.** The MOD register
+  map hand-copies its battery cluster 2 definitions instead of importing the shared block
+  every other profile uses, and the copy had drifted: its four energy registers carried an
+  extra `_low` suffix that `battery2_power` right next to them does not, and that the
+  driver's reader does not expect. The registers were never wrong and never withheld — they
+  were simply never looked up, on every poll, including the ones where voltage, current,
+  power, SOC, SOH and temperature all read correctly from the same block.
+
+  A debug log confirmed it precisely: the block read for the affected registers succeeded
+  repeatedly, with every other field in it decoding correctly each time, while the four
+  energy fields stayed unknown regardless. A permanent test now checks every real register
+  map for this class of naming mismatch, not just this one instance.
+
+  Applies to MOD and MID hybrid profiles with a second battery cluster. Reported by
+  @Rocko84, who provided the debug log that pinned it down.
+
+---
+
+## v2.0.5-b2
+
+Issues: #453
+
+- **The profile-mismatch notice fired for every MOD owner on the canonical profile key,
+  and its own suggested fix was silently undone on the next load.** v2.0.4's Battery 2
+  sensors were added to `mod_6000_15000tl3_xh_v201` but not to `mod_6000_15000tl3_xh`, the
+  key it is aliased back to on every setup — so the two profiles this integration treats as
+  interchangeable silently stopped being interchangeable. The equivalence guard that keeps
+  the notice quiet when two profiles behave identically correctly noticed they no longer
+  did, and recommended switching to the profile that gets aliased straight back before the
+  recommendation could ever be followed.
+
+  **`mod_6000_15000tl3_xh` now carries the same Battery 2 sensors as its v201 counterpart**,
+  restoring the equivalence the alias depends on. A permanent test now checks every entry
+  in the alias table for this, so a future addition to one side without the other fails a
+  test instead of reaching an inverter.
+
+  Applies to any MOD 6000-15000TL3-XH owner on the canonical (non-v201) profile key — which,
+  since v201 keys get aliased back automatically, is effectively everyone on this hardware.
+  Reported and precisely traced to the exact comparison by @KevlarD-67.
+
+---
+
+## v2.0.5-b1
+
+Issues: #446
+
+- **A genuine reading could be mistaken for the grid-power corruption fixed in v2.0.4.**
+  The guard added for that fault withholds a 32-bit pair whose high word is small and
+  whose low word sits jammed against one end of its range — the signature of a value
+  landing in the wrong half of the pair. The margin at the low end was wide enough to also
+  catch ordinary readings: a MOD TL3-XH's `power_to_load` read a genuine 6,570 W (EV
+  charger included, confirmed against an independent register in the same poll) and was
+  withheld for 73 seconds because its low word, 167, fell inside the old margin.
+
+  **The margin is now two numbers instead of one.** The original 16 reported samples are
+  tight at the low end (no more than 7 counts from zero) and loose at the high end (up to
+  802 counts), so the low end is tightened to 16 — comfortably past every genuine bottom
+  sample seen, comfortably short of every corrupted one — while the high end is unchanged.
+  All 16 original samples are still caught.
+
+  Applies to any profile using this guard (SPH-TL3, MOD, MID, WIT and others sharing the
+  affected register pairs). Reported and precisely characterised by @KevlarD-67, on a MOD
+  TL3-XH.
+
+---
+
+## v2.0.4
+
+Promoted to stable from the pre-release line below (b1 through b26). Every change in that
+line is included — see each `v2.0.4-bN` section for the individual reports and hardware
+confirmations behind it, or the [GitHub release](https://github.com/0xAHA/Growatt_ModbusTCP/releases/tag/v2.0.4)
+for a summary grouped by area.
+
+---
+
+## v2.0.4-b26
+
+Issues: #443
+
+- **Off-grid (SPF/SPE) inverters can now have their clock set from Home Assistant.** The
+  Inverter Clock Sync button and the `sync_inverter_time` action were previously withheld
+  on these models — reading the clock worked, but nothing was known about which form the
+  year register wanted to accept for a write, and guessing wrong risked setting the year to
+  26 AD.
+
+  That question is now answered: an SPF 3000-6000 ES PLUS was tested directly, with a
+  friend confirming the front panel at each step. Minute writes work exactly like every
+  other family. The year register takes the **opposite** form — writing `26` (the form
+  every other confirmed model uses) is accepted, briefly shown, and then silently reverted;
+  writing the full year (`2027`) is accepted and held. This action now writes whichever
+  form your profile needs automatically.
+
+  Applies to SPF and SPE profiles. Confirmed on an SPF 3000-6000 ES PLUS; SPE shares the
+  same clock block with no reason so far to expect it differs, but has not been tested
+  directly. Reported and tested by @takisbg, across a careful two-stage procedure (minutes
+  first, year only once minutes were confirmed safe).
+
+---
+
+## v2.0.4-b25
+
+Issues: #451
+
+- **A second physical battery pack (e.g. two APX units) is no longer read and discarded.**
+  On WIT, MOD and MID hybrids the integration already read a second battery cluster's
+  voltage, power, SOC and more whenever it answered — but nothing offered the resulting
+  entities, and one sensor (Current) pointed at the wrong internal name and would have read
+  unavailable even where it was offered. Ten new **Battery 2** sensors exist now (Voltage,
+  Current, Power, SOC, SOH, Temperature, Charge/Discharge Energy Today/Total), plus
+  **Battery 3** on models that support a third stack. They appear **disabled by default** —
+  enable them if you have more than one pack; they stay unavailable, not zero, on a
+  single-pack install.
+
+  **Correction (2026-09-21):** the last sentence overstates what a single-pack install
+  sees. The entities are not created at all there — not disabled, not unavailable, simply
+  absent from the registry — because creation itself is gated on the pack's own voltage
+  register answering above 0 at startup, not just the value shown afterward. "Disabled by
+  default" only describes what happens when a second pack genuinely exists. Found by
+  @as-wallpen, on a single-stack MID 25KTL3-XH where a debug log showed the cluster
+  reading successfully while no `battery2_*` field appeared anywhere in the coordinator
+  data ([#454](https://github.com/0xAHA/Growatt_ModbusTCP/issues/454)).
+
+  They are not summed into the existing Battery Power/SOC sensors — two packs of different
+  capacity don't average meaningfully at that level, so each pack's figures stand on their
+  own. Applies to WIT, MOD and MID hybrid profiles. Confirmed on a MID 25kTL3-XH with a
+  10 kWh and a 20 kWh APX pack, reported by @Rocko84.
+
+---
+
+## v2.0.4-b24
+
+Issues: #450
+
+- **A failed Backup Box register read no longer reports Off-Grid.** Backup Box work mode,
+  temperature, grid power and load power are read from a single 18-register block; when
+  that block times out, the connection-status register (read separately) still answers, but
+  these four silently fell back to `0` — which is exactly what a genuine Off-Grid reading
+  looks like. A transport hiccup was indistinguishable from the grid actually failing.
+
+  These fields now report unknown for the poll instead, the same treatment already used
+  elsewhere for a failed read. Applies to any Backup Box (Growatt ARK) install. Reported by
+  @monchote, whose debug log caught the exact moment it happened and showed the next poll
+  reading correctly.
+
+---
+
+## v2.0.4-b23
+
+Issues: #449
+
+- **A device type code of 0 is no longer reported as an unsupported model.** On firmware
+  that leaves the DTC register empty, the log carried `✗ DTC Detection - Unknown DTC code:
+  0 (not in supported models)` once after every restart — naming a fully supported inverter
+  as unsupported, with no way to clear it. An empty register is not a code, and is now
+  logged at debug instead.
+
+  Nothing was ever changed by that message: no profile was switched and no entity was
+  affected. Applies to any model whose DTC register reads 0. Reported by @JosvL on a
+  MIN 5000TL-XH.
+
+---
+
+## v2.0.4-b22
+
+Issues: #447, #446
+
+- **Absurd one-off spikes are now caught on grid power too.** v2.0.4-b19 began withholding
+  single readings that arrive corrupted, but it deliberately skipped any reading that is
+  allowed to be negative — which is exactly what grid power is. So the guard stepped over
+  the sensor most likely to show the fault.
+
+  **It now covers those readings as well**, using a different test: a real value, whether
+  importing or exporting, always sits at one end of its range, and a corrupted one lands in
+  the middle. Genuine readings up to about ±107 kW are unaffected, and anything that holds
+  the same shape for three polls is published rather than withheld.
+
+  Reported by @AzraelsDisk, whose Grid Power showed a burst of spikes to 9 MW against a
+  −20 W baseline — and whose own register scan had caught the corruption live. Same inverter
+  model as @acsel91's report in #446, which found the original fault.
+
+---
+
+## v2.0.4-b21
+
+Issues: #448
+
+- **Diagnostics no longer present unused values as if they were readings.** The dump lists
+  every internal field, and one whose register your inverter's profile does not use simply
+  shows its starting value — which looks identical to something measured. A WIT owner
+  reasonably read one of those as a live setting that disagreed with another, and spent time
+  on it. The dump now includes the list of names your profile can actually fill, and a note
+  saying that anything missing from it is not a reading. Reported by @Svetlonos76.
+
+- **Documented: a schedule set in the ShinePhone app overrides this integration, and cannot
+  be seen or cleared from it.** A time period configured under *Advanced Setting →
+  TimeElectricity Price* takes effect regardless of what you set here, and
+  `sync_tou_schedule` does not clear it — it writes a different schedule. The symptom is an
+  inverter doing something no Home Assistant entity accounts for, usually charging from the
+  grid, while every control you change appears to revert. Deleting the period in the app
+  fixes it within one poll. Now covered on the action's page, in Battery & Scheduling, and
+  in the troubleshooting guide. (#448)
+
+---
+
+## v2.0.4-b20
+
+Issues: #400
+
+- **Fixes Hold failing with an error on v2.0.4-b16 to b19.** Setting Hold — from the
+  Mode (VPP) select on WIT, or the Set Battery Mode action on MOD — raised an internal error
+  on **any inverter using a shared Modbus connection**, which is the usual setup where one
+  connection serves the integration. The write that clears the branch selector reached the
+  inverter and *then* threw, so the action reported failure after it had already changed the
+  register.
+
+  **The state it left behind was the one b18 was written to prevent:** the selector cleared,
+  the previous mode's power setpoint still standing, and no hold schedule written. If you
+  use Hold, upgrade past this.
+
+  Diagnosed from the traceback by @KevlarD-67, who found the cause as well as the symptom.
+
+---
+
+## v2.0.4-b19
+
+Issues: #446, #447
+
+- **Single absurd power readings are withheld instead of published.** A 32-bit reading is
+  sent as two halves, and on one SPH-TL3 the value occasionally arrived in the wrong half —
+  publishing 98 kW, and once 1.8 MW, of grid import for a single poll before returning to
+  normal. Readings with that signature are now withheld, and the raw values are logged so
+  they can be recognised.
+
+  **A reading that keeps the same shape for three polls is published**, because a genuine
+  value can look like this: the check is for a glitch, and a glitch does not persist.
+  Reported by @acsel91 with 16 samples over two days, which is what made the pattern
+  identifiable — no plausibility threshold could have caught it, since his smallest was
+  6,553.8 W.
+
+- **Documented: on SPH-TL3, AC Voltage R/S/T are line-to-line voltages**, around 400 V on a
+  230/400 V supply rather than 230 V. Confirmed on two inverters, one of which settled it by
+  reading those registers against the VPP registers documented as line voltage, seconds
+  apart. **No entity changes in this release**; for per-phase voltage use a meter.
+  (#442, #447)
+
+  **Correction (2026-09-17):** this note first said the inverter derives per-phase AC power
+  from that voltage. It does not — the inverter leaves two of the three power registers
+  empty, and the integration computes all three itself. The effect on those entities is the
+  same, and they still read about √3 high, but the cause is ours. Withdrawn by @acsel91, who
+  had reported it.
+
+---
+
+## v2.0.4-b18
+
+Issues: #400
+
+- **WIT/MOD VPP: Hold now clears the power setpoint, not just the branch selector.** Setting
+  Hold after Charge deselects the direct branch, which stops the charge — but the old
+  setpoint stayed in the register behind it. Growatt's own scheduler re-enables that branch
+  on MOD, and when it did, a stale charge command came back with it. Hold now clears both.
+
+  If the setpoint cannot be cleared the hold still stands, and says so in the log rather than
+  failing: by that point the battery has already stopped.
+
+- **The Charge-then-Hold fault is confirmed on hardware.** @KevlarD-67 measured it on a MOD
+  10KTL3-XH: after Hold the battery kept charging at 1.52 kW and grid import went from 469 W
+  to 2166 W, while the hold schedule sat in the branch that was not selected — an open-ended
+  grid charge reported as Hold. **Fixed in v2.0.4-b16 and b18**; this release adds the
+  setpoint half and records the measurement alongside the code.
+
+---
+
+## v2.0.4-b17
+
+Issues: #434
+
+- **WIT: a remembered battery power scale could be erased instead of reused.** Every write to
+  the integration's storage rebuilt the file from scratch, and left the scale out whenever the
+  running session did not have one in hand. So a single save before the scale was restored
+  deleted it permanently, and the next restart had nothing to restore — the battery power
+  reading then had to be re-detected, which needs the battery working above 500 W.
+
+  **Storage now keeps a scale it is not carrying**, so this repairs itself: the next time your
+  inverter validates one, it stays put. Reported by @Wojak129, whose restart re-detected from
+  scratch instead of restoring.
+
+- **The reason a scale was not restored is now in the log.** Nothing stored, stored for a
+  different inverter profile, or storage unreadable were all silent. Each now says which, at
+  INFO, so it can be read from an ordinary log rather than reproduced with debug logging on.
+
+---
+
+## v2.0.4-b16
+
+Issues: #400, #349
+
+- **WIT/MOD VPP: Hold after Charge could leave the battery charging.** Register 30407 chooses
+  between the direct power setpoint and the TOU schedule, and Hold has to clear it before
+  writing its schedule. Two ways that failed: the **Set Battery Mode** action never cleared it
+  at all, and in the Mode (VPP) select a Hold chosen **within 30 seconds** of Charge had the
+  clear refused by the control-write rate limit and carried on regardless — leaving the
+  previous mode's setpoint in force while the entity reported Hold.
+
+  **Hold now stops with an error** if it cannot clear that register, rather than writing a
+  hold that cannot hold. Found by @KevlarD-67 reading the code against his own measurements.
+
+- **Set Battery Mode (VPP) is documented for the models that can use it.** Its description
+  said WIT/WIS only, while it has always been available on MOD/MID XH hybrids too — the
+  action itself is unchanged apart from the fix above.
+
+- **Docs: a refused single-register write does not mean the slot is broken.** The
+  troubleshooting steps for time-of-use slots suggested `write_register` to isolate a failing
+  write. That sends FC06, and on a MOD 10KTL3-XH the slot *end* words refuse FC06 while the
+  time entity's FC16 pair write is accepted. The advice now uses `write_registers`, and notes
+  that writing a register's existing value back proves nothing when it succeeds. (#349,
+  @KevlarD-67)
+
+---
+
+## v2.0.4-b15
+
+Issues: #434, #447, #443, #414
+
+- **Battery Power shows unknown, not 0 W, when its reading is withheld.** v2.0.4-b12 began
+  withholding WIT battery power while its scale is in dispute, and Battery Charge Power and
+  Battery Discharge Power went unknown as intended — but Battery Power published **0 W**,
+  which is what an idle battery really reads. The same happened on any profile when the
+  battery block failed to read. **House Consumption and Grid Power** no longer fill in the
+  withheld battery as zero either. Found in @Wojak129's history export.
+
+- **SPH-TL3 (V2.01): AC Voltage RS, ST and TR now report.** Nothing on the SPH-TL3 profiles
+  fed them, so all three sat at 0 V. They now read the line voltages from the inverter's VPP
+  registers — around 400 V on a 230/400 V supply, which is correct for line-to-line.
+  Confirmed from @AzraelsDisk's register scan.
+
+  **On the legacy SPH-TL3 profile those three entities are removed.** It has no source for
+  them, and the older addresses read 0 on two inverters with a live grid.
+
+- **SPH-TL3 (V2.01): register map correction, no visible change.** Four entries were mapped
+  to power registers as if they were voltages and frequency. They were never used, so no
+  published value moves; they are corrected so they are not copied into another profile.
+
+- **Docs:** on the WIT HU15 the EMS/VPP RS485 address is fixed at 1 regardless of ShineTools,
+  so two units cannot share one RS485 bus (thanks @Svetlonos76). And on SPF/SPE, Grid
+  Connection Status reports what the inverter is running on, not whether mains is present —
+  Off-grid with 230 V at the input is normal on battery-first priority.
+
+---
+
+## v2.0.4-b14
+
+Issues: #443
+
+- **SPF/SPE: Grid Connection Status works.** It read the off-grid status register with the
+  grid-tied code table, and the two sets mean different things: off-grid `0` is Standby and
+  `1` is No Use, so the two codes that reported "On-grid" mean the opposite, while every
+  state an SPF actually runs in — Discharge, PV Charge, AC Charge, Bypass — fell through to
+  "Unknown". On off-grid hardware the sensor had never shown anything else.
+
+  **It now reports On-grid or Off-grid on SPF and SPE.** AC charging in any combination, or
+  bypassing the input straight to the load, means the utility is carrying the system;
+  Discharge and PV Charge mean it is not. Standby, No Use, Fault and Flash defer to the
+  measured AC input voltage. Grid-tied profiles are unchanged. Reported by @takisbg.
+
+---
+
+## v2.0.4-b13
+
+Issues: #443
+
+- **SPF/SPE: Boost Temperature and IPM Temperature are removed.** Neither exists anywhere
+  in the off-grid register table — its temperatures are Inverter, DC-DC, Buck1 and Buck2 —
+  so both sensors reported 0.0 °C for ever. A power module apparently sitting at freezing
+  reads as a measurement rather than as missing data.
+
+  **Those two entities disappear on off-grid profiles.** Recorded history stays; the
+  temperatures that do have registers are unchanged. Found by @takisbg, whose Diagnostic
+  card showed both at 0.0 °C beside a DC-DC of 21.8 °C and an inverter temperature of
+  37.1 °C — the two with registers working, the two without not.
+
+---
+
+## v2.0.4-b12
+
+Issues: #434
+
+- **WIT: battery power no longer drops to a tenth of the truth after a connection drop.**
+  Some WIT firmware reports battery power in whole watts rather than the tenths the
+  specification gives, and the integration works that out by comparing the register against
+  battery voltage x current. The result was held only for the life of the Modbus client, so
+  anything that rebuilt it lost the correct scale — and it can only be re-earned while the
+  battery is working above 500 W. Overnight it never is, so the wrong reading could persist
+  until morning.
+
+  **The confirmed scale is now remembered** and applied from the first poll. Nothing to do
+  on upgrade; it is learned once and reused. Changing profile discards it, and real load
+  still overrules it if it is ever wrong. Reported and diagnosed by @Wojak129, whose two
+  captured connection drops — one either side of the 500 W threshold, one self-healing and
+  one not — are what identified the mechanism.
+
+- **WIT: Battery Power reports unknown instead of a figure already known to be wrong.**
+  In the window between voltage x current contradicting the scale in force and the
+  replacement being confirmed, the reading is withheld. **Battery Power, Charge Power and
+  Discharge Power may show unknown for a few polls after a first-ever setup**, where they
+  previously showed a value ten times out. Owners whose scale agrees with the specification
+  — most WIT owners — see no change. (#434)
+
+---
+
+## v2.0.4-b11
+
+Issues: #439, #442, #444
+
+- **SPF/SPE: a new Battery Cut-Off control.** Holding register 82 is the battery
+  undervoltage cut-off point — how deep the battery is allowed to discharge before the
+  inverter stops drawing from it. It was reachable only from the front panel or ShinePhone.
+  Like the two switchover thresholds beside it, the entity shows a percentage on Lithium and
+  volts otherwise. **A new number entity appears on the Battery device.** Confirmed on an
+  SPF 5000 ES on Lithium by @eugeniodb; the non-Lithium half follows the two neighbouring
+  registers rather than its own measurement.
+
+- **SPF: Generator Charge Current goes unavailable on models without one.** An SPF 5000 ES
+  answers that register with `0xFFFF`, which was published as a 65535 A charge limit sitting
+  in a writable box. It is withheld now, as other all-ones "not supported" values already
+  are. **The entity disappears on models that answer this way**; it is unchanged where the
+  register holds a real figure. (#444)
+
+- **The Inverter Clock sensor now works on SPF and SPE.** An SPF 5000 ES read against a
+  known-good clock returned the full four-digit year and the standard field order, so the
+  off-grid layout is no longer treated as unknown. **A new diagnostic sensor is available on
+  off-grid profiles** — disabled by default, like everywhere else.
+
+  **Setting** the clock is still not offered there: the year is written in a form confirmed
+  on other protocol families only, and reading four digits does not say which form the
+  register accepts. Off-grid drift notices now say to use ShinePhone or the front panel
+  instead of naming a sync button those models do not have. (#444, #439)
+
+- **SPF: the AC Charge Current ceiling stays at 80 A, now with a measurement behind it.**
+  ShinePhone offers 0-100 A on the 5000 ES, and the register does store 100 — but the
+  hardware charges at 78 A and stops. Unchanged for users; recorded so it is not widened on
+  the strength of an app screen. (#444)
+
+- **DTC 20105 is recognised as an SPF 5000 ES.** It sits outside the 034xx block other
+  off-grid models use and is read from holding register 43. **Affected owners no longer have
+  to pick the profile by hand.** Confirmed from @eugeniodb's scan.
+
+---
+
+## v2.0.4-b10
+
+Issues: #442, #443, #445
+
+- **SPF: three sensors that could only ever read zero are removed.** Battery Temperature,
+  Load Energy Today and Load Energy Total had nothing behind them on this profile — the SPF
+  has no battery temperature sensor at all, which the profile's own notes say, and no
+  register for load energy. They published `0.0` for ever, which on a counter is worse than
+  absent because it goes into the Energy Dashboard. Reported by @takisbg.
+
+  **Those three entities disappear on SPF.** Their recorded history stays; nothing else on
+  the profile changes.
+
+- **MID: battery voltage from the VPP range is read as signed**, matching the VPP
+  specification (`31214 | Battery voltage | RO | INT16 | 0.1V`) and the TL-XH profiles,
+  which already declared it. No practical change — a battery voltage does not go negative —
+  but a sign-bit reading is now decoded rather than withheld. (#442)
+
+---
+
+## v2.0.4-b9
+
+Issues: #444
+
+- **SPF/SPE: "Max Output Power Rate" is withdrawn — it was pointed at a schedule hour.**
+  Holding register 3 is the active power rate on grid-tied inverters, and `UtiOutStart` on
+  the off-grid protocol: the hour the utility output period starts, 0-23. The entity read
+  0 % at full output, and because it is writable, setting it to 100 would have written
+  **hour 100** into the inverter's output schedule.
+
+  **The entity disappears on SPF and SPE.** It was never reporting anything meaningful on
+  those models. Grid-tied profiles are unaffected. Found by @eugeniodb against ShinePhone
+  and the SPF 3500/5000 ES manual v4.0.
+
+- **SPF: Max Charge Current no longer shows empty on inverters that report above 100 A.**
+  The ceiling came from the SPF 6000ES Plus manual, and an SPF 5000 ES on the same profile
+  reads 120 A — which Home Assistant rejected, because it validates an entity's state
+  against the declared bounds and not only what a user may set. The ceiling is now the
+  protocol's 400 A. The floor stays at 10 A, which exists because that panel silently
+  discards an out-of-range save.
+
+---
+
+## v2.0.4-b8
+
+Issues: #400
+
+- **WIT/MOD VPP: selecting Hold straight after Charge or Discharge now actually holds.**
+  Register 30407 chooses between the two routes through the VPP control block — the direct
+  setpoint and the TOU roster. Charge and Discharge set it for the direct route and never
+  cleared it, and Hold did not touch it, so a Hold selected after either wrote its period
+  into the route that was not selected while the previous setpoint stayed in force. The
+  entity reported Hold throughout, because it shows the last command rather than the
+  inverter's state.
+
+  **Affects anyone switching Mode (VPP) from Charge or Discharge to Hold.** Selecting Hold
+  from Hold, or after a restart, was unaffected. Found by @KevlarD-67 from a code reading
+  against the 30407 behaviour he measured in #349 — no failed hold was observed, so this
+  closes a gap rather than a reported symptom.
+
+---
+
+## v2.0.4-b7
+
+Issues: #441
+
+- **SPH-TL3 and TL-XH on V2.01: Solar Energy Today no longer rises overnight.** Those
+  profiles were reading daily solar from register 53/54, which counts all AC output
+  *including battery discharge* — so the figure climbed through the night in step with the
+  battery. The per-MPPT DC registers are summed instead, as they already were on the legacy
+  variants of the same profiles.
+
+  **Affects SPH-TL3 3-10kW and TL-XH 3000-10000 on the V2.01 protocol variant**, which is
+  what auto-detection selects on that hardware — so the default configuration was the
+  affected one. Reported by @acsel91 with the cause already identified: a V2.01 variant
+  merges its base profile's registers but writes its own top-level keys, so the flag added
+  for #307 was silently dropped. His suggestion to check the other variants found the second
+  profile, and a test now compares every variant against its base so the next one cannot be
+  lost the same way.
+
+  **Your daily solar figure will read lower and correctly from the upgrade.** Yesterday's
+  recorded totals are unchanged.
+
+---
+
+## v2.0.4-b6
+
+Issues: #401
+
+- **The `UNDERFLOW` warning no longer advises adding `signed` to a register the firmware
+  does not implement.** A 32-bit pair that arrives with its sign bit set is withheld, and
+  the log used to give the same advice every time: the profile is probably missing
+  `'signed': True`. That is right for a counter dipping a hair below zero, and wrong for an
+  unimplemented register answering with an all-ones pattern — one owner read `0xFFED0000`
+  on per-phase grid import, which as a signed value is **-124 kW** on a 10 kW inverter.
+
+  The message now distinguishes the two by magnitude, says plainly not to add the flag in
+  the sentinel case, and prints the raw value in hex so the pattern is visible at a glance.
+  No behaviour change: those readings were already being withheld correctly. Reported by
+  @acsel91.
+
+---
+
+## v2.0.4-b5
+
+Issues: #440
+
+- **SPH: Battery Temperature was reading the battery's remaining capacity.** One owner saw
+  **272 °C**. The VPP register at 31221 is a 32-bit value spanning two registers — remaining
+  capacity in Ah — so 31222 is its low word, and the temperature is at **31223**. The SPH
+  profiles resolved the sensor from 31222.
+
+  **Affects SPH and SPH-TL3 profiles on the V2.01 map.** The same correction was already
+  made for MID, MOD and WIT; the SPH family had been missed. Reported with a full register
+  scan by @trickyau, whose 31222 read `2727` — the same value as input register 1091, which
+  the V1.39 protocol documents as `BMS_GaugeRM`.
+
+  **If your battery temperature still looks wrong after this**, it is a separate question
+  about scale rather than about which register is read — say so on #440 with what your
+  ShinePhone app or inverter display shows.
+
+---
+
+## v2.0.4-b4
+
+Issues: #439
+
+- **A whole-hour clock offset is now reported as a timezone, not as drift.** An RTC drifts
+  gradually and does not land on exactly one hour, so a notification saying "almost exactly
+  one hour behind" now explains what it actually is — the plant timezone in the Growatt
+  portal, which offers fixed UTC offsets with no daylight-saving zones, pushed to the
+  inverter by the datalogger. It also says that pressing Inverter Clock Sync will not hold,
+  because the datalogger overwrites it within a minute or two. The previous message told
+  those owners to sync, which could not work on their hardware.
+
+- **New option: Clock Drift Warning (minutes).** Defaults to 5, unchanged from before, and
+  **0 turns the notice off**. For a plant whose zone observes daylight saving and whose
+  portal has no entry for it, the offset cannot be corrected at all and the only honest
+  answer is a way to stop asking. Reported by @ilSacramento on a MOD 8000TL3-XH in Åland.
+
+---
+
+## v2.0.4-b3
+
+Issues: #438
+
+- **Device identification no longer repeats on every poll.** Reading the serial, firmware,
+  inverter type and protocol version is meant to happen once per session, but the check that
+  decided whether it had already run looked only at the serial number. On hardware whose
+  serial register answers blank that check was never satisfied, so six holding reads were
+  repeated every poll for the life of the session — over three hundred an hour on one WIT,
+  all of them already answered.
+
+  **Affects any inverter that does not report a serial number.** No entity changes; the
+  effect is less Modbus traffic and one less duplicated line per poll in the log. Found in a
+  debug capture attached to #434 by @Wojak129.
+
+---
+
+## v2.0.4-b2
+
+Issues: #437
+
+- **SPF: new BLU/LBU Mode control.** Growatt added the setting to the SPF 6000 ES Plus in
+  firmware 100.08/101.07, on holding register 116 — `BLU` charges the battery before serving
+  the load, `LBU` serves the load first. Reported and confirmed on hardware by
+  @dartyukh-afk, who wrote each value and read the inverter's own display back.
+
+  **New entity on SPF profiles**, and it reads back rather than being write-only. Two
+  options, not three: the same register on SPE carries a third ordering (`LUB`) that SPF
+  does not have, so offering it here would write a mode the hardware has no meaning for.
+
+  **On firmware older than 100.08/101.07** the setting does not exist and the control will
+  show unknown rather than a made-up value.
+
+---
+
+## v2.0.4-b1
+
+Issues: #370, PR #409
+
+- **A single dropped Modbus frame no longer blanks the VPP controls.** The optional VPP
+  register blocks — control authority, export limit, remote power control — are skipped for
+  a while after a failed read, so firmware that does not implement them is not asked on
+  every poll. **One** failure was enough to trigger that, and a timeout on a healthy
+  inverter looks exactly like a register that does not exist. On one WIT a single transient
+  failure took registers 30407-30410 out of service while the inverter went on answering
+  them correctly for 30 hours.
+
+  A block is now skipped only after **three consecutive** failures; the skip is dropped when
+  the connection is re-established, because a dead socket says nothing about a register; and
+  a block that was genuinely refused on a working socket stays skipped, so the poll does not
+  pay for its timeout again.
+
+- **A VPP control whose block was not read now reports unavailable** rather than publishing
+  the value it was built with. That default reads as a real "Disabled" or 0 — which for
+  `VPP AC Charge Enable` means "grid charging is off" when nobody said so.
+
+  **Affects the seven controls on those blocks**: Control Authority, VPP Export Limit
+  Enable and Power Rate, Remote Power Control Enable, Charging Time, Charge/Discharge Power,
+  and VPP AC Charge Enable. They will show as unavailable in the moments the block does not
+  answer, where previously they showed a number.
+
+  Contributed by @jekmanis, as a follow-up to their own #370 work.
+
+---
+
+## v2.0.3
+
+Issues: #433
+
+- **A gateway that closes the connection is now reconnected to immediately.** Since v1.10.0
+  the integration has waited before reopening a socket after consecutive failures - 2 seconds
+  doubling to 32 - which is right for a gateway that has stopped answering, because opening
+  another socket just queues behind whatever is stalling it. It was also being applied when
+  the gateway **closed** the connection, where there is nothing to queue behind and a new
+  socket is the only way back. The recovery that normally rescues the block was refused from
+  the second consecutive failure onward, so a blip took the entities offline instead.
+
+  **Affects anyone on v1.10.0 to v2.0.2 whose gateway drops its end**, which on a ShineWiFi-X
+  is often. Found by @TobiGitHubi from a debug log, who reported that it had been stable
+  before v2.0.0 - that is what identified it as something we changed rather than marginal
+  hardware. Gateways that stall rather than hang up keep the existing back-off unchanged.
+
+---
+
+## v2.0.2
+
+Issues: #426 #427 #429 #432 #433
+
+Promotes the v2.0.2-b1 to -b7 beta line to stable. Mostly connection reliability, plus one
+entity that had never been created on the profiles that could populate it.
+
+- **Shared connections no longer leak a socket per config-entry reload.** Reading the serial
+  number, firmware, protocol version and inverter clock went straight to the underlying
+  Modbus client instead of through the shared connection, opening a second connection that
+  nothing owned or closed. A clean start held two connections instead of one, and every
+  reload added another. **Affects anyone running two or more inverters through one gateway**,
+  or a gateway with a low client limit - an Elfin EW11 accepts five. Diagnosed by
+  @KevlarD-67. (#426)
+- **A frame the gateway answers badly is re-read instead of costing the whole block.** A
+  response whose length does not match the request has always been discarded, but the read
+  was then lost for that poll - so entities dropped to unavailable in ones and twos while the
+  connection looked fine. Most useful on Growatt WiFi dongles and PUSR-class bridges; a
+  healthy adapter never reaches this path. Thanks @TobiGitHubi, whose ShineWiFi-X answered 17
+  of 200 requests this way. (#433)
+- **Setup asks what your inverter is connected through**, and sets the polling timings to
+  match. A dedicated RS485 gateway keeps today's defaults; a Growatt ShineWiFi-X, ShineLan or
+  PUSR-class bridge starts on a slower interval, longer timeout, more delay between requests
+  and 25-register reads. The same question is in **Configure**, where changing it re-applies
+  those timings except for anything you edit in the same save. **Existing setups are not
+  affected.** (#433)
+- **AC Power now appears on MOD and MID three-phase profiles.** The entity was never created
+  on those profiles, so two earlier fixes aimed at its value could not reach it. It reads the
+  inverter's total output register, or the sum of the three phases where firmware does not
+  serve it. **New entity on** MOD 6000-15000TL3-X, MOD 6000-15000TL3-XH and MID 11-30KTL3-XH,
+  confirmed on hardware by @as-wallpen at two opposite operating points. (#427)
+  **If you had a `sensor.growatt_grid_ac_power` from an older version, repoint anything using
+  it to `sensor.growatt_solar_ac_power`** - AC Power belongs to the solar device, so the new
+  entity takes a solar-prefixed id rather than reviving the old one.
+- **"Detect grid orientation" no longer reports an unread inverter as zero solar.** Running
+  it on an entry that has never had a successful read said "Insufficient Solar - current
+  production 0 W, try again when the sun is shining", to someone whose panels were making
+  over a kilowatt. It now says the inverter has not answered, and lists what to check. Found
+  by @JHPHendriks. (#432)
+- **The "no response since setup" repair notice now mentions a held serial port.** A USB
+  RS485 adapter can only be opened by one program at a time, so a second Growatt integration
+  on the same adapter stops this one reading anything - with a symptom identical to a wrong
+  unit ID. (#432)
+- **Unit / Slave ID and Connection Timeout are number boxes rather than sliders**, and the
+  unit ID is now range-checked at setup as well as in Configure.
+- Registers 35/36 are read as signed on the MIC, MID, MIN and MOD profiles, so a negative AC
+  output power is reported rather than withheld. Confirmed by @rj6zs826fn-web. (#429)
+
+---
+
+## v2.0.2-b7
+
+Issues: #432, #433
+
+- **A frame the gateway answers badly is now re-read instead of costing the whole block.**
+  A response whose length does not match the request has always been discarded, because the
+  words in it would land on registers they do not belong to - but the read was then lost for
+  that poll, so entities dropped to unavailable in ones and twos while the connection looked
+  fine. It is now re-read once on the same socket, after the receive buffer is drained.
+  Reported by @TobiGitHubi, whose ShineWiFi-X answered 17 of 200 requests this way. (#433)
+
+  **Most useful on Growatt WiFi dongles and PUSR-class bridges.** A healthy adapter never
+  reaches this path. Discarded frames are still discarded - no bad data is published.
+
+- **"Detect grid orientation" no longer reports an unread inverter as zero solar.** Running
+  it on an entry that has never had a successful read said "Insufficient Solar - current
+  production 0 W, try again when the sun is shining", to someone whose panels were making
+  over a kilowatt. It now says the inverter has not answered, and lists what to check.
+  Found by @JHPHendriks. (#432)
+
+- **The "no response since setup" repair notice now mentions a held serial port.** A USB
+  RS485 adapter can only be opened by one program at a time, so a second Growatt integration
+  using the same adapter stops this one reading anything - with a symptom identical to a
+  wrong unit ID. (#432)
+
+---
+
+## v2.0.2-b6
+
+- **Unit / Slave ID is now a number box instead of a slider.** Dragging a slider through 247
+  positions to reach a value you already know was needless, and worse on a phone. It is a
+  typed field in both setup and Configure.
+
+- **Setup now checks the unit ID is a valid Modbus address.** The setup form accepted any
+  number, while Configure only accepted 1-247 - so an entry could be created with a unit ID
+  that the options form would then refuse to save. Both use the same range.
+
+---
+
+## v2.0.2-b5
+
+Issues: #427, #433
+
+- **Setup now asks what your inverter is connected through, and sets the polling timings to
+  match.** A new **Connection hardware** question on the TCP setup form, with three answers:
+  a dedicated RS485 gateway (today's defaults), a Growatt ShineWiFi-X / ShineLan or PUSR-class
+  bridge, or a Growatt ShineWiLan-X2. Picking a Growatt dongle starts you on a slower scan
+  interval, a longer timeout, more delay between requests and 25-register reads, which is what
+  those devices need to stay connected. Reported by @TobiGitHubi. (#433)
+
+  The same question is in **Configure**. Changing it re-applies that hardware's timings, except
+  for anything you edit in the same save - your own tuning is kept. **Existing setups are not
+  affected**: they show the default answer, which counts as no change.
+
+- **AC Power now appears on MOD and MID three-phase profiles.** The entity was never created on
+  those profiles, so two earlier fixes aimed at its value could not reach it. It reads the
+  inverter's total output register, or the sum of the three phases where firmware does not serve
+  that register. Found by @as-wallpen on a MID 25KTL3-XH. (#427)
+
+  **New entity on** MOD 6000-15000TL3-X, MOD 6000-15000TL3-XH and MID 11-30KTL3-XH. Deliberately
+  not added to SPH-TL3, where the same register name refers to phase R rather than the total, or
+  to MID 15000-25000TL3-X, which maps neither a total nor per-phase powers.
+
+---
+
+## v2.0.2-b4
+
+Issues: #426
+
+- **Shared connections no longer leak a socket per config-entry reload.** Reading the device
+  serial, firmware, protocol version and inverter clock went straight to the underlying Modbus
+  client instead of through the shared connection, and those reads opened a second connection
+  that nothing owned or closed. A clean start held two connections instead of one, and every
+  reload added another until Home Assistant restarted.
+
+  **Affects anyone running two or more inverters through one RS485 gateway**, or a gateway with
+  a low client limit - an Elfin EW11 accepts five. Diagnosed by @KevlarD-67, who paired the
+  local ports from the debug log against the operating system's own socket list.
+
+---
+
+## v2.0.2-b3
+
+Issues: #427
+
+- **AC Power no longer sits unknown on three-phase models whose firmware does not serve the
+  aggregate register.** It now falls back to the sum of the three phase powers, which is the
+  rule grid flow already uses. A working aggregate register is never overridden, and a phase
+  that did not read leaves the total unknown rather than understating it. Reported by
+  @as-wallpen on a MID 25KTL3-XH. (#427)
+
+---
+
+## v2.0.2-b2
+
+Issues: #426
+
+- **Socket-level tracing for the shared-connection leak** still under investigation in #426.
+  Debug level, no behaviour change. Logs the local port of each connection so a log line can
+  be matched to a row of `ss -tn` output, and reports what `close()` actually did to it.
+- Warns once if a client holds a connection of its own while the shared hub is in charge - a
+  socket nothing would close. Testing a hypothesis rather than reporting a finding; **if you
+  see that warning, please post it on #426.**
+
+---
+
+## v2.0.2-b1
+
+Issues: #431
+
+- **WIT: a balanced site no longer reports phantom grid export.** With PV down and the battery
+  carrying the house, the meter registers correctly read zero - and that zero was treated as
+  "nothing is reporting", so an energy-balance estimate ran instead and published the battery
+  discharge as grid export. On the reference unit that was 605 W of export that never happened,
+  and the Energy Dashboard then showed the house consuming nothing.
+
+  On profiles where the meter is the only usable source, a zero from a meter that is fitted is
+  now believed. Whether one is fitted is read from the inverter (MeterLink, holding 180) rather
+  than assumed.
+
+  **Testers wanted, particularly a WIT with no meter or CT fitted.** That case is the one piece
+  not yet confirmed on hardware - if MeterLink reads 0 there, Grid Power becomes unknown rather
+  than a fabricated figure. Please report on #431 either way.
+
+  Found, measured and fixed by @minajevs.
+
+---
+
+## v2.0.1
+
+Issues: #403 #426 #429 #430
+
+Promotes the v2.0.1-b1 to -b4 beta line to stable. Four fixes, all for values that were wrong
+rather than missing.
+
+- **WIT: Battery Power was reading about a tenth of the real value.** Models that map several
+  battery-current addresses but implement only one had the automatic power-scale check blocked
+  permanently, leaving a scale that is wrong on that hardware. Affects WIT profiles from
+  v1.9.0. Thanks @Wojak129, whose paired register captures under load identified it. (#430)
+- **SPH-TL3: Battery Max/Min Cell Voltage are withdrawn.** Those registers do not carry cell
+  voltages on that hardware - one owner read 2.27 V and 1.89 V per cell on a LiFePO4 pack at
+  47 % state of charge. **The two entities disappear on upgrade.** Thanks
+  @Doprintityourself. (#403)
+- **AC output power is no longer discarded when it goes negative** on the MIC, MID, MIN and
+  MOD profiles. A negative reading was decoded as an impossible 429 MW and thrown away, so the
+  value went missing rather than wrong. If you saw `UNDERFLOW` warnings naming
+  `output_power_low`, they should stop. Thanks @rj6zs826fn-web. (#429)
+- **The connection test no longer leaks a socket when the read fails.** It ran on every
+  connection test in the config and options flows, so a gateway with a hard client limit could
+  run out of slots during a run of failed attempts. (#426)
+- Connection lifecycle tracing added at debug level, for a reload socket leak still under
+  investigation in #426. No behaviour change.
+
+---
+
+## v2.0.1-b4
+
+Issues: #430
+
+- **WIT: battery power no longer reads a tenth of the actual value.** On models that map
+  several battery-current addresses but implement only one, the unimplemented ones sit at
+  zero permanently. Those were being treated as readings that contradicted the working
+  register, which permanently blocked the automatic power-scale check and left the documented
+  scale in place - wrong on this hardware. A register reading zero is now treated as not
+  reporting rather than as disagreement.
+
+  **Affects WIT profiles on v1.9.0 through v2.0.1-b3.** If your Battery Power has been
+  reading about a tenth of voltage x current, this is it. Thanks @Wojak129 for the paired
+  register captures that identified the cause.
+
+---
+
+## v2.0.1-b3
+
+Issues: #403
+
+- **Battery Max/Min Cell Voltage are withdrawn from SPH-TL3.** They were added in v2.0.0 from
+  the protocol document alone, without a device to check them against. The first owner to
+  receive them read **2.27 V and 1.89 V per cell at 47% state of charge** on a LiFePO4 pack,
+  where a real cell sits near 3.25 V - and no scale turns one into the other, so those
+  registers do not carry cell voltages on that hardware.
+
+  **If you are on v2.0.0 or v2.0.1-b1/b2 with an SPH-TL3, those two sensors are wrong.** A cell
+  voltage of 1.9 V reads as a pack about to fail rather than as a bad mapping, which is why
+  they are being removed rather than left in place. The entities disappear on upgrade.
+
+  Thanks @Doprintityourself, who was asked to check them and reported straight back.
+
+---
+
+## v2.0.1-b2
+
+Issues: #426 #429
+
+- **The connection test no longer leaks a socket when the read fails.** It is the only place
+  that opens a connection outside the shared hub, and the close sat outside the `try`, so a
+  read that raised left the socket established. It ran on every connection test in the config
+  and options flows - the retry loop you work through when a connection is not right yet,
+  which is exactly when the read is most likely to fail. On a gateway with a hard client limit
+  each attempt burned a slot until Home Assistant restarted.
+- **Connection lifecycle tracing added at debug level** for the reload socket leak under
+  investigation in #426. No behaviour change; it logs which hub opened which socket, and
+  whether anything closed it, across an unload/setup cycle.
+- Carries the register-36 signed fix from b1 (#429).
+
+**If you are helping with #426:** enable `custom_components.growatt_modbus` at debug, capture
+Home Assistant starting up and then one `homeassistant.reload_config_entry`, and attach the
+log. The lines to look for contain `hub=0x`.
+
+---
+
+## v2.0.1-b1
+
+Issues: #429
+
+- **AC output power is no longer withheld when it goes negative.** Registers 35/36 were
+  decoded as unsigned on the MIC, MID, MIN and MOD profiles, so a negative reading became an
+  impossible 429 MW and was discarded by the out-of-range guard - the reading went *missing*
+  rather than wrong, which is why it went unreported for so long. WIT already had this right.
+  Found by @rj6zs826fn-web from the UNDERFLOW warnings in his log. (#429)
+
+- **WIT: Grid Power no longer invents a flow while the meter reads zero.** With PV down and
+  the battery covering the house on its own, both directional meter registers read a
+  truthful 0 W - a balanced site. The derivation treated that as "no meter" and fell back
+  to an energy balance, which on these models is `(0 + battery discharge)` and published
+  the discharge as grid flow: 605 W of export on an evening with no export at all, with
+  the Energy Dashboard then computing house consumption as zero. The direction followed
+  the battery sign, so before the polarity option was corrected the same site fabricated
+  an import instead.
+
+    A zero from a meter that is fitted is now believed, gated on the profile: WIT maps
+    declare the meter their only usable source of grid direction, because `power_to_load`
+    reads 0 W there while the house draws hundreds of watts. Other families keep the
+    estimate - with no meter fitted the same all-zero reading means nothing is reporting,
+    and the balance is the better answer.
+
+- **A WIT with no meter and no CT reads unknown rather than zero.** Grid-side measurement
+  on these models comes from either a Growatt meter or external CTs, and the inverter
+  reports whether it is receiving one (`MeterLink`, holding 180). Where nothing is
+  connected — the manual's *Zero export to GRID* arrangement needs no meter — a reading of
+  zero is the absence of a source rather than a balanced house, so `Grid Power` goes
+  unknown. Sites that are measuring are unaffected.
+
+- **A meter register that could not be read is no longer published as zero.** Where the
+  total is mapped but no address answered and there are no phase registers to fall back
+  on, the sensor goes unknown for that poll rather than reporting 0 W. On a metered
+  profile a zero is a measurement, so a failed read published as one was indistinguishable
+  from a balanced site (#384's distinction, applied where it costs most).
+
+**Testers wanted.** If you saw `UNDERFLOW` warnings mentioning `output_power_low`, they should
+stop, and AC output power should read through periods where it was previously blank.
+
+---
+
+## v2.0.0
+
+Issues: #373 #387 #403 #404 #428
+
+**Nothing breaks, and there is nothing to do on upgrade.** The jump from 1.10.0 to 2.0.0 is a
+version-numbering change, not a rewrite: `1.10` sorts *before* `1.9` in any alphabetical list,
+which made the release history read out of order. Starting at 2.x fixes that for good. Upgrade
+normally.
+
+This release is otherwise a set of fixes, four of them for defects in v1.10.0.
+
+- **SPF with a lithium battery: the switchover thresholds are no longer capped at 64.** On
+  lithium these two registers are a percentage of state of charge, not a voltage, but the
+  entities were created with the lead-acid range and unit and never updated - so a threshold
+  of 75 % was rejected as "must be less than or equal to 64" and nothing above 64 % could be
+  set from Home Assistant. They now follow the battery type, including when you change it.
+  Reported by @eugeniodb. (#428)
+- **Fixed a duplicate "Battery State of Health" entity.** Two sensors carried the same name,
+  so any profile with both created a second entity with a `_2` suffix. The one from the VPP
+  range is now "Battery State of Health (VPP)"; the plain one is the documented BMS register.
+  Reported by @Doprintityourself. (#403)
+- **New on SPH-TL3: highest and lowest cell voltage.** Growatt exposes no per-cell readings,
+  but it does report the two extremes - the gap between them is the cell-imbalance figure.
+  (#403)
+
+- **MOD: the Mode selector for VPP branch control had its two options the wrong way round.**
+  Selecting "Roster/TOU schedule" wrote the value that selects the direct setpoint branch, and
+  vice versa. Affects v1.10.0 and the b7-b10 pre-releases. Found by @KevlarD-67.
+- **MOD: VPP AC Charge Enable now decodes all three of its values.** The control offers
+  Disabled / PV priority / AC priority; the profile decoded only two, so a live "AC priority"
+  read as unknown. Found by @KevlarD-67.
+- Register note corrected: **input 3087-3091 works on some firmware.** A previous note said no
+  device honoured it. A MOD 10KTL3-XH on DN1.0 returns live measurements there, while four
+  other devices echo serial-number text. The integration reads 200-205 either way, which works
+  on both. (#404)
+
+- **SPF Bulk and Float Charge Voltage now constrain each other.** Bulk cannot be set below
+  Float, or Float above Bulk - the inverter rejects that combination, and it rejected it in a
+  way that surfaced as a "settings are being reverted" repair notice rather than as an invalid
+  request. The sliders no longer offer the invalid range, and a script setting them through
+  `number.set_value` gets a message saying what the limit is. Equal values are allowed.
+  Reported by @dinkalin-ux.
+
+---
+
+## v1.10.0
+
+Promotes the v1.10.0-b1 to -b10 beta line to stable. Per-release detail is in the sections
+below; this is what it means if you are coming from v1.9.8.
+
+### Energy dashboard
+
+- **SPH grid import now reads the whole service, not one phase.** Import was taken from
+  `PactouserR` (register 1015), which is phase R alone. It now uses the total at 1021, falling
+  back to the sum of R+S+T where a firmware does not populate the total. **Three-phase and US
+  split-phase SPH owners were under-reading grid import** - a third and a half respectively.
+  Single-phase systems are unaffected, because R and the total are the same measurement there
+  (#419).
+- Energy counters that step backwards by a small amount are held rather than published, on
+  both daily and lifetime totals, so Home Assistant no longer records a phantom meter reset
+  (#417).
+- Impossible energy spikes are withheld instead of being published and entering long-term
+  statistics (#410, #412).
+
+### Battery
+
+- **New: Battery Remaining Capacity and Battery Full Charge Capacity** in Ah, on SPH-TL3 and
+  SPH 8000-10000 HU, from the battery's own fuel gauge. Confirmed against an ARK nameplate
+  (#403).
+- Battery Current now reads on SPH-TL3 and the legacy SPH profiles, where it previously
+  published a permanent 0.00 A (#397, #403).
+- On SPH 8000-10000 HU, register 1088 is a BMS charge-current limit rather than a current, and
+  is withheld rather than published as one (#420).
+
+### Safety diagnostics
+
+- **Insulation Resistance, DC Injection and Leakage Current now read from the correct
+  registers** on MIN TL-X, MIN TL-XH and MOD-XH. They were reading serial-number text. These
+  sensors are disabled by default (#404).
+- Insulation Resistance is reported as unknown when the inverter signals it is not measuring,
+  rather than as a healthy-looking 65 MOhm (#404).
+
+### Setup and reliability
+
+- **The Modbus unit / slave ID can be changed from the options page.** Previously this needed
+  deleting and re-adding the entry, losing entity IDs, automations and statistics (#414).
+- A repair notice suggests checking the unit ID when an entry has never had a single
+  successful read since setup (#424).
+- Setup can be completed when the inverter does not answer, so a register scan can be produced
+  for an unsupported model (#389).
+- Shared connections no longer leave an orphaned socket behind on reload, and reconnects after
+  repeated failures are spaced out without holding up other inverters on the same gateway
+  (PR #422).
+- Failed writes report why they failed, so a caller can tell a transient refusal from a hard
+  fault (PR #421).
+
+### MOD / MID / WIT
+
+- MOD-XH no longer reports its own AC output as grid export (#415).
+- VPP remote power controls are available on MOD TL3-XH, disabled by default (#373).
+- WIT VPP Hold no longer expires at midnight when set late in the evening (#423).
+
+### Worth knowing
+
+**#419 is the change to watch.** It alters grid import for every SPH profile and is the one
+change here that a single-phase system cannot distinguish - the old and new behaviour are
+identical on single-phase hardware. It is reasoned from the V1.39 register table and from how
+export and load already resolve, and it is covered by tests, but **no three-phase SPH owner has
+confirmed it on hardware**. If your grid import looks wrong after upgrading, please say so on
+[#419](https://github.com/0xAHA/Growatt_ModbusTCP/issues/419) and it will be treated as a
+priority.
+
+---
+
+## v1.10.0-b10
+
+Issues: #404
+
+- **Insulation Resistance, DC Injection and Leakage Current now read from the right
+  registers.** On MIN TL-X, MIN TL-XH and MOD-XH these were read from input 3087-3091, which
+  returns serial-number text on every device scanned - so Insulation Resistance was
+  publishing decoded serial-number characters as a reading of 2261.6 kOhm. They now come from
+  input 200-205, confirmed against Growatt's own app. These sensors are diagnostic and
+  disabled by default, so most people will not have seen the wrong values.
+- **Insulation Resistance is withheld when the inverter reports it is not measuring it.**
+  Two devices report exactly 65530, which is a not-measured code rather than a 65 MOhm array
+  - Growatt's own app shows the same raw number. It is now reported as unknown, because a
+  falling insulation resistance is how a failing connector gets found and a healthy-looking
+  constant would hide that.
+
+Thanks @TyngRikku for the app screenshot that confirmed the mapping from outside the project.
+
+---
+
+## v1.10.0-b9
+
+Issues: #403 #414 #423  PRs: #421 #422
+
+- **New sensors: Battery Remaining Capacity and Battery Full Charge Capacity**, in Ah, on
+  SPH-TL3 and SPH 8000-10000 HU. They come from the battery's own fuel gauge, so Remaining
+  divided by Full is the gauge's state of charge, and Full Charge Capacity falling below the
+  nameplate figure shows real degradation. The scale is **confirmed on hardware**: an SPH-TL3
+  with 4x ARK 2.5H-A2 in series (50.0 Ah, 10.24 kWh) reports 52.50 Ah, 105% of nameplate.
+  Thanks @Doprintityourself, whose readings and battery specification this rests on.
+- **A shared connection no longer leaves a second socket behind when an entry is reloaded.**
+  An in-flight poll could outlive its hub and open a socket nobody would close, which on a
+  gateway that serialises clients turns one transport error into a cascade that does not
+  recover. Reconnects after a *run* of failures are now spaced out, without holding up other
+  inverters on the same gateway. Thanks @minajevs (#422).
+- **A failed write now tells the caller why.** Over the REST API a rate-limit refusal and a
+  hard Modbus failure were both a generic error; they are now distinguishable, so an
+  automation can retry the first and report the second. Thanks @minajevs (#421).
+- **The `set_battery_mode` service no longer expires a Hold at midnight.** b8 fixed this for
+  the Mode (VPP) select and missed the service, so a Hold set from a script or the REST API
+  still lasted minutes rather than hours (#423).
+- Fixed: the two new capacity sensors would have appeared with no name until CI caught it.
+
+---
+
+## v1.10.0-b8
+
+Issues: #423 #424
+
+- **A repair notice now suggests the Modbus unit ID when an entry has never once
+  responded.** A wrong unit ID looks exactly like a dead connection - every read times out
+  and the log says `transport error during block read` - so nothing points at the address as
+  the thing to check. The notice fires only when there has been no successful read since
+  setup, never when a working entry goes offline, and clears itself on the first success.
+- **WIT VPP HOLD no longer expires at midnight.** TOU period words are minutes since
+  midnight and do not wrap, and the end was being clamped to 23:59 - so a Hold selected at
+  23:50 lasted nine minutes rather than two hours, then lapsed while the entity went on
+  reporting `Hold`. A window crossing midnight is now written as two periods. Affects WIT
+  profiles, where the Mode (VPP) select is offered.
+
+---
+
+## v1.10.0-b7
+
+Issues: #349 #400 #414
+
+- **The Modbus unit / slave ID can now be changed from the options page.** Previously the
+  only way to correct it was to delete the config entry and add it again, which loses entity
+  IDs and with them automations, dashboards and statistics history. A wrong unit ID looks
+  exactly like a connection that will not recover, so this was two days of hunting for
+  @Svetlonos76 on a WIT that answered only on unit 1 despite ShineTools being set to 2.
+  Offered for both TCP and serial.
+- Register note corrected: **30407 is not a master enable.** It selects between the direct
+  setpoint (30409) and the roster/TOU schedule. Growatt's own scheduler moved 12.3 kWh into a
+  battery through the roster branch with 30407 reading "Disabled". If you are checking whether
+  external power control is active, 30100 is the register to read. Thanks @KevlarD-67. (#349)
+- Register note corrected: **30474 mirrors the active control value, not the commanded
+  setpoint** - it moved 9-15 times a day across five days while 30409 never moved at all. It
+  stays read-only; the reason is different. (#400)
+- Documented that the **+1 % / -1 % asymmetry behind the WIT HOLD workaround did not
+  reproduce on a MOD DTC 5400** direct branch, where both signs held. Whether the workaround
+  holds on MOD's roster branch is still being measured and is not yet answered. (#400)
+
+---
+
+## v1.10.0-b6
+
+Issues: #373 #417
+
+- **A lifetime energy counter stepping backwards is now held too.** b4 added this guard for
+  daily counters and missed the lifetime ones, so `Load Energy Today` was correctly held
+  while `Load Energy Total` went on tripping Home Assistant's counter-reset detection by
+  itself - from the same event, three milliseconds apart. Caught by @Vict20 on the first
+  capture after b4. (#417)
+- Register note corrected: **30410** is still believed to be written by something other
+  than this integration, but on the absence of any write path rather than on timing. The
+  original observation placed the change one second before the reporter's own controller
+  started; his register sweep samples every ~300 seconds, so that precision did not exist.
+  @KevlarD-67 withdrew it himself. (#373)
+
+---
+
+## v1.10.0-b5
+
+Issues: #373
+
+- **MOD-XH: the VPP remote power controls are now available.** Control Authority, Remote
+  Power Control Enable, Charging Time, Charge/Discharge Power and VPP AC Charge Enable were
+  read-only on this family. They work, and they are now offered - **all five disabled by
+  default**, so nothing appears or changes unless you go and enable it.
+
+  !!! warning "Read this before enabling Control Authority"
+      **Enabling it takes your TOU schedule out of circuit.** While Control Authority is
+      set, the inverter switches to the VPP model and `Charge Power Rate`, `Allow Grid
+      Charge` and your Battery First slots all stop applying together.
+
+      It fails silently - no error, no entity going unavailable, nothing in the log. In the
+      measurement behind this change, 84 minutes with authority held bought **0.04 kWh**
+      against a plan of 3.53 kWh; released, 51 minutes bought **4.33 kWh**. The owner was
+      watching at 1 Hz and it still took him 84 minutes to spot.
+
+      If you use a scheduler such as Predbat, or the built-in time periods, leave this
+      control alone unless you specifically intend to hand the inverter over to VPP.
+
+  Two registers stay read-only for good reasons: **30474** only mirrors the last commanded
+  setpoint and ignores writes, and **30476** is listed as `Reserve` in one protocol version
+  and as the default-mode selector in another, with nobody having measured what writing it
+  does. **30410** is also now known to change on its own - the inverter's own scheduler
+  writes it - so do not trust a cached value there.
+
+  All of it measured and reported by @KevlarD-67. (#373)
+
+---
+
+## v1.10.0-b4
+
+Issues: #389 #415 #417 #418 #420
+
+- **A counter stepping backwards no longer registers as a meter reset.** Occasionally an
+  inverter recomputes a total and rounds it down by a single count - one reporter caught
+  `load_energy_today` going 9.3 to 9.2 kWh and `load_energy_total` doing the same in the
+  same poll, confirmed at the register itself rather than anywhere on our side. Home
+  Assistant reads any decrease on this kind of sensor as a meter reset, which distorts your
+  energy dashboard permanently. Such a step is now held at the previous value until the
+  counter moves forward again. A genuine reset, which goes to zero or drops a long way, is
+  still passed through. Reported by @Vict20. (#417)
+- **SPH-HU: per-leg CT sensors.** On a US split-phase service, Grid Import and Grid Export
+  are now also available for each leg separately. Contributed by @risco21-dot. (#418)
+- **MOD-XH: Grid Power no longer reports the inverter's own AC output as grid export.** A
+  regression introduced in v1.9.3. On MOD 6-15kW TL3-XH and TL3-HU inverters, register 31101
+  is the inverter's AC output, but it was offered to the integration as a source of grid
+  export - so whenever your real grid registers read zero, which is what "nothing flowing to
+  the grid" looks like, the AC output was published as export instead.
+
+  **If you upgraded from v1.8.14 and your Grid Power started showing export while you were
+  self-consuming, this was why.** One reporter's diagnostics show 0.0 W on v1.8.14 and
+  702.7 W on v1.9.4 from the same inverter, while it was charging a battery and running the
+  house on solar. Reported by @pduarte-aldape and @ciccio1337. (#415)
+
+---
+
+## v1.10.0-b3
+
+Issues: #389 #420
+
+- **You can now finish setup even if the inverter does not answer.** A failed connection
+  test used to be a dead end - the address was cleared and there was no way past it. After a
+  failure you now get an **Add anyway** option, which takes you straight to choosing the
+  model yourself, and the address you typed is kept between attempts.
+
+  The setup screen tells you plainly what to expect: **every entity stays unavailable until
+  the inverter answers.** This is for an inverter that is offline for now, or one we do not
+  support yet - in that case adding it is the only way to reach the register scanner, since
+  Home Assistant does not load the integration until a device exists. The option only
+  appears **after** a failure, so a typo or a wrong port still stops you as it should.
+  Raised by @gamer123. (#389)
+- **SPH-HU: Battery Current is withheld rather than showing a charge limit.** On SPH
+  8000-10000 TL-HU, register 1088 does not carry live battery current - it carries the BMS
+  charge-current limit, which sits near 140 A and tapers to 40 A as the battery fills. The
+  Battery Current sensor on that profile was reporting it as a measurement.
+
+  **If you have an SPH-HU, that sensor will disappear.** It was never showing your battery's
+  current. Other SPH models are unaffected: 1088 is confirmed as real current on the 3-6 kW
+  and TL3 families, measured against a clamp meter and a known discharge.
+
+  Established by @risco21-dot on an SPH-10000-US: a direct scan reading 1400 while the
+  battery did 355 W at 53.0 V, and a month of history in which the value repeats 140.0
+  exactly 22 times, 40.0 exactly 8 times, and is never once negative. (#420)
+
+---
+
+## v1.10.0-b2
+
+Issues: #419
+
+- **SPH-10000-US inverters are now detected automatically.** Device type code **21100** was
+  not in the registry, so these reported as Unknown and needed the profile picking by hand.
+  It maps to the same `sph_8000_10000_hu` profile as its already-known sibling 21303.
+  Confirmed from a register scan on an SPH-10000-US running firmware UL2.21, contributed by
+  @risco21-dot on #418. Existing installs are unaffected - this only helps new setups and
+  anyone re-running detection.
+
+---
+
+## v1.10.0-b1
+
+Issues: #419
+
+> **New version numbering.** Betas are now `x.y.z-b1`, `-b2` and so on, and the stable
+> release drops the suffix. Previously every beta consumed a patch number, so the version
+> climbed several times a week and told you nothing about whether a release was tested.
+> Nothing changes about how you install: betas still require "Show beta versions" in HACS.
+
+- **SPH grid import was reading one phase, not the whole service.** Every SPH profile took
+  grid import from register 1015, which Protocol V1.39 names `PactouserR` - the R phase. The
+  whole-service total at 1021 was mapped but under a name the integration could not resolve.
+  Grid export and house load already used their totals; import alone did not.
+
+  **If you have a single-phase SPH, nothing changes** - R and the total are the same
+  measurement on your hardware, which is why this went unnoticed for so long.
+
+  **If you have a three-phase SPH-TL3, your grid import has been reading roughly a third of
+  actual**, and on a US split-phase SPH-HU, about half. Both now read the whole service.
+
+  The total is not trusted blindly: if your inverter does not populate it, the per-phase
+  registers are summed instead, and a zero total is never accepted while the phases show
+  real power. If a phase read fails, the sensor reports unknown for that poll rather than a
+  partial sum. Surfaced by @risco21-dot on a US split-phase unit. (#419)
+
+---
+
+## v1.9.8
+
+Issues: #416
+
+- **The deprecated `via_device` warning is gone on Home Assistant 2026.8 and later.** Each
+  sub-device (Solar, Grid, Load, Battery) points at the parent inverter, and the way that
+  link is expressed changed: identifiers are only unique per config entry, so Home
+  Assistant replaced the identifier form with a resolved device id. The old form still
+  works and warns; it stops working in HA 2027.8.
+
+  **Nothing changes for you** - the device tree is identical either way. The integration
+  now uses whichever form your Home Assistant supports, so **older versions keep working
+  exactly as before**. Reported by @Vict20. (#416)
+
+---
+
+## v1.9.7
+
+Issues: #389 #405
+
+- **The Universal Register Scanner is no longer advertised as usable before you add a
+  device.** Home Assistant does not load an integration until it has at least one
+  configured device, and the scanner is provided by the integration - so the action simply
+  does not appear until then. Both the action's own description and the documentation said
+  the opposite, which sent the one group the feature exists for - people with an
+  unsupported inverter, trying to produce a scan so it can be supported - looking for
+  something that was never there. The docs now say what the constraint is and give the way
+  through: add the inverter with any profile chosen by hand, then scan it, since the scan
+  sweeps every range regardless of the profile configured. Found by @gamer123, who
+  diagnosed it correctly from the outside. (#389)
 - **The wrong-profile notice now tells you the actual difference.** It used to assert that
   the profile in use "maps fewer registers than the one your hardware reports", which
   nothing verified - where two profiles differ, the suggested one may map fewer sensors, or
@@ -1651,7 +3581,7 @@ Issues: #367
   Still not ideal, but it no longer corrupts Energy Dashboard history — which is
   permanent, and has to be repaired by hand.
 
-- **Note:** if you already have corrupted hourly statistics, Developer Tools → Statistics
+- **Note:** if you already have corrupted hourly statistics, Settings → Tools → Statistics
   can correct the affected means without touching the database.
 
 - **Known remaining:** five call sites in the WIT battery-power path use the same

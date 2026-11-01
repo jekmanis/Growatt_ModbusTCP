@@ -38,6 +38,12 @@ POWER_FLOW_SENSORS: Set[str] = {
     "power_to_grid", "power_to_load", "power_to_user",
 }
 
+SPH_HU_CT_SENSORS: Set[str] = {
+    "ct_grid_import_l1", "ct_grid_import_l2",
+    "ct_grid_export_l1", "ct_grid_export_l2",
+    "inverter_to_load_l1", "inverter_to_load_l2",
+}
+
 CONSUMPTION_SENSORS: Set[str] = {
     "self_consumption", "self_consumption_percentage", "house_consumption",
 }
@@ -65,6 +71,8 @@ ENERGY_BREAKDOWN_SENSORS: Set[str] = {
 
 BATTERY_SENSORS: Set[str] = {
     "battery_voltage", "battery_current", "battery_soc",
+    # BMS fuel gauge, in Ah (#403)
+    "bms_gauge_rm", "bms_gauge_fcc",
     "battery_temp", "battery_power",
     "battery_charge_power", "battery_discharge_power",
     "battery_charge_today", "battery_discharge_today",
@@ -94,6 +102,12 @@ _EXTRA_BATTERY_FIELDS = (
 )
 
 BATTERY2_SENSORS: Set[str] = {f"battery2_{f}" for f in _EXTRA_BATTERY_FIELDS}
+# Pack 1's own energy counters (VPP 31202-31209) on multi-pack MOD/MID. Only the maps that
+# define them as *_vpp_* registers get these (#451).
+BATTERY1_ENERGY_SENSORS: Set[str] = {
+    "battery1_charge_energy_today", "battery1_charge_energy_total",
+    "battery1_discharge_energy_today", "battery1_discharge_energy_total",
+}
 BATTERY3_SENSORS: Set[str] = {f"battery3_{f}" for f in _EXTRA_BATTERY_FIELDS}
 BATTERY4_SENSORS: Set[str] = {f"battery4_{f}" for f in _EXTRA_BATTERY_FIELDS}
 
@@ -109,6 +123,41 @@ BATTERY4_SENSORS: Set[str] = {f"battery4_{f}" for f in _EXTRA_BATTERY_FIELDS}
 # degrees rather than an entity that no longer exists (#362). The sensor set is the only
 # hard filter available, so exclusion has to happen here.
 NO_BATTERY_TEMP: Set[str] = {"battery_temp"}
+
+# Boost and IPM temperature do not exist on the off-grid protocol (#443).
+#
+# TEMPERATURE_SENSORS carries both, and the off-grid families inherit that group whole -
+# but the off-grid register table has no Boost or IPM temperature at all. Its temperatures
+# are InvTemp (25), DcDc (26), Buck1/Buck2 (32/33) and, further out, TxTemp, LLCTemp and
+# EnvTemp. Nothing maps to these two names, so `_find_register_by_name` returns None, the
+# field keeps its 0.0 default and both sensors report 0.0 C for ever.
+#
+# Confirmed on hardware rather than inferred from the default: @takisbg's SPF 6000 ES PLUS
+# shows Boost 0.0 C and IPM 0.0 C in the same Diagnostic card where DC-DC reads 21.8 C and
+# Inverter reads 37.1 C - so the two with registers work and the two without do not.
+#
+# Do NOT map these to holding 94/95 to "fix" them. `profiles/helpers.py` uses those
+# addresses for ipm_temp and boost_temp on other families; on off-grid, holding 94 and 95
+# are the low-voltage cut-off and uwAC2BatVolt, which would publish a battery threshold as
+# a temperature.
+NO_BOOST_OR_IPM_TEMP: Set[str] = {"boost_temp", "ipm_temp"}
+
+# AC Voltage RS/ST/TR on a register map with nothing to fill them (#447).
+#
+# The read path fills these from registers named line_voltage_rs/st/tr. The V2.01 SPH-TL3
+# map has them at VPP 31106-31108; the legacy SPH-TL3 map has no such register at all,
+# because it does not read the VPP range, so on that profile the three sensors can only ever
+# publish their 0.0 default. Mapping the V1.39 addresses instead is not an option: input
+# 50-52 read 0.0 on two SPH 10000 TL3 BH-UP units with a live three-phase grid (#442, #447).
+# Dry contact relay state, input 3119 (V1.39, TL-X/TL-XH group). Offered only on the profiles
+# whose map defines the register. It was in STATUS_SENSORS, which put it on every profile -
+# and dry_contact_state is a dataclass field, so 24 profiles with no register showed a
+# permanent "Off" that was never read (#470). SPH-TL3 and SPH V2.01 also mapped 3119 but do
+# not implement that range: Illegal Function on #467, and zeros or one value repeated across
+# 3071-3119 on three DTC 3501 scans (#470).
+DRY_CONTACT_SENSORS: Set[str] = {"dry_contact_state"}
+
+NO_LINE_VOLTAGES: Set[str] = {"ac_voltage_rs", "ac_voltage_st", "ac_voltage_tr"}
 
 # dcdc_temp is NOT in TEMPERATURE_SENSORS, and must not be put back there.
 #
@@ -145,11 +194,25 @@ TEMPERATURE_SENSORS: Set[str] = {
 STATUS_SENSORS: Set[str] = {
     "status", "grid_connection_status", "last_update", "derating_mode", "fault_code", "warning_code",
     "wit_mode_status",
-    # Dry contact relay state (read-only, SPH/MIN TL-X/TL-XH)
-    "dry_contact_state",
     # WIT debug/safety registers (read-only, disabled by default)
     "ntognd_detect", "nonstd_vac_enable", "enable_spec_set", "fast_mppt_enable",
     # Insulation/leakage diagnostics (ISO/DCI/GFCI — reg 3087-3091, disabled by default)
+    #
+    # `pv_iso` is worth a look if anyone reports it, and is recorded here rather than as an
+    # issue because it needs hardware to settle. It is in this shared group and therefore on
+    # 28 profiles, and most of those do not map input 200 — so on those it can only publish
+    # 0.0. A DCI or GFCI of zero is a correct reading on a healthy inverter, which is why
+    # those two are not suspicious; an insulation resistance of **exactly zero** is not, and
+    # would mean a dead short across the array.
+    #
+    # So the likely position is that `pv_iso` belongs with `DCDC_TEMP_SENSOR` below — opted
+    # into per profile rather than shared — but confirming that needs a scan from a profile
+    # that does map it, against one that does not. Both are disabled by default, which is
+    # why nobody has hit it.
+    #
+    # Do not remove it on the strength of this note alone: an earlier sweep that flagged
+    # sensors like these as unpopulatable was wrong about 7 in 8 of them, because it counted
+    # runtime-excluded sensors and legitimate zeroes as faults.
     "pv_iso", "dci_r", "gfci",
 }
 
@@ -165,6 +228,32 @@ THREE_PHASE_SENSORS: Set[str] = {
 
 SYSTEM_OUTPUT_SENSORS: Set[str] = {
     "system_output_power",
+}
+
+# Aggregate AC output power on a three-phase profile.
+#
+# Deliberately NOT part of THREE_PHASE_SENSORS, and it cannot be: whether an aggregate is
+# safe on a three-phase inverter depends on the register map, not on the phase count.
+# `ac_power` resolves through `_find_register_by_name('ac_power_low')`, and across the nine
+# three-phase maps that lands in three different places:
+#
+#   MOD_6000_15000TL3_X / _XH    reg 36, "output power total" - a distinct total. Safe.
+#   WIT_*, TL3_S_*               a distinct total. Safe, and already exposed.
+#   SPH_TL3_*                    aliases reg 41, which is ac_power_r_low - PHASE R.
+#   MID_15000_25000TL3_X(_V201)  no total and no phase power registers at all.
+#
+# On an SPH-TL3 the sensor would publish one phase as the whole output: a wrong-but-plausible
+# number, which is worse than no sensor. On the MID TL3-X maps there is nothing to read and
+# nothing to sum. So this is applied per profile against its map, never by phase count.
+#
+# The MOD/MID-XH profiles were the gap. Their map has a perfectly good total at 35/36 and,
+# where firmware does not serve it, the phase sum fills in (#427) - but `ac_power` was in
+# BASIC_AC_SENSORS only, which THREE_PHASE_SENSORS replaces rather than extends, so the
+# entity was never created on a three-phase profile. A reporter on a MID 25KTL3-XH had the
+# entity from an older version, saw it sit unknown through two fixes aimed at the decode,
+# and was right that neither had reached it.
+AC_POWER_TOTAL_SENSOR: Set[str] = {
+    "ac_power",
 }
 
 SPF_OFFGRID_SENSORS: Set[str] = {
@@ -215,8 +304,16 @@ WIT_EXTRA_SENSORS: Set[str] = {
     "extra_energy_today", "extra_energy_total",
 }
 
+# Holding 30474, mapped by both WIT register maps and already polled; it had no entity
+# (#481). V2.05 calls it the actual charge/discharge power, but the diagram only writes it
+# inside the remote-control and time-segment branches, and on a MOD it kept the last
+# command for hours after control ended (#373) - so it is labelled as the last setpoint.
+WIT_VPP_STATE_SENSORS: Set[str] = {
+    "vpp_last_setpoint",
+}
+
 BACKUP_BOX_SENSORS: Set[str] = {
-    # Growatt ARK transfer switch, connected via RS485 to TL-X/TL-XH inverters.
+    # Growatt SYN backup box, connected via RS485 to TL-X/TL-XH inverters.
     # Sensors gated on box_connect_flag==1 (reg 3320); box_connect_flag itself is always shown.
     "box_connect_flag",
     "box_bypass_status",
@@ -247,6 +344,41 @@ MOD_PEAK_SHAVING_SENSORS: Set[str] = {
     "demand_export_limit",
     "peak_shaving_reserve_soc",
     "ac_charge_max_power",
+}
+
+# Sensors the shared groups give the MIN TL-XH2 that it has no register for. It answers only
+# the VPP ranges, so every one of these sat at its dataclass default - 0, "Load First",
+# 0.0 kWh - looking like a reading (#461). Removing them from the set is the only filter
+# that works (CLAUDE.md rule 6); __init__.py then clears the registered entities.
+XH2_UNSOURCED_SENSORS: Set[str] = {
+    "ac_charge_energy_today", "ac_charge_energy_total",
+    "battery_voltage_bms", "bms_gauge_fcc", "bms_gauge_rm",
+    "pv3_energy_today", "pv3_energy_total",
+    "priority_mode",
+    "derating_mode", "dry_contact_state", "enable_spec_set", "fast_mppt_enable",
+    "fault_code", "warning_code", "gfci", "dci_r", "pv_iso",
+    "nonstd_vac_enable", "ntognd_detect",
+    # 31223, the documented battery environment temperature, reads 0 on both XH2 units
+    # seen, and 31224 matched none of the temperatures ShinePhone shows (#461).
+    "battery_temp",
+}
+
+# Battery pack description, VPP input 31225-31228. Validated on MIN TL-XH only (#460); MOD
+# maps the registers too but nobody has read them there, so it does not get the sensors.
+BATTERY_PACK_SENSORS: Set[str] = {
+    "battery_working_status",   # 31001, same validation
+    "battery_cluster_sum",
+    "battery_module_number",
+    "battery_module_rated_voltage",
+    "battery_module_rated_capacity",
+}
+
+# Full-charge capacity per cluster, VPP 31219-31220 / 31319-31320 (#482). The MOD TL3-XH
+# map names cluster 1's bms_gauge_fcc, so the existing sensor serves it. Only that map
+# defines these, so only its profiles take this group.
+BATTERY_FCC_SENSORS: Set[str] = {
+    "bms_gauge_fcc",
+    "battery2_full_charge_capacity",
 }
 
 MOD_VPP_STATE_SENSORS: Set[str] = {
@@ -389,7 +521,7 @@ INVERTER_PROFILES = {
         "has_battery": False,
         "max_power_kw": 6.0,
         "protocol_version": "v1.39",
-        "sensors": GRID_TIED_1P_SENSORS,
+        "sensors": GRID_TIED_1P_SENSORS | DRY_CONTACT_SENSORS,
     },
 
     "min_7000_10000_tl_x": {
@@ -401,7 +533,7 @@ INVERTER_PROFILES = {
         "has_battery": False,
         "max_power_kw": 10.0,
         "protocol_version": "v1.39",
-        "sensors": GRID_TIED_1P_SENSORS | PV3_SENSORS | SYSTEM_OUTPUT_SENSORS,
+        "sensors": GRID_TIED_1P_SENSORS | PV3_SENSORS | SYSTEM_OUTPUT_SENSORS | DRY_CONTACT_SENSORS,
     },
 
     # MIN Series VPP Protocol V2.01 (adds 30000 range for DTC)
@@ -414,7 +546,7 @@ INVERTER_PROFILES = {
         "has_battery": False,
         "max_power_kw": 6.0,
         "protocol_version": "v2.01",
-        "sensors": GRID_TIED_1P_SENSORS,
+        "sensors": GRID_TIED_1P_SENSORS | DRY_CONTACT_SENSORS,
     },
 
     "min_7000_10000_tl_x_v201": {
@@ -426,7 +558,7 @@ INVERTER_PROFILES = {
         "has_battery": False,
         "max_power_kw": 10.0,
         "protocol_version": "v2.01",
-        "sensors": GRID_TIED_1P_SENSORS | PV3_SENSORS | SYSTEM_OUTPUT_SENSORS,
+        "sensors": GRID_TIED_1P_SENSORS | PV3_SENSORS | SYSTEM_OUTPUT_SENSORS | DRY_CONTACT_SENSORS,
     },
 
     # ========================================================================
@@ -507,7 +639,7 @@ INVERTER_PROFILES = {
             # it, which is the correct handling of a sensor with no source and the reason
             # this model never showed a phantom 0.0 degC.
             {"inverter_temp"}
-        ),
+        ) - XH2_UNSOURCED_SENSORS,
     },
 
     "min_tl_xh_3000_10000_v201": {
@@ -530,6 +662,7 @@ INVERTER_PROFILES = {
             PV_DC_ENERGY_SENSORS |
             ENERGY_BREAKDOWN_SENSORS |
             BATTERY_SENSORS |
+            BATTERY_PACK_SENSORS |
             TEMPERATURE_SENSORS |
             STATUS_SENSORS |
             BACKUP_BOX_SENSORS
@@ -640,7 +773,12 @@ INVERTER_PROFILES = {
         "has_pv3": True,
         "has_battery": True,
         "max_power_kw": 10.0,
-        "sensors": HYBRID_1P_SENSORS | PV3_SENSORS | BMS_SENSORS,
+        # battery_current is withheld: register 1088 carries a BMS charge-current limit on
+        # this family, not live current (#420). Removing the register mapping alone would
+        # not be enough - battery_current is a GrowattData field, so the sensor would be
+        # created anyway and publish its 0.0 default as a measurement (CLAUDE.md rule 6).
+        # The sensor set is the only hard filter.
+        "sensors": (HYBRID_1P_SENSORS | PV3_SENSORS | BMS_SENSORS | SPH_HU_CT_SENSORS) - {"battery_current"},
     },
 
     # SPH V2.01 VPP Protocol
@@ -685,7 +823,20 @@ INVERTER_PROFILES = {
         "has_pv3": False,
         "has_battery": True,
         "max_power_kw": 10.0,
-        "sensors": HYBRID_3P_SENSORS | BMS_SENSORS,
+        # House Consumption from the AC side (AC output + import - export), not 1037/1038:
+        # that register closes the DC balance to within 15 W on two units, so it overstates
+        # the house by the conversion loss, ~10%. The AC side matched an independent wallbox
+        # meter to 0.4% (@acsel91, #447). A device-profile key rather than a register-map one
+        # because SPA-TL3 shares this map, and on AC-coupled storage the solar comes from a
+        # separate inverter this cannot see.
+        "house_load_from_ac_output": True,
+        # AC Power: the map now has a genuine total (Pac, 35/36) rather than an alias of
+        # phase R, confirmed on two SPH 10000 TL3 BH-UP units (#447).
+        # The V2.01 variant below keeps the line voltages; it has a source for them.
+        "sensors": (
+            (HYBRID_3P_SENSORS | BMS_SENSORS | AC_POWER_TOTAL_SENSOR)
+            - NO_LINE_VOLTAGES
+        ),
     },
 
     # SPH-TL3 V2.01 VPP Protocol
@@ -698,7 +849,10 @@ INVERTER_PROFILES = {
         "has_battery": True,
         "max_power_kw": 10.0,
         "protocol_version": "v2.01",
-        "sensors": HYBRID_3P_SENSORS | BMS_SENSORS,
+        "house_load_from_ac_output": True,  # see sph_tl3_3000_10000 (#447)
+        "sensors": (
+            HYBRID_3P_SENSORS | BMS_SENSORS | AC_POWER_TOTAL_SENSOR
+        ),
     },
 
     # ========================================================================
@@ -802,6 +956,23 @@ INVERTER_PROFILES = {
         "has_pv3": False,
         "has_battery": True,
         "max_power_kw": 6.0,
+        # First reduction of the unpopulatable sensors on this profile (#443, #445).
+        #
+        # SPF has no BMS block and no grid-side energy meter, so several sensors inherited
+        # from the shared groups have nothing to fill them and published 0.0 for ever. A
+        # counter stuck at zero is not neutral: it goes into the Energy Dashboard and cannot
+        # afterwards be told apart from a real one.
+        #
+        # `battery_temp` is the clearest: this profile's own docstring says "Battery
+        # Temperature: NOT AVAILABLE (SPF hardware does not provide battery temp sensor)",
+        # and NO_BATTERY_TEMP exists for exactly this - it simply was not applied here.
+        #
+        # `load_energy_today`/`_total` are the ones @takisbg reported reading 0 kWh while
+        # the inverter was working normally.
+        #
+        # The rest of this profile's list is in tests/phantom_sensor_baseline.json and comes
+        # out in reviewed batches - removing an entity takes it off dashboards and stops its
+        # history, so it is not something to do in bulk on a static analysis.
         "sensors": (
             BASIC_PV_SENSORS |
             BASIC_AC_SENSORS |
@@ -811,7 +982,7 @@ INVERTER_PROFILES = {
             TEMPERATURE_SENSORS |
             STATUS_SENSORS |
             SPF_OFFGRID_SENSORS
-        ),
+        ) - NO_BATTERY_TEMP - NO_BOOST_OR_IPM_TEMP - {"load_energy_today", "load_energy_total"},
     },
 
     "spe_8000_12000_es": {
@@ -831,7 +1002,7 @@ INVERTER_PROFILES = {
             TEMPERATURE_SENSORS |
             STATUS_SENSORS |
             SPE_OFFGRID_SENSORS
-        ),
+        ) - NO_BOOST_OR_IPM_TEMP,
     },
 
     # ========================================================================
@@ -850,6 +1021,7 @@ INVERTER_PROFILES = {
             BASIC_PV_SENSORS |
             PV3_SENSORS |
             THREE_PHASE_SENSORS |
+            AC_POWER_TOTAL_SENSOR |
             ENERGY_SENSORS |
             # PV_DC_ENERGY_SENSORS intentionally excluded: MOD X grid-tied profile has no
             # pv_energy_total registers (91-92 absent), so the sensor would always read 0.
@@ -867,8 +1039,19 @@ INVERTER_PROFILES = {
         "has_pv3": True,
         "has_battery": True,
         "max_power_kw": 15.0,
+        # BATTERY2_SENSORS: must stay identical to mod_6000_15000tl3_xh_v201's sensor set -
+        # PROFILE_ALIASES maps that key back to this one on every load, on the strength of
+        # the two being "functionally identical". b25 (#451) added BATTERY2_SENSORS to the
+        # v201 key alone, so the two diverged silently: the alias kept collapsing owners
+        # onto this key, the #405 equivalence guard started firing because the sensor sets
+        # no longer matched, and its own suggested fix - switching to v201 - was aliased
+        # straight back, so the notice could never be resolved (#453). See the note above
+        # PROFILE_ALIASES: this is exactly the drift that rule exists to prevent, and
+        # test_profile_aliases_stay_equivalent holds it from here.
         "sensors": ((HYBRID_3P_SENSORS | PV3_SENSORS | BACKUP_BOX_SENSORS | DCDC_TEMP_SENSOR
-                     | MOD_PEAK_SHAVING_SENSORS | MOD_VPP_STATE_SENSORS)
+                     | MOD_PEAK_SHAVING_SENSORS | MOD_VPP_STATE_SENSORS
+                     | AC_POWER_TOTAL_SENSOR | BATTERY2_SENSORS | BATTERY1_ENERGY_SENSORS
+                     | BATTERY_PACK_SENSORS | BATTERY_FCC_SENSORS)
                     - NO_BATTERY_TEMP),
     },
 
@@ -881,8 +1064,15 @@ INVERTER_PROFILES = {
         "has_pv3": True,
         "has_battery": True,
         "max_power_kw": 15.0,
+        # BATTERY2_SENSORS: this register map already defines battery cluster 2 at
+        # 31300-31399 (mirroring MOD's own cluster at 31200-31299), and the driver reads it
+        # dynamically whenever batteryN_voltage answers > 0. A commercial MID/MOD install
+        # with two physical battery packs (e.g. two APX units) had no way to see the second
+        # one - reading it, then discarding it because nothing offered the entity (#451).
         "sensors": ((HYBRID_3P_SENSORS | PV3_SENSORS | BACKUP_BOX_SENSORS | DCDC_TEMP_SENSOR
-                     | MOD_PEAK_SHAVING_SENSORS | MOD_VPP_STATE_SENSORS)
+                     | MOD_PEAK_SHAVING_SENSORS | MOD_VPP_STATE_SENSORS
+                     | AC_POWER_TOTAL_SENSOR | BATTERY2_SENSORS | BATTERY1_ENERGY_SENSORS
+                     | BATTERY_PACK_SENSORS | BATTERY_FCC_SENSORS)
                     - NO_BATTERY_TEMP),
     },
 
@@ -901,8 +1091,12 @@ INVERTER_PROFILES = {
         "has_pv3": True,
         "has_battery": True,
         "max_power_kw": 30.0,
+        # BATTERY2_SENSORS — see the identical comment on mod_6000_15000tl3_xh_v201, whose
+        # register map this profile shares (#451).
         "sensors": ((HYBRID_3P_SENSORS | PV3_SENSORS | BACKUP_BOX_SENSORS | DCDC_TEMP_SENSOR
-                     | MOD_PEAK_SHAVING_SENSORS | MOD_VPP_STATE_SENSORS)
+                     | MOD_PEAK_SHAVING_SENSORS | MOD_VPP_STATE_SENSORS
+                     | AC_POWER_TOTAL_SENSOR | BATTERY2_SENSORS | BATTERY1_ENERGY_SENSORS
+                     | BATTERY_PACK_SENSORS | BATTERY_FCC_SENSORS)
                     - NO_BATTERY_TEMP),
     },
 
@@ -935,6 +1129,7 @@ INVERTER_PROFILES = {
             BATTERY_SENSORS |
             BATTERY2_SENSORS |
             WIT_EXTRA_SENSORS |
+            WIT_VPP_STATE_SENSORS |
             TEMPERATURE_SENSORS |
             STATUS_SENSORS
         ),
@@ -968,6 +1163,7 @@ INVERTER_PROFILES = {
             BATTERY2_SENSORS |
             BATTERY3_SENSORS |
             WIT_EXTRA_SENSORS |
+            WIT_VPP_STATE_SENSORS |
             TEMPERATURE_SENSORS |
             STATUS_SENSORS
         ),

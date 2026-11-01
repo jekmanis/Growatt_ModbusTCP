@@ -167,7 +167,32 @@ SPF_3000_6000_ES_PLUS = {
     'holding_registers': {
         # System Control
         0: {'name': 'on_off', 'scale': 1, 'unit': '', 'access': 'RW', 'desc': '0=Off, 1=On'},
-        3: {'name': 'active_power_rate', 'scale': 1, 'unit': '%', 'access': 'RW', 'desc': 'Active power rate control'},
+        # NOT the active power rate. The off-grid table gives 3-6 as UtiOutStart,
+        # UtiOutEnd, UtiChargeStart and UtiChargeEnd - hours, 0-23, shown in ShinePhone as
+        # the output and charging period times. Mapped as a power rate, the entity read 0 %
+        # at full output, and writing "100 %" would have written hour 100 into the
+        # inverter's output schedule (#444).
+        #
+        # Named rather than deleted so the next person sees what the register is. No control
+        # is offered for it yet: the four are a schedule and belong together as time
+        # entities, not as four bare numbers.
+        3: {'name': 'uti_out_start', 'scale': 1, 'unit': 'h', 'access': 'RW',
+            'desc': 'Utility output period start hour (LCD program 50), 0-23'},
+
+        # BLU / LBU selection, added by firmware 100.08/101.07 (#437).
+        #
+        # The protocol table calls this register `uwLoadFirst` and documents three values -
+        # 0 charge first, 1 load first, 2 feed first. Those are the same three orderings the
+        # SPE profile exposes as BLU / LBU / LUB (Battery-Load-Utility, Load-Battery-Utility,
+        # Load-Utility-Battery), so the naming differs but the register does not.
+        #
+        # Only the first two are offered here. The reporter's SPF 6000 ES Plus shows exactly
+        # two on its screen and has no LUB, confirmed by writing each value and reading the
+        # display back - so offering a third would let someone write a mode this hardware
+        # does not have.
+        116: {'name': 'spf_blu_lbu_mode', 'scale': 1, 'unit': '', 'access': 'RW',
+              'desc': 'BLU/LBU energy priority (uwLoadFirst): 0=BLU (battery first), 1=LBU (load first)',
+              'values': {0: 'BLU', 1: 'LBU'}},
 
         # Output Priority Configuration
         1: {'name': 'output_config', 'scale': 1, 'unit': '', 'access': 'RW',
@@ -246,7 +271,7 @@ SPF_3000_6000_ES_PLUS = {
         #
         # Cannot be set at all when battery type (39) is Lithium; see WRITABLE_REGISTERS.
         34: {'name': 'max_charge_current', 'scale': 1, 'unit': 'A', 'access': 'RW',
-             'valid_range': (10, 100),
+             'valid_range': (10, 400),
              'desc': 'Max total charge current, solar + utility (LCD Program 02). '
                      '10-100A confirmed on SPF 6000ES Plus; unavailable on Lithium'},
 
@@ -270,6 +295,18 @@ SPF_3000_6000_ES_PLUS = {
 
         # AC Charge Current — LCD "Program 11", 0A~80A per the same manual, which confirms
         # the limit this profile already assumed.
+        #
+        # The 80 was challenged on #444 by an SPF 5000 ES owner whose ShinePhone offers
+        # 0-100 A, and it survived the challenge because he tested the hardware rather than
+        # quoting the screen. Written over Modbus the register takes 100 and reads 100 back.
+        # He then forced the grid to charge and watched the battery current for three
+        # minutes: 76.7 A, 77.9 A, 78.5 A — it never approached 100, and the combined
+        # charge ceiling was not what held it (83 A total against a 100 A limit). His
+        # manual, SPF 3500/5000 ES v4.0, gives Program 11 as 0-80 A on this model.
+        #
+        # So the register stores a value the hardware will not deliver, and the entity
+        # follows the hardware. Do not widen this to match an app screen; widen it only if
+        # a device is measured charging above 80 A from the grid.
         38: {'name': 'ac_charge_current', 'scale': 1, 'unit': 'A', 'access': 'RW',
              'valid_range': (0, 80),
              'desc': 'AC charging current limit (SPF 6000 hardware max: 80A, stored directly)'},
@@ -289,7 +326,36 @@ SPF_3000_6000_ES_PLUS = {
         # DTC is used during auto-detection only (034xx for SPF 3-6K ES PLUS series)
         # Holding register 43 may contain DTC as fallback on some firmware versions
 
+        # Battery Undervoltage Cut-Off — the third of the three thresholds ShinePhone shows
+        # together, and the one that decides how deep the battery discharges in an outage.
+        #
+        # The off-grid table calls it `wBatLowCutOff` / "Bat cutoff" and gives no scale or
+        # range, so the scale comes from a device: an SPF 5000 ES on Lithium (register 39 =
+        # 3) read 100 here while its app showed 10 %, alongside 37 = 350 for 35 % and
+        # 95 = 850 for 85 % — all three at 0.1, all three matching the app exactly (#444).
+        #
+        # BATTERY TYPE DEPENDENT, on the same footing as 37 and 95 rather than on its own
+        # evidence: only the Lithium half is confirmed. The reporter also found register 94
+        # holding 420 against his manual's 42.0 V Low DC Cut-Off (Li Mode), which is what a
+        # voltage twin of this setting looks like — so a non-Lithium system may well put
+        # volts here as the other two do. If an AGM or Flooded owner reports this entity
+        # showing a percentage where the panel shows volts, it is this assumption that is
+        # wrong, not the scale.
+        #
+        # The value was already reaching the diagnostics under a name borrowed from another
+        # profile (`load_first_battery_minimum_soc`), so this surfaces a reading that was
+        # being taken anyway rather than adding a register to the poll.
+        82: {'name': 'bat_low_cutoff', 'scale': 0.1, 'unit': 'V/%', 'access': 'RW',
+             'valid_range': (0, 1000),
+             'desc': 'Battery undervoltage cut-off point. Lithium: 0-100%, Non-Lithium: '
+                     '20.0-64.0V (assumed, as for registers 37 and 95)',
+             'battery_dependent': True},
+
         # Generator Charge Current
+        #
+        # Reads 65535 — 0xFFFF — on an SPF 5000 ES, which is the all-ones "not supported"
+        # pattern rather than a 65 kA charge limit (#444). Withheld on that value; see
+        # GEN_CHARGE_CURRENT_NOT_SUPPORTED in growatt_modbus.py.
         83: {'name': 'gen_charge_current', 'scale': 1, 'unit': 'A', 'access': 'RW',
              'valid_range': (0, 80),
              'desc': 'Generator charging current limit (SPF 6000 hardware max: 80A, stored directly)'},

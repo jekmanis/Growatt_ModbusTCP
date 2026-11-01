@@ -71,9 +71,9 @@ In Home Assistant:
 > If this entity is not visible, confirm you are on the MOD TL3-XH profile. Grid-tied
 > (TL3-X) models do not have this register.
 
-To verify via raw register (optional — requires the diagnostic service):
+To verify via raw register (optional — requires the diagnostic actions):
 ```yaml
-service: growatt_modbus.read_register
+action: growatt_modbus.read_register
 data:
   device_id: YOUR_DEVICE_ID
   register_type: holding
@@ -130,7 +130,7 @@ Only enabled slots are executed by the inverter.
 
 After configuring all slots:
 1. Wait **60 seconds** (one full poll cycle minimum)
-2. Re-read the start register of slot 1 using the diagnostic service or by checking
+2. Re-read the start register of slot 1 using the diagnostic actions or by checking
    the time entity's current value
 3. If the value matches what you wrote, TOU is working correctly
 4. If it reverted, go back to Step 1 and confirm register 3049 reads **1**
@@ -154,12 +154,12 @@ automation:
       - platform: time
         at: "17:55:00"
     action:
-      - service: select.select_option
+      - action: select.select_option
         target:
           entity_id: select.growatt_tou_period_1_priority
         data:
           option: "Battery Priority"
-      - service: select.select_option
+      - action: select.select_option
         target:
           entity_id: select.growatt_tou_period_1_enable
         data:
@@ -264,26 +264,37 @@ enable registers (not bit-packed like MOD).
 
 | Entity | Register | Purpose |
 |--------|----------|---------|
-| Batt First Time Period 4 Start / End | 1017, 1018 | Battery First window 4 |
-| Batt First Time Period 4 Enable | 1019 | Enable slot |
-| Batt First Time Period 5 Start / End | 1020, 1021 | Battery First window 5 |
-| Batt First Time Period 5 Enable | 1022 | Enable slot |
-| Batt First Time Period 6 Start / End | 1023, 1024 | Battery First window 6 |
-| Batt First Time Period 6 Enable | 1025 | Enable slot |
+| Batt First Time Period 4 Start / End | 1018, 1019 | Battery First window 4 |
+| Batt First Time Period 4 Enable | 1020 | Enable slot |
+| Batt First Time Period 5 Start / End | 1021, 1022 | Battery First window 5 |
+| Batt First Time Period 5 Enable | 1023 | Enable slot |
+| Batt First Time Period 6 Start / End | 1024, 1025 | Battery First window 6 |
+| Batt First Time Period 6 Enable | 1026 | Enable slot |
 
 #### Grid First Extended Slots 4–9 (new in v0.6.8)
 
 | Entity | Register | Purpose |
 |--------|----------|---------|
-| Grid First Period 4–6 Start/End | 1026–1033 | Grid First windows 4–6 |
-| Grid First Period 4–6 Enable | 1028, 1031, 1034 | Enable each slot |
+| Grid First Period 4–6 Start/End | 1027–1034 | Grid First windows 4–6 |
+| Grid First Period 4–6 Enable | 1029, 1032, 1035 | Enable each slot |
 | Grid First Period 1–3 Start/End | 1080–1087 | Grid First windows 1–3 |
 | Grid First Period 1–3 Enable | 1082, 1085, 1088 | Enable each slot |
+
+!!! danger "A schedule set in ShinePhone wins, and you cannot see it from here"
+    Periods created in **ShinePhone → Advanced Setting → TimeElectricity Price** are not the
+    same thing as the time period entities or `sync_tou_schedule`. They are not exposed over
+    Modbus, do not appear in diagnostics, and **take effect regardless of what this
+    integration sets**.
+
+    The symptom is an inverter doing something nothing in Home Assistant explains - typically
+    charging from the grid - while every control you change reverts or appears to be ignored.
+    Delete the period in the app; the change takes effect within a poll
+    ([#448](https://github.com/0xAHA/Growatt_ModbusTCP/issues/448)).
 
 > **SPH HU note:** The SPH 8000–10000 TL-HU uses a different holding register architecture.
 > Battery management registers (1044, 1070–1071, 1090–1108) return Modbus exceptions on HU
 > hardware — these settings must be made via the inverter LCD or ShinePhone app. The
-> extended time period registers (1017–1088) have not been validated on HU hardware.
+> extended time period registers (1018–1088) have not been validated on HU hardware.
 
 ### Setting Up Time Periods on SPH
 
@@ -328,12 +339,12 @@ automation:
       - platform: time
         at: "21:55:00"
     action:
-      - service: select.select_option
+      - action: select.select_option
         target:
           entity_id: select.growatt_ac_charge_enable
         data:
           option: "Enabled"
-      - service: select.select_option
+      - action: select.select_option
         target:
           entity_id: select.growatt_time_period_1_enable
         data:
@@ -369,6 +380,36 @@ If you drive slots from an automation or a price optimiser, disable the conflict
 before writing the new one — write `[23:59, 23:59, 0]` to the opposing slot as one atomic
 triple, allow it to settle, then write the period you want.
 
+#### The disable-then-enable pattern, confirmed under load
+
+This sequence has been run against a genuinely busy night — 28 register writes driven by
+Predbat in expert mode, revising its own plan repeatedly as prices updated — with **zero
+rejections** ([#417](https://github.com/0xAHA/Growatt_ModbusTCP/issues/417), @Vict20):
+
+1. Before writing an enabled period, read the **opposing** mode's enable state from its
+   `select` entity.
+2. If it is active, write `[23:59, 23:59, 0]` to that opposing slot — one atomic triple via
+   `write_registers`, never a bare single-register write.
+3. Wait about **2 seconds** for it to settle.
+4. Write the real `[start, end, enable]` triple for the slot you actually want.
+
+Two details that made the difference:
+
+- **Every write is a three-register triple.** Writing `start`, `end` and `enable`
+  individually can leave the inverter briefly holding a period that overlaps the running one,
+  which is both a rejection risk and how partially-written periods appear.
+- **Only the final state of a revised plan is written.** An optimiser that rewrites the same
+  window two or three times before settling should collapse those into one write, rather than
+  firing on every intermediate change.
+
+Cross-checking the integration's debug log against the optimiser's own record of intended
+writes showed every decision reaching the inverter, **8–17 seconds later** (the automation's
+settle delay), with no missing writes and no register changes that could not be accounted
+for.
+
+This is firmware behaviour rather than anything SPH-specific, so the same pattern should
+apply on other families that refuse overlapping enabled periods.
+
 !!! note "The inverter's SoC reserve is a separate protection"
     A discharge window does not run the battery flat. Discharge throttles to near zero as
     SoC approaches your configured reserve floor, whatever the schedule says — observed
@@ -400,7 +441,7 @@ Must be set to **Enabled** before any remote control registers will be accepted.
 This is a one-time setup step that persists across inverter restarts.
 
 ```yaml
-service: select.select_option
+action: select.select_option
 target:
   entity_id: select.growatt_control_authority
 data:
@@ -444,17 +485,17 @@ automation:
       - platform: time
         at: "23:00:00"
     action:
-      - service: number.set_value
+      - action: number.set_value
         target:
           entity_id: number.growatt_remote_charging_time
         data:
           value: 120
-      - service: number.set_value
+      - action: number.set_value
         target:
           entity_id: number.growatt_remote_charge_discharge_power
         data:
           value: 80        # 80% charge rate
-      - service: select.select_option
+      - action: select.select_option
         target:
           entity_id: select.growatt_remote_power_control_enable
         data:
@@ -470,17 +511,17 @@ automation:
       - platform: time
         at: "17:00:00"
     action:
-      - service: number.set_value
+      - action: number.set_value
         target:
           entity_id: number.growatt_remote_charging_time
         data:
           value: 180
-      - service: number.set_value
+      - action: number.set_value
         target:
           entity_id: number.growatt_remote_charge_discharge_power
         data:
           value: -80       # 80% discharge to grid
-      - service: select.select_option
+      - action: select.select_option
         target:
           entity_id: select.growatt_remote_power_control_enable
         data:
@@ -490,7 +531,7 @@ automation:
 #### Pattern 3 — Cancel Active Override Immediately
 
 ```yaml
-service: select.select_option
+action: select.select_option
 target:
   entity_id: select.growatt_remote_power_control_enable
 data:
@@ -501,7 +542,10 @@ data:
 
 The integration enforces a **30-second minimum interval** between WIT control writes.
 This prevents oscillation from rapid automation triggers. If you write within 30 seconds
-of a previous write the request is silently dropped and a warning is logged:
+of a previous write the request is not sent, the action fails with an error, and a warning
+is logged. Disabling Control Authority (30100) or Remote Power Control (30407) is exempt, so
+releasing control always goes through
+([#481](https://github.com/0xAHA/Growatt_ModbusTCP/issues/481)):
 
 ```
 [WIT CTRL] Rate limit: WIT control writes must be 30s apart
@@ -564,7 +608,7 @@ SPF inverters prioritise power sources, not TOU schedules. The key controls are:
 ### Example: Solar-First with Grid Backup
 
 ```yaml
-service: select.select_option
+action: select.select_option
 target:
   entity_id: select.growatt_output_config
 data:
@@ -603,7 +647,7 @@ automation:
         entity_id: select.growatt_priority_mode
         state: "Grid First"
     action:
-      - service: select.select_option
+      - action: select.select_option
         target:
           entity_id: select.growatt_priority_mode
         data:
@@ -623,7 +667,7 @@ automation:
         entity_id: sensor.growatt_battery_battery_soc
         above: 30
     action:
-      - service: select.select_option
+      - action: select.select_option
         target:
           entity_id: select.growatt_priority_mode
         data:
@@ -635,7 +679,7 @@ automation:
         entity_id: sensor.growatt_battery_battery_soc
         below: 20
     action:
-      - service: select.select_option
+      - action: select.select_option
         target:
           entity_id: select.growatt_priority_mode
         data:
@@ -655,17 +699,17 @@ automation:
         entity_id: sensor.growatt_battery_battery_soc
         below: 80
     action:
-      - service: number.set_value
+      - action: number.set_value
         target:
           entity_id: number.growatt_remote_charging_time
         data:
           value: 240        # 4-hour window
-      - service: number.set_value
+      - action: number.set_value
         target:
           entity_id: number.growatt_remote_charge_discharge_power
         data:
           value: 60
-      - service: select.select_option
+      - action: select.select_option
         target:
           entity_id: select.growatt_remote_power_control_enable
         data:
@@ -694,20 +738,39 @@ write succeeded but value reverted (possible cloud override)
 
 1. Confirm you are on the correct profile (Settings → Devices & Services → Growatt → Configure)
 2. For **MOD GEN4** control entities: the profile must be MOD TL3-XH, and register 3038 must be present in holding registers (verified during auto-detection)
-3. For **SPH extended time periods**: registers 1017–1088 must be present in the profile's holding_registers definition — verify with the Universal Register Scanner
+3. For **SPH extended time periods**: registers 1018–1088 must be present in the profile's holding_registers definition — verify with the Universal Register Scanner
 4. Check HA logs for entity creation messages: `INFO — MOD TOU priority/enable controls enabled`
 
 ### Write silently fails (no error, value stays unchanged)
 
 1. Check you are writing to a **holding register** (FC06/FC16), not an input register (FC04)
 2. Verify slave ID — some adapters require slave ID 1, others use the inverter's configured address
-3. Try `growatt_modbus.write_register` directly from **Developer Tools → Actions** to isolate the issue from the entity
+3. Try `growatt_modbus.write_registers` (plural) from **Settings → Tools → Actions** to isolate
+   the issue from the entity - write the `[start, end, enable]` triple, not one word
+
+!!! warning "A single-register write can be refused where the entity's write works"
+    `growatt_modbus.write_register` (singular) sends **FC06**, one register at a time. The time
+    entities send **FC16** for the whole triple, and some firmware accepts only the second.
+
+    Measured on a MOD 10KTL3-XH, firmware `DN1.0`
+    ([#349](https://github.com/0xAHA/Growatt_ModbusTCP/issues/349)): FC06 on the slot *end*
+    words 3041, 3055 and 3059 returned `exception 2` (Illegal Data Address) on every attempt,
+    while FC16 on the pair was accepted on all nine slots. The start word 3050 did accept FC06.
+    A *changed* value written by FC16 then read back on slots 2 and 5-9, including the pair
+    containing 3055, which refuses FC06.
+
+    So an FC06 refusal there is **not** evidence that the slot is broken or unsupported - it
+    can refuse while the control that uses it works normally. Use the plural action to test.
+
+    **And write a value that differs from the current one.** Writing a register's own value
+    back makes the read-back match whether or not anything landed, so a success proves
+    nothing. A refusal still counts.
 
 ### MOD TOU slots 5–9 not appearing
 
 Slots 5–9 use registers 3050–3059. These must be present in the holding_registers of your profile. Verify:
 ```yaml
-service: growatt_modbus.read_register
+action: growatt_modbus.read_register
 data:
   device_id: YOUR_DEVICE_ID
   register_type: holding

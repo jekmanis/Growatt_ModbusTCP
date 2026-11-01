@@ -101,12 +101,28 @@ model rejects the write, use the inverter display panel or the manufacturer app 
 - 1–1440 = control active for this many minutes, then reverts
 - Timer starts when register 30407 is set to 1
 
+!!! warning "1440 is not \"always\""
+    1440 is exactly 24 hours. When the window runs out the inverter falls back to
+    self-consumption (Load First unless 30476 says otherwise) while 30100, 30407 and 30409
+    all still read as set, and no fault or warning is raised — VPP V2.05, appendix 3.3.3.
+    An automation that arms once with 1440 will look armed and silently stop being
+    obeyed a day later. Use **0** for open-ended control
+    ([#481](https://github.com/0xAHA/Growatt_ModbusTCP/issues/481)).
+
 #### Register 30409: Charge/Discharge Power
 
 - Range: -100 to +100 (signed integer, percentage of rated power)
 - Negative values = Discharge battery / export to grid
 - Positive values = Charge battery from grid/PV
 - 0 = Suspend forced cycle (passthrough)
+
+**The sign also sets the work priority.** Per VPP V2.05 (appendix 3.3.3), while remote control
+is running a positive 30409 runs the inverter in Battery First and a negative one in **Grid
+First**, whatever 30476 says. 30476 only applies once remote control ends. So a negative
+setpoint discharges toward the grid. There is no remote-control mode for "battery covers the
+house only": for that, leave remote control off and let 30476 = 0 (Load First) run. A WIT
+100K-HU showed 31002 = 1 at +10 % and Grid First when negative
+([#349](https://github.com/0xAHA/Growatt_ModbusTCP/issues/349)).
 
 ### Legacy VPP Registers (Registers 201-202)
 
@@ -403,7 +419,7 @@ The inverter enforces its own SOC limits (registers 30404/30405). Your automatio
 variables:
   soc: "{{ states('sensor.INVERTER_battery_soc') | int(0) }}"
   charge_cutoff: "{{ states('number.INVERTER_vpp_charge_cutoff_soc') | int(100) }}"
-  discharge_cutoff: "{{ states('number.INVERTER_vpp_discharge_cutoff_soc') | int(20) }}"
+  discharge_cutoff: "{{ states('number.INVERTER_vpp_discharge_cutoff_soc') | int(10) }}"
 condition:
   - condition: template
     value_template: >
@@ -444,6 +460,18 @@ When `control_authority` (register 30100) is enabled but `remote_power_control` 
 | **1** | **0** | **⚠️ VPP standby — inverter draws from grid, battery suspended** |
 
 Always ensure remote power control is enabled when control authority is on, or disable both together.
+
+### Off-grid on enabling Control Authority (WIT 100K-HU)
+
+On a WIT 100K-HU (VPP V2.03), enabling Control Authority also switched on EPS off-grid
+(30155 = 1). The inverter islanded: working state 31000 went from 5 to 7, the display showed
+warning 300 (no utility grid), the grid contactors opened, and AC output fell to 0 whatever
+30409 asked for. Writing **30155 = 0** with authority still on brought it back on-grid
+([#349](https://github.com/0xAHA/Growatt_ModbusTCP/issues/349)). The off-grid setting also
+stayed enabled after authority was turned off, so check it in ShineTools afterwards.
+
+If your WIT loses grid output as soon as authority is enabled, read holding 30155. Only
+one model has shown this so far.
 
 ---
 
@@ -497,6 +525,11 @@ To prevent oscillation and instability, v0.4.6 introduces **30-second rate limit
 - Integration tracks last write time for each WIT control register
 - If you try to write within 30 seconds of previous write, request is blocked
 - Warning logged: "Rate limit: WIT control writes must be 30s apart"
+- **The action fails with an error**, so an automation knows the value was not sent. Before
+  v2.0.6-b10 it returned normally and the entity showed the new value
+  ([#481](https://github.com/0xAHA/Growatt_ModbusTCP/issues/481))
+- **Releasing control is never blocked.** Setting Control Authority (30100) or Remote Power
+  Control (30407) back to Disabled goes through at once, however recently it was enabled
 
 **Impact**:
 - ✅ Prevents rapid automation loops
@@ -534,7 +567,7 @@ If you're used to SPH/SPF inverters and moving to WIT, here are key changes:
 automation:
   - alias: "Set Battery First Mode"
     action:
-      - service: number.set_value
+      - action: number.set_value
         target:
           entity_id: select.growatt_priority_mode
         data:
@@ -548,21 +581,21 @@ automation:
   - alias: "Discharge Battery for 3 Hours"
     action:
       # Set duration
-      - service: number.set_value
+      - action: number.set_value
         target:
           entity_id: number.growatt_remote_charging_time
         data:
           value: 180  # 3 hours
 
       # Set discharge power
-      - service: number.set_value
+      - action: number.set_value
         target:
           entity_id: number.growatt_remote_charge_discharge_power
         data:
           value: -80  # 80% discharge
 
       # Enable remote control
-      - service: switch.turn_on
+      - action: switch.turn_on
         target:
           entity_id: switch.growatt_remote_power_control
 ```
@@ -573,7 +606,7 @@ automation:
 
 ### 1. Enable VPP Control Authority (One-time setup)
 ```yaml
-service: switch.turn_on
+action: switch.turn_on
 target:
   entity_id: switch.growatt_control_authority
 ```
@@ -607,14 +640,14 @@ automation:
         to: 'on'
     action:
       # Set duration from helper
-      - service: number.set_value
+      - action: number.set_value
         target:
           entity_id: number.growatt_remote_charging_time
         data:
           value: "{{ states('input_number.battery_override_duration') | int }}"
 
       # Set power from helper
-      - service: number.set_value
+      - action: number.set_value
         target:
           entity_id: number.growatt_remote_charge_discharge_power
         data:
@@ -625,7 +658,7 @@ automation:
           seconds: 2
 
       # Enable override
-      - service: switch.turn_on
+      - action: switch.turn_on
         target:
           entity_id: switch.growatt_remote_power_control
 ```
